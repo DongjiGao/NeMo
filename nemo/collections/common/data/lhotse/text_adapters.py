@@ -33,6 +33,7 @@ from lhotse.serialization import load_jsonl, open_best
 from lhotse.shar import AudioTarWriter, JsonlShardWriter
 from lhotse.utils import Pathlike, is_valid_url
 
+from nemo.collections.common.data.lhotse.indexed_adapters import IndexedJSONLReader, LazyShuffledRange
 from nemo.collections.common.data.lhotse.nemo_adapters import expand_sharded_filepaths
 from nemo.collections.common.data.prompt_fn import apply_prompt_format_fn, registered_prompt_format_fn
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
@@ -718,11 +719,18 @@ class NeMoMultimodalConversationShareGPTJsonlAdapter:
             self.audio_placeholders = ["<sound>", "<speech>"]
         elif isinstance(self.audio_placeholders, str):
             self.audio_placeholders = [self.audio_placeholders]
+
+        # Check if all manifest files have corresponding .idx index files.
+        # When they do and shuffle is requested, we can use random access instead of
+        # loading everything into memory.
+        self._has_index = all(Path(p).with_suffix(Path(p).suffix + ".idx").exists() for p in self.manifest_filepath)
         self.epoch = 0
 
     def __iter__(self) -> Iterator[NeMoMultimodalConversation]:
         if self.tarred_audio_filepaths is not None:
             yield from self._iter_tar()
+        elif self.shuffle_shards and self._has_index:
+            yield from self._iter_jsonl_indexed()
         else:
             yield from self._iter_jsonl()
 
@@ -800,6 +808,29 @@ class NeMoMultimodalConversationShareGPTJsonlAdapter:
                 rng.shuffle(jsonl_iter)
             for data in jsonl_iter:
                 # Transform ShareGPT format to standard format
+                conversations = self._transform_sharegpt_conversations(data)
+
+                yield NeMoMultimodalConversation(
+                    id=data["id"],
+                    turns=self._create_turns(conversations, None, path),
+                    token_equivalent_duration=self.token_equivalent_duration,
+                )
+
+        self.epoch += 1
+
+    def _iter_jsonl_indexed(self):
+        """
+        Iterate JSONL files using IndexedJSONLReader for random access.
+        Used when shuffle is requested and .idx index files are available,
+        avoiding loading entire files into memory.
+        """
+        paths = list(self.manifest_filepath)
+        rng = self._get_rng()
+        rng.shuffle(paths)
+        for path in paths:
+            reader = IndexedJSONLReader(path)
+            for idx in LazyShuffledRange(len(reader), rng):
+                data = reader[idx]
                 conversations = self._transform_sharegpt_conversations(data)
 
                 yield NeMoMultimodalConversation(

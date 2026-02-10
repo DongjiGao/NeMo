@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import random
 from itertools import islice
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from lhotse.testing.dummies import dummy_cut, dummy_recording
 from omegaconf import OmegaConf
 
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
+from nemo.collections.common.data.lhotse.indexed_adapters import LazyShuffledRange, create_index
 from nemo.collections.common.data.lhotse.sampling import (
     DurationFilter,
     MultimodalFixedBucketBatchSizeConstraint2D,
@@ -922,3 +924,176 @@ def test_dataloader_multimodal_conversation_nontarred_slice_length_ignored(multi
     assert len(ids) == 10
     assert len(set(ids)) == 10
     assert ids == sorted(ids)
+
+
+@pytest.fixture(scope="session")
+def indexed_sharegpt_conversations_path(tmp_path_factory):
+    """
+    Creates a ShareGPT JSONL manifest with 10 text-only conversations
+    and a corresponding .idx index file.
+    """
+    tmp_path = tmp_path_factory.mktemp("indexed_sharegpt_data")
+    manifest_path = tmp_path / "sharegpt_manifest.jsonl"
+    data = [
+        {
+            "id": f"convo_{i}",
+            "conversations": [
+                {"from": "human", "value": f"Question number {i}"},
+                {"from": "gpt", "value": f"Answer number {i}"},
+            ],
+        }
+        for i in range(10)
+    ]
+    lhotse.serialization.save_to_jsonl(data, manifest_path)
+    create_index(str(manifest_path), str(manifest_path) + ".idx")
+    return manifest_path
+
+
+def test_sharegpt_indexed_sequential_no_shuffle(indexed_sharegpt_conversations_path):
+    """When shuffle is off, indexed reading is NOT used — sequential order is preserved."""
+    adapter = NeMoMultimodalConversationShareGPTJsonlAdapter(
+        manifest_filepath=str(indexed_sharegpt_conversations_path),
+        audio_locator_tag="[audio]",
+        shuffle_shards=False,
+        shard_seed=0,
+    )
+    assert adapter._has_index is True
+    conversations = list(adapter)
+    assert len(conversations) == 10
+    ids = [c.id for c in conversations]
+    assert ids == [f"convo_{i}" for i in range(10)]
+
+
+def test_sharegpt_indexed_shuffle_uses_random_access(indexed_sharegpt_conversations_path):
+    """When shuffle is on and .idx files exist, all items are yielded in shuffled order."""
+    adapter = NeMoMultimodalConversationShareGPTJsonlAdapter(
+        manifest_filepath=str(indexed_sharegpt_conversations_path),
+        audio_locator_tag="[audio]",
+        shuffle_shards=True,
+        shard_seed=0,
+    )
+    assert adapter._has_index is True
+    conversations = list(adapter)
+    assert len(conversations) == 10
+    ids = [c.id for c in conversations]
+    # All items present
+    assert sorted(ids) == [f"convo_{i}" for i in range(10)]
+    # Order is shuffled (with 10 items the chance of identical order is 1/10! ≈ 0)
+    assert ids != [f"convo_{i}" for i in range(10)]
+
+
+def test_sharegpt_indexed_different_epochs_different_order(indexed_sharegpt_conversations_path):
+    """Different epochs produce different shuffled orders."""
+    adapter = NeMoMultimodalConversationShareGPTJsonlAdapter(
+        manifest_filepath=str(indexed_sharegpt_conversations_path),
+        audio_locator_tag="[audio]",
+        shuffle_shards=True,
+        shard_seed=0,
+    )
+    epoch0_ids = [c.id for c in adapter]
+    epoch1_ids = [c.id for c in adapter]
+    # Both epochs have all items
+    assert sorted(epoch0_ids) == sorted(epoch1_ids)
+    # But in different order (epoch counter increments the seed)
+    assert epoch0_ids != epoch1_ids
+
+
+def test_sharegpt_no_index_falls_back_to_in_memory_shuffle(tmp_path_factory):
+    """When .idx files don't exist, shuffle_shards still works via in-memory shuffle."""
+    tmp_path = tmp_path_factory.mktemp("sharegpt_no_idx")
+    manifest_path = tmp_path / "manifest.jsonl"
+    data = [
+        {
+            "id": f"convo_{i}",
+            "conversations": [
+                {"from": "human", "value": f"Question {i}"},
+                {"from": "gpt", "value": f"Answer {i}"},
+            ],
+        }
+        for i in range(10)
+    ]
+    lhotse.serialization.save_to_jsonl(data, manifest_path)
+    # No .idx file created
+
+    adapter = NeMoMultimodalConversationShareGPTJsonlAdapter(
+        manifest_filepath=str(manifest_path),
+        audio_locator_tag="[audio]",
+        shuffle_shards=True,
+        shard_seed=0,
+    )
+    assert adapter._has_index is False
+    conversations = list(adapter)
+    assert len(conversations) == 10
+    ids = [c.id for c in conversations]
+    assert sorted(ids) == [f"convo_{i}" for i in range(10)]
+    # Should still be shuffled (in-memory path)
+    assert ids != [f"convo_{i}" for i in range(10)]
+
+
+def test_sharegpt_indexed_with_audio(tmp_path_factory):
+    """Indexed reading works correctly with audio turns (ShareGPT format with <sound> placeholders)."""
+    tmp_path = tmp_path_factory.mktemp("indexed_sharegpt_audio")
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    # Create audio files
+    for i in range(5):
+        dummy_recording(i, duration=1.0 + i * 0.5, with_data=True).to_cut().save_audio(tmp_path / f"audio_{i}.wav")
+
+    data = [
+        {
+            "id": f"audio_convo_{i}",
+            "sound": f"audio_{i}.wav",
+            "conversations": [
+                {"from": "human", "value": f"Listen to this: <sound> What do you think?"},
+                {"from": "gpt", "value": f"Response {i}"},
+            ],
+        }
+        for i in range(5)
+    ]
+    lhotse.serialization.save_to_jsonl(data, manifest_path)
+    create_index(str(manifest_path), str(manifest_path) + ".idx")
+
+    adapter = NeMoMultimodalConversationShareGPTJsonlAdapter(
+        manifest_filepath=str(manifest_path),
+        audio_locator_tag="[audio]",
+        shuffle_shards=True,
+        shard_seed=42,
+    )
+    assert adapter._has_index is True
+    conversations = list(adapter)
+    assert len(conversations) == 5
+
+    ids = sorted([c.id for c in conversations])
+    assert ids == [f"audio_convo_{i}" for i in range(5)]
+
+    # Verify audio turns were created correctly
+    for conv in conversations:
+        assert conv.has_audio_turns
+        audio_turns = [t for t in conv.turns if isinstance(t, AudioTurn)]
+        assert len(audio_turns) == 1
+        assert audio_turns[0].audio_locator_tag == "[audio]"
+        assert audio_turns[0].cut.load_audio().shape[0] == 1  # mono audio
+
+
+@pytest.mark.parametrize("n", [0, 1, 2, 3, 5, 10, 100, 1000, 1023, 1024, 1025])
+def test_lazy_shuffled_range_is_a_permutation(n):
+    """LazyShuffledRange must yield every element of [0, n) exactly once."""
+    rng = random.Random(42)
+    result = list(LazyShuffledRange(n, rng))
+    assert len(result) == n
+    assert sorted(result) == list(range(n))
+
+
+def test_lazy_shuffled_range_is_shuffled():
+    """LazyShuffledRange should not produce the identity permutation (for non-trivial n)."""
+    rng = random.Random(0)
+    result = list(LazyShuffledRange(50, rng))
+    assert result != list(range(50))
+
+
+def test_lazy_shuffled_range_different_seeds():
+    """Different RNG seeds produce different permutations."""
+    a = list(LazyShuffledRange(100, random.Random(0)))
+    b = list(LazyShuffledRange(100, random.Random(1)))
+    assert a != b
+    assert sorted(a) == sorted(b) == list(range(100))
