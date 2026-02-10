@@ -1103,10 +1103,11 @@ def test_lazy_shuffled_range_different_seeds():
 # ─── WebDataset ShareGPT adapter tests ──────────────────────────────────────
 
 
-def _make_webdataset_dir(tmp_path, num_samples=6, num_shards=2, create_idx=True):
+def _make_webdataset_dir(tmp_path, num_samples=6, num_shards=2, create_idx=True, audio_first=False):
     """
     Helper: create a WebDataset directory layout with wids-meta.json,
     tar shards containing N.json + N.wav pairs, and optional .idx files.
+    When *audio_first* is True the wav member is written before the json member.
     """
     import io
     import json
@@ -1126,7 +1127,6 @@ def _make_webdataset_dir(tmp_path, num_samples=6, num_shards=2, create_idx=True)
         tar_path = shard_dir / f"shard-{shard_id}.tar"
         with tarfile.open(tar_path, "w:") as tar:
             for local_idx in range(shard_size):
-                # Build ShareGPT JSON
                 data = {
                     "id": f"sample_{sample_idx}",
                     "sound": f"audio_{sample_idx}.wav",
@@ -1143,22 +1143,23 @@ def _make_webdataset_dir(tmp_path, num_samples=6, num_shards=2, create_idx=True)
                 }
                 json_bytes = json.dumps(data).encode("utf-8")
 
-                # Build WAV audio in memory
                 rec = dummy_recording(sample_idx, duration=1.0 + sample_idx * 0.1, with_data=True)
                 audio_array = rec.load_audio().squeeze()
                 buf = io.BytesIO()
                 sf.write(buf, audio_array, rec.sampling_rate, format="WAV")
                 wav_bytes = buf.getvalue()
 
-                # Add json member
                 json_info = tarfile.TarInfo(name=f"{local_idx}.json")
                 json_info.size = len(json_bytes)
-                tar.addfile(json_info, io.BytesIO(json_bytes))
-
-                # Add wav member
                 wav_info = tarfile.TarInfo(name=f"{local_idx}.wav")
                 wav_info.size = len(wav_bytes)
-                tar.addfile(wav_info, io.BytesIO(wav_bytes))
+
+                if audio_first:
+                    tar.addfile(wav_info, io.BytesIO(wav_bytes))
+                    tar.addfile(json_info, io.BytesIO(json_bytes))
+                else:
+                    tar.addfile(json_info, io.BytesIO(json_bytes))
+                    tar.addfile(wav_info, io.BytesIO(wav_bytes))
 
                 sample_idx += 1
 
@@ -1173,7 +1174,6 @@ def _make_webdataset_dir(tmp_path, num_samples=6, num_shards=2, create_idx=True)
         if create_idx:
             create_tar_index(str(tar_path), str(tar_path) + ".idx")
 
-    # Write wids-meta.json
     meta = {"name": "test-dataset", "__kind__": "test-WebDataset", "wids_version": 1, "shardlist": shardlist}
     (tmp_path / "wids-meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -1313,3 +1313,29 @@ def test_webdataset_indexed_audio_loads_correctly(webdataset_dir):
         audio = audio_turns[0].cut.load_audio()
         assert audio.shape[0] == 1
         assert audio.shape[1] > 0
+
+
+@pytest.mark.parametrize("use_index", [False, True])
+def test_webdataset_audio_first_ordering(tmp_path_factory, use_index):
+    """Tar samples with wav before json are handled correctly."""
+    wds_dir = _make_webdataset_dir(
+        tmp_path_factory.mktemp("webdataset_audio_first"),
+        num_samples=4,
+        num_shards=2,
+        create_idx=use_index,
+        audio_first=True,
+    )
+    adapter = NeMoMultimodalConversationShareGPTWebdatasetAdapter(
+        data_dir=str(wds_dir),
+        audio_locator_tag="[audio]",
+        shuffle_shards=use_index,
+        shard_seed=0,
+    )
+    conversations = list(adapter)
+    assert len(conversations) == 4
+    ids = sorted(c.id for c in conversations)
+    assert ids == [f"sample_{i}" for i in range(4)]
+    for conv in conversations:
+        audio_turns = [t for t in conv.turns if isinstance(t, AudioTurn)]
+        assert len(audio_turns) == 1
+        assert audio_turns[0].cut.load_audio().shape[0] == 1

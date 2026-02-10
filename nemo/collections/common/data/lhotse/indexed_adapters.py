@@ -120,6 +120,15 @@ class IndexedJSONLReader:
         return json.loads(data.decode('utf-8'))
 
 
+def _split_json_audio_pair(name_a, bytes_a, name_b, bytes_b):
+    """Classify two tar members into (json_data_dict, audio_bytes, audio_name) regardless of order."""
+    if name_a.endswith('.json'):
+        return json.loads(bytes_a), bytes_b, name_b
+    if name_b.endswith('.json'):
+        return json.loads(bytes_b), bytes_a, name_a
+    raise ValueError(f"Expected one .json member in tar sample pair, got: {name_a}, {name_b}")
+
+
 class IndexedTarSampleReader:
     """
     Random access to WebDataset tar samples (``N.json`` + ``N.<audio>``) via an index file.
@@ -138,9 +147,9 @@ class IndexedTarSampleReader:
         idx = _resolve_idx(idx, self._len)
         with open(self.data_path, 'rb') as f:
             f.seek(int(self.offsets[idx]))
-            json_name, json_bytes = _read_tar_member(f)
-            audio_name, audio_bytes = _read_tar_member(f)
-        return json.loads(json_bytes), audio_bytes, audio_name
+            name_a, bytes_a = _read_tar_member(f)
+            name_b, bytes_b = _read_tar_member(f)
+        return _split_json_audio_pair(name_a, bytes_a, name_b, bytes_b)
 
 
 def _read_tar_member(f):

@@ -38,6 +38,7 @@ from nemo.collections.common.data.lhotse.indexed_adapters import (
     IndexedJSONLReader,
     IndexedTarSampleReader,
     LazyShuffledRange,
+    _split_json_audio_pair,
 )
 from nemo.collections.common.data.lhotse.nemo_adapters import expand_sharded_filepaths
 from nemo.collections.common.data.prompt_fn import apply_prompt_format_fn, registered_prompt_format_fn
@@ -739,7 +740,7 @@ class NeMoMultimodalConversationShareGPTJsonlAdapter:
     We expect the following ShareGPT schema (contained in a single line per example)::
 
         {
-            "id": str,
+            "id": str,  # not optional, but we will tolerate if it's missing
             "sound": str,  # path to audio file
             "conversations": [
                 {
@@ -840,7 +841,7 @@ class NeMoMultimodalConversationShareGPTJsonlAdapter:
                     break
 
                 yield NeMoMultimodalConversation(
-                    id=data["id"],
+                    id=data.get("id", "missing-example-id"),
                     turns=_create_sharegpt_turns(self.audio_locator_tag, conversations, lambda t: cuts.popleft()),
                     token_equivalent_duration=self.token_equivalent_duration,
                 )
@@ -861,7 +862,7 @@ class NeMoMultimodalConversationShareGPTJsonlAdapter:
             for data in jsonl_iter:
                 conversations = _transform_sharegpt(self.audio_placeholders, data)
                 yield NeMoMultimodalConversation(
-                    id=data["id"],
+                    id=data.get("id", "missing-example-id"),
                     turns=_create_sharegpt_turns(
                         self.audio_locator_tag,
                         conversations,
@@ -881,7 +882,7 @@ class NeMoMultimodalConversationShareGPTJsonlAdapter:
                 data = reader[idx]
                 conversations = _transform_sharegpt(self.audio_placeholders, data)
                 yield NeMoMultimodalConversation(
-                    id=data["id"],
+                    id=data.get("id", "missing-example-id"),
                     turns=_create_sharegpt_turns(
                         self.audio_locator_tag,
                         conversations,
@@ -972,15 +973,19 @@ class NeMoMultimodalConversationShareGPTWebdatasetAdapter:
         for tar_path in shard_paths:
             with tarfile.open(tar_path, 'r:') as tar:
                 while True:
-                    json_info = tar.next()
-                    if json_info is None:
+                    info_a = tar.next()
+                    if info_a is None:
                         break
-                    audio_info = tar.next()
-                    if audio_info is None:
+                    info_b = tar.next()
+                    if info_b is None:
                         break
-                    json_data = json.loads(tar.extractfile(json_info).read())
-                    audio_bytes = tar.extractfile(audio_info).read()
-                    yield self._yield_from_sample(json_data, audio_bytes, audio_info.name)
+                    json_data, audio_bytes, audio_name = _split_json_audio_pair(
+                        info_a.name,
+                        tar.extractfile(info_a).read(),
+                        info_b.name,
+                        tar.extractfile(info_b).read(),
+                    )
+                    yield self._yield_from_sample(json_data, audio_bytes, audio_name)
         self.epoch += 1
 
     def _iter_indexed(self):
