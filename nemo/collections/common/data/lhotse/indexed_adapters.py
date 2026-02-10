@@ -15,6 +15,7 @@ import json
 import os
 import random
 import struct
+import tarfile
 from pathlib import Path
 
 import numpy as np
@@ -180,3 +181,106 @@ def create_index(jsonl_path, idx_path):
         # 5. Write any remaining offsets
         if write_buffer:
             f_out.write(write_buffer)
+
+
+def _read_tar_member(f):
+    """
+    Read a single tar member (header + data) at the current file position.
+    Skips PAX extended headers transparently.
+    Returns (member_name, data_bytes).
+    """
+    while True:
+        header_buf = f.read(512)
+        if len(header_buf) < 512 or header_buf == b'\0' * 512:
+            raise EOFError("End of tar archive or unexpected EOF")
+
+        info = tarfile.TarInfo.frombuf(header_buf, tarfile.ENCODING, "surrogateescape")
+        data = f.read(info.size)
+        if len(data) < info.size:
+            raise EOFError("Unexpected end of tar file while reading data")
+
+        # Skip padding to next 512-byte boundary
+        remainder = info.size % 512
+        if remainder:
+            f.seek(512 - remainder, 1)
+
+        # Skip PAX extended headers; re-read to get the actual file
+        if info.type in (tarfile.XHDTYPE, tarfile.XGLTYPE):
+            continue
+
+        return info.name, data
+
+
+class IndexedTarSampleReader:
+    """
+    Provides random access to samples in a WebDataset tar archive using an index file.
+    Each sample consists of a pair of files with the same basename: ``N.json`` + ``N.<audio_ext>``.
+
+    The index file has the same format as for ``IndexedJSONLReader``: a sequence of
+    little-endian unsigned 64-bit offsets, optionally followed by a sentinel equal to
+    the tar file size.
+
+    Each offset points to the start of the first tar member header for that sample (the
+    ``.json`` entry).
+    """
+
+    def __init__(self, tar_path: str | Path, idx_path: str | Path | None = None):
+        self.tar_path = str(tar_path)
+        if idx_path is None:
+            idx_path = self.tar_path + '.idx'
+        self.idx_path = str(idx_path)
+        assert os.path.exists(self.tar_path), f"Tar file not found: {self.tar_path}"
+        assert os.path.exists(self.idx_path), f"Index file not found: {self.idx_path}"
+
+        self.offsets = np.memmap(self.idx_path, dtype=np.dtype('<u8'), mode='r')
+        self.tar_size = os.path.getsize(self.tar_path)
+
+        if self.offsets[-1] == self.tar_size:
+            self._len = self.offsets.shape[0] - 1
+        else:
+            self._len = self.offsets.shape[0]
+
+    def __len__(self):
+        return self._len
+
+    def __getitem__(self, idx):
+        if idx < 0:
+            idx += self._len
+        if idx < 0 or idx >= self._len:
+            raise IndexError("Index out of bounds")
+
+        offset = int(self.offsets[idx])
+        with open(self.tar_path, 'rb') as f:
+            f.seek(offset)
+            json_name, json_bytes = _read_tar_member(f)
+            audio_name, audio_bytes = _read_tar_member(f)
+
+        return json.loads(json_bytes), audio_bytes, audio_name
+
+
+def create_tar_index(tar_path, idx_path):
+    """
+    Creates a raw binary index file for a WebDataset tar archive.
+
+    Samples in the tar consist of consecutive members with the same basename
+    (e.g. ``0.json``, ``0.wav``).  The index stores the byte offset of the first
+    member of each sample, followed by a sentinel equal to the tar file size.
+
+    Format is identical to :func:`create_index`: little-endian ``uint64`` values.
+    """
+    offsets = []
+    prev_stem = None
+    with tarfile.open(tar_path, 'r:') as tar:
+        for member in tar:
+            stem = Path(member.name).stem
+            if stem != prev_stem:
+                offsets.append(member.offset)
+                prev_stem = stem
+
+    with open(idx_path, 'wb') as f:
+        write_buffer = bytearray()
+        for off in offsets:
+            write_buffer.extend(struct.pack('<Q', off))
+        # Sentinel: tar file size
+        write_buffer.extend(struct.pack('<Q', os.path.getsize(tar_path)))
+        f.write(write_buffer)
