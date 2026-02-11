@@ -153,7 +153,8 @@ class IndexedTarSampleReader:
 
 
 def _read_tar_member(f):
-    """Read a single tar member at the current file position (skips PAX extended headers)."""
+    """Read the next regular-file tar member, skipping non-regular entries
+    (PAX headers, GNU long-name headers, directory entries, etc.)."""
     while True:
         header_buf = f.read(512)
         if len(header_buf) < 512 or header_buf == b'\0' * 512:
@@ -165,7 +166,7 @@ def _read_tar_member(f):
         remainder = info.size % 512
         if remainder:
             f.seek(512 - remainder, 1)
-        if info.type in (tarfile.XHDTYPE, tarfile.XGLTYPE):
+        if info.type not in (tarfile.REGTYPE, tarfile.AREGTYPE):
             continue
         return info.name, data
 
@@ -202,6 +203,8 @@ def create_tar_index(tar_path, idx_path):
     prev_stem = None
     with tarfile.open(tar_path, 'r:') as tar:
         for member in tar:
+            if not member.isreg():
+                continue
             stem = Path(member.name).stem
             if stem != prev_stem:
                 offsets.append(member.offset)

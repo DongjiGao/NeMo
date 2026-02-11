@@ -980,13 +980,8 @@ class NeMoMultimodalConversationShareGPTWebdatasetAdapter:
             rng.shuffle(shard_paths)
         for tar_path in shard_paths:
             with tarfile.open(tar_path, 'r:') as tar:
-                while True:
-                    info_a = tar.next()
-                    if info_a is None:
-                        break
-                    info_b = tar.next()
-                    if info_b is None:
-                        break
+                members = (m for m in tar if m.isreg())
+                for info_a, info_b in zip(members, members):
                     json_data, audio_bytes, audio_name = _split_json_audio_pair(
                         info_a.name,
                         tar.extractfile(info_a).read(),

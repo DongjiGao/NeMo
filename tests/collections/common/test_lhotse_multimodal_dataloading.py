@@ -1103,11 +1103,14 @@ def test_lazy_shuffled_range_different_seeds():
 # ─── WebDataset ShareGPT adapter tests ──────────────────────────────────────
 
 
-def _make_webdataset_dir(tmp_path, num_samples=6, num_shards=2, create_idx=True, audio_first=False, create_meta=True):
+def _make_webdataset_dir(
+    tmp_path, num_samples=6, num_shards=2, create_idx=True, audio_first=False, create_meta=True, add_dir_entries=False
+):
     """
     Helper: create a WebDataset directory layout with optional wids-meta.json,
     tar shards containing N.json + N.wav pairs, and optional .idx files.
     When *audio_first* is True the wav member is written before the json member.
+    When *add_dir_entries* is True, directory entries are inserted into each tar shard.
     """
     import io
     import json
@@ -1126,6 +1129,10 @@ def _make_webdataset_dir(tmp_path, num_samples=6, num_shards=2, create_idx=True,
     for shard_id in range(num_shards):
         tar_path = shard_dir / f"shard-{shard_id}.tar"
         with tarfile.open(tar_path, "w:") as tar:
+            if add_dir_entries:
+                d = tarfile.TarInfo(name="./")
+                d.type = tarfile.DIRTYPE
+                tar.addfile(d)
             for local_idx in range(shard_size):
                 data = {
                     "id": f"sample_{sample_idx}",
@@ -1429,3 +1436,29 @@ def test_webdataset_auto_discover_no_tars_raises(tmp_path_factory):
             data_dir=str(empty_dir),
             audio_locator_tag="[audio]",
         )
+
+
+@pytest.mark.parametrize("use_index", [False, True])
+def test_webdataset_tar_with_directory_entries(tmp_path_factory, use_index):
+    """Tar shards containing directory entries are handled correctly."""
+    wds_dir = _make_webdataset_dir(
+        tmp_path_factory.mktemp("webdataset_dir_entries"),
+        num_samples=4,
+        num_shards=2,
+        create_idx=use_index,
+        add_dir_entries=True,
+    )
+    adapter = NeMoMultimodalConversationShareGPTWebdatasetAdapter(
+        data_dir=str(wds_dir),
+        audio_locator_tag="[audio]",
+        shuffle_shards=use_index,
+        shard_seed=0,
+    )
+    conversations = list(adapter)
+    assert len(conversations) == 4
+    ids = sorted(c.id for c in conversations)
+    assert ids == [f"sample_{i}" for i in range(4)]
+    for conv in conversations:
+        audio_turns = [t for t in conv.turns if isinstance(t, AudioTurn)]
+        assert len(audio_turns) == 1
+        assert audio_turns[0].cut.load_audio().shape[0] == 1
