@@ -760,6 +760,7 @@ class NeMoMultimodalConversationShareGPTJsonlAdapter:
     audio_locator_tag: str
     audio_placeholders: Union[str, list[str]] = None
     tarred_audio_filepaths: str | list[str] = None
+    audio_root: str | None = None
     token_equivalent_duration: float = None
     shuffle_shards: bool = False
     shard_seed: Union[int, Literal["trng", "randomized"]] = "trng"
@@ -799,7 +800,7 @@ class NeMoMultimodalConversationShareGPTJsonlAdapter:
             data = open_best(turn["value"], "rb").read()
             cut = Recording.from_bytes(data, recording_id=turn["value"]).to_cut()
         else:
-            cut = Recording.from_file(get_full_path(turn["value"], manifest_path)).to_cut()
+            cut = Recording.from_file(get_full_path(turn["value"], manifest_path, data_dir=self.audio_root)).to_cut()
         return cut.truncate(offset=turn["offset"], duration=turn["duration"]).with_id(self._make_cut_id(cut, turn))
 
     def _iter_tar(self):

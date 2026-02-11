@@ -325,6 +325,7 @@ def read_share_gpt_as_conversation(config) -> tuple[CutSet, bool]:
             tarred_audio_filepaths=config.get("tarred_audio_filepaths"),
             audio_locator_tag=config.audio_locator_tag,
             audio_placeholders=config.audio_placeholders,
+            audio_root=config.get("audio_root"),
             token_equivalent_duration=config.get("token_equivalent_duration"),
             shuffle_shards=config.shuffle,
             shard_seed=config.shard_seed,
