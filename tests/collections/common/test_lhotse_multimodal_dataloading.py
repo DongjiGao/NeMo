@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import random
 from itertools import islice
 from pathlib import Path
@@ -25,7 +26,12 @@ from lhotse.testing.dummies import dummy_cut, dummy_recording
 from omegaconf import OmegaConf
 
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
-from nemo.collections.common.data.lhotse.indexed_adapters import LazyShuffledRange, create_index, create_tar_index
+from nemo.collections.common.data.lhotse.indexed_adapters import (
+    IndexedTarSampleReader,
+    LazyShuffledRange,
+    create_index,
+    create_tar_index,
+)
 from nemo.collections.common.data.lhotse.sampling import (
     DurationFilter,
     MultimodalFixedBucketBatchSizeConstraint2D,
@@ -1426,6 +1432,60 @@ def test_webdataset_auto_discover_shards_no_meta(tmp_path_factory, create_idx):
         audio_turns = [t for t in conv.turns if isinstance(t, AudioTurn)]
         assert len(audio_turns) == 1
         assert audio_turns[0].cut.load_audio().shape[0] == 1
+
+
+def test_indexed_tar_reader_rejects_bad_idx(webdataset_dir):
+    """IndexedTarSampleReader rejects an idx file with offsets that don't point to valid tar headers."""
+    import struct
+
+    shard_paths = sorted(webdataset_dir.rglob("*.tar"))
+    tar_path = str(shard_paths[0])
+    bad_idx = tar_path + ".bad.idx"
+    # Write garbage offsets (huge values well past file size)
+    with open(bad_idx, "wb") as f:
+        for i in range(5):
+            f.write(struct.pack("<Q", 10**15 + i))
+    with pytest.raises(ValueError, match="beyond file size"):
+        IndexedTarSampleReader(tar_path, bad_idx)
+
+
+def test_indexed_tar_reader_strips_trailing_zero_block_sentinel(tmp_path_factory):
+    """IndexedTarSampleReader silently strips trailing sentinel pointing to end-of-archive zero blocks."""
+    import struct
+
+    wds_dir = _make_webdataset_dir(
+        tmp_path_factory.mktemp("webdataset_zero_idx"), num_samples=2, num_shards=1, create_idx=True
+    )
+    tar_path = str(next(wds_dir.rglob("*.tar")))
+    tar_size = os.path.getsize(tar_path)
+    # Read the valid index to get the real offsets, then append a bad trailing entry
+    good_idx = tar_path + ".idx"
+    with open(good_idx, "rb") as f:
+        good_data = f.read()
+    bad_idx = tar_path + ".bad.idx"
+    # Take the valid sample offsets but replace the sentinel with a zero-block offset
+    with open(bad_idx, "wb") as f:
+        f.write(good_data[:-8])  # all offsets except the file-size sentinel
+        f.write(struct.pack("<Q", tar_size - 1024))  # add zero-block offset as sentinel
+    reader = IndexedTarSampleReader(tar_path, bad_idx)
+    assert len(reader) == 2  # trailing zero-block entry was stripped
+
+
+def test_indexed_tar_reader_rejects_all_zero_block_offsets(tmp_path_factory):
+    """IndexedTarSampleReader raises when all offsets (including first) point to zero blocks."""
+    import struct
+
+    wds_dir = _make_webdataset_dir(
+        tmp_path_factory.mktemp("webdataset_all_zero"), num_samples=2, num_shards=1, create_idx=False
+    )
+    tar_path = str(next(wds_dir.rglob("*.tar")))
+    tar_size = os.path.getsize(tar_path)
+    bad_idx = tar_path + ".idx"
+    with open(bad_idx, "wb") as f:
+        f.write(struct.pack("<Q", tar_size - 1024))
+        f.write(struct.pack("<Q", tar_size))
+    with pytest.raises(ValueError, match="zero block"):
+        IndexedTarSampleReader(tar_path, bad_idx)
 
 
 def test_webdataset_auto_discover_no_tars_raises(tmp_path_factory):

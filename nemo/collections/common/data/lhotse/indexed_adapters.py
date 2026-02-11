@@ -139,16 +139,86 @@ class IndexedTarSampleReader:
     def __init__(self, tar_path: str | Path, idx_path: str | Path | None = None):
         self.data_path = str(tar_path)
         self.offsets, self._len, self._data_size = _load_index(self.data_path, str(idx_path) if idx_path else None)
+        self._validate_index()
+
+    def _validate_index(self):
+        if self._len == 0:
+            return
+        max_offset = int(max(self.offsets[i] for i in range(self._len)))
+        if max_offset >= self._data_size:
+            raise ValueError(
+                f"Tar index for {self.data_path} contains offset {max_offset} "
+                f"beyond file size {self._data_size}. "
+                f"The .idx file may have been created by an incompatible tool "
+                f"or for a different file."
+            )
+        # Validate first offset is a valid tar header.
+        self._check_offset_is_tar_header(int(self.offsets[0]), label="first")
+        # Strip trailing sentinels: some tools store the offset of the
+        # end-of-archive zero-block marker as a sentinel instead of the
+        # file size (which _load_index already handles).
+        while self._len > 0:
+            last = int(self.offsets[self._len - 1])
+            with open(self.data_path, 'rb') as f:
+                f.seek(last)
+                buf = f.read(512)
+            if len(buf) < 512 or buf == b'\0' * 512:
+                self._len -= 1
+            else:
+                break
+
+    def _check_offset_is_tar_header(self, offset: int, label: str = ""):
+        with open(self.data_path, 'rb') as f:
+            f.seek(offset)
+            buf = f.read(512)
+        if len(buf) < 512:
+            raise ValueError(
+                f"Tar index for {self.data_path}: {label} offset {offset} "
+                f"is too close to EOF (file size {self._data_size})."
+            )
+        if buf == b'\0' * 512:
+            raise ValueError(
+                f"Tar index for {self.data_path}: {label} offset {offset} "
+                f"points to a zero block (end-of-archive marker), not a tar header. "
+                f"The .idx file may have been created by an incompatible tool "
+                f"or for a different file."
+            )
+        try:
+            tarfile.TarInfo.frombuf(buf, tarfile.ENCODING, "surrogateescape")
+        except tarfile.TarError as e:
+            raise ValueError(
+                f"Tar index for {self.data_path}: {label} offset {offset} "
+                f"does not point to a valid tar header: {e}. "
+                f"The .idx file may have been created by an incompatible tool "
+                f"(e.g. has a binary header or stores per-member offsets) "
+                f"or for a different file."
+            ) from e
 
     def __len__(self):
         return self._len
 
     def __getitem__(self, idx):
         idx = _resolve_idx(idx, self._len)
+        offset = int(self.offsets[idx])
         with open(self.data_path, 'rb') as f:
-            f.seek(int(self.offsets[idx]))
-            name_a, bytes_a = _read_tar_member(f)
-            name_b, bytes_b = _read_tar_member(f)
+            f.seek(offset)
+            try:
+                name_a, bytes_a = _read_tar_member(f)
+            except (EOFError, tarfile.TarError) as e:
+                raise type(e)(
+                    f"{e} — reading first member of sample {idx}/{self._len} "
+                    f"at offset {offset} in {self.data_path} "
+                    f"(file size {self._data_size})"
+                ) from e
+            try:
+                name_b, bytes_b = _read_tar_member(f)
+            except (EOFError, tarfile.TarError) as e:
+                raise type(e)(
+                    f"{e} — reading second member of sample {idx}/{self._len} "
+                    f"(first member was '{name_a}', {len(bytes_a)} bytes) "
+                    f"at offset {offset} in {self.data_path} "
+                    f"(file size {self._data_size})"
+                ) from e
         return _split_json_audio_pair(name_a, bytes_a, name_b, bytes_b)
 
 
