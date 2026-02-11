@@ -1315,6 +1315,58 @@ def test_webdataset_indexed_audio_loads_correctly(webdataset_dir):
         assert audio.shape[1] > 0
 
 
+def test_sharegpt_audio_root(tmp_path_factory):
+    """When audio_root is set, audio files are resolved relative to it, not the manifest directory."""
+    manifest_dir = tmp_path_factory.mktemp("sharegpt_manifest_dir")
+    audio_dir = tmp_path_factory.mktemp("sharegpt_audio_dir")
+
+    # Create audio files in audio_dir (separate from manifest)
+    dummy_recording(0, 2.0, with_data=True).to_cut().save_audio(audio_dir / "clip_a.wav")
+    dummy_recording(1, 3.0, with_data=True).to_cut().save_audio(audio_dir / "clip_b.wav")
+
+    manifest_path = manifest_dir / "manifest.jsonl"
+    data = [
+        {
+            "id": "root_convo_1",
+            "sound": "clip_a.wav",
+            "conversations": [
+                {"from": "human", "value": "Describe this: <sound>"},
+                {"from": "gpt", "value": "It sounds nice."},
+            ],
+        },
+        {
+            "id": "root_convo_2",
+            "sound": "clip_b.wav",
+            "conversations": [
+                {"from": "human", "value": "What about <sound>?"},
+                {"from": "gpt", "value": "Also nice."},
+            ],
+        },
+    ]
+    lhotse.serialization.save_to_jsonl(data, manifest_path)
+
+    adapter = NeMoMultimodalConversationShareGPTJsonlAdapter(
+        manifest_filepath=str(manifest_path),
+        audio_locator_tag="[audio]",
+        audio_root=str(audio_dir),
+    )
+    conversations = list(adapter)
+    assert len(conversations) == 2
+    assert conversations[0].id == "root_convo_1"
+    assert conversations[1].id == "root_convo_2"
+
+    # Verify audio was loaded from audio_dir
+    audio_turns_1 = [t for t in conversations[0].turns if isinstance(t, AudioTurn)]
+    assert len(audio_turns_1) == 1
+    assert abs(audio_turns_1[0].cut.duration - 2.0) < 0.01
+    assert audio_turns_1[0].cut.load_audio().shape[0] == 1
+
+    audio_turns_2 = [t for t in conversations[1].turns if isinstance(t, AudioTurn)]
+    assert len(audio_turns_2) == 1
+    assert abs(audio_turns_2[0].cut.duration - 3.0) < 0.01
+    assert audio_turns_2[0].cut.load_audio().shape[0] == 1
+
+
 @pytest.mark.parametrize("use_index", [False, True])
 def test_webdataset_audio_first_ordering(tmp_path_factory, use_index):
     """Tar samples with wav before json are handled correctly."""
