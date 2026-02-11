@@ -937,9 +937,14 @@ class NeMoMultimodalConversationShareGPTWebdatasetAdapter:
         import json as _json
 
         meta_path = Path(self.data_dir) / "wids-meta.json"
-        with open(meta_path) as f:
-            meta = _json.load(f)
-        self._shard_paths = [str(Path(self.data_dir) / shard_info["url"]) for shard_info in meta["shardlist"]]
+        if meta_path.exists():
+            with open(meta_path) as f:
+                meta = _json.load(f)
+            self._shard_paths = [str(Path(self.data_dir) / s["url"]) for s in meta["shardlist"]]
+        else:
+            self._shard_paths = sorted(str(p) for p in Path(self.data_dir).rglob("*.tar"))
+            if not self._shard_paths:
+                raise FileNotFoundError(f"No wids-meta.json and no .tar files found under {self.data_dir}")
         self.audio_placeholders = _normalize_audio_placeholders(self.audio_placeholders)
         self._has_index = all(Path(p + ".idx").exists() for p in self._shard_paths)
         self.epoch = 0
