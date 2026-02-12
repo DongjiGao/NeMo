@@ -47,6 +47,10 @@ def resolve_trainer_cfg(trainer_cfg: DictConfig) -> DictConfig:
     # Allows customizable strategies (eg ModelParallelStrategy) in YAML configs.
     if (strategy := trainer_cfg.get("strategy", None)) is not None and isinstance(strategy, Mapping):
         trainer_cfg["strategy"] = hydra.utils.instantiate(strategy)
+        # Convert dict-valued nemo_automodel configs to proper dataclass instances.
+        # This must happen AFTER Hydra instantiation because Hydra's recursive
+        # processing chokes on dataclass fields with Union types (e.g. MoEParallelizerConfig).
+        _resolve_automodel_configs(trainer_cfg["strategy"])
 
     # Allows to add custom callbacks (e.g. NsysCallback) from YAML config.
     if (cbs := trainer_cfg.get("callbacks", None)) is not None and isinstance(cbs, Sequence):
@@ -56,6 +60,36 @@ def resolve_trainer_cfg(trainer_cfg: DictConfig) -> DictConfig:
         trainer_cfg["callbacks"] = resolved
 
     return trainer_cfg
+
+
+def _resolve_automodel_configs(strategy) -> None:
+    """Convert plain dicts for ``distributed_config`` and ``moe_config`` to nemo_automodel objects.
+
+    When :class:`AutomodelParallelStrategy` is specified in YAML, ``distributed_config``
+    and ``moe_config`` arrive as plain dicts (Hydra passes them through as-is).
+    This function converts them to proper dataclass instances on the
+    already-instantiated strategy object.
+
+    Does nothing if the strategy doesn't have these attributes or if they are
+    already proper objects (not dicts).
+    """
+    if isinstance(getattr(strategy, '_distributed_config', None), Mapping):
+        from nemo_automodel.components.distributed.config import FSDP2Config
+
+        cfg = strategy._distributed_config
+        # Instantiate any nested _target_ dicts (e.g. a custom mp_policy)
+        resolved = {}
+        for k, v in cfg.items():
+            if isinstance(v, Mapping) and "_target_" in v:
+                resolved[k] = hydra.utils.instantiate(v)
+            else:
+                resolved[k] = v
+        strategy._distributed_config = FSDP2Config(**resolved)
+
+    if isinstance(getattr(strategy, '_moe_config', None), Mapping):
+        from nemo_automodel.components.moe.config import MoEParallelizerConfig
+
+        strategy._moe_config = MoEParallelizerConfig(**strategy._moe_config)
 
 
 class HalfPrecisionForAudio(HalfPrecision):
