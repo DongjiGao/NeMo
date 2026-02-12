@@ -69,8 +69,9 @@ class SALM(LightningModule, HFHubMixin):
         # del self.llm.model.embed_tokens
         # maybe_install_lora(self)
 
+        self.perception = None  # populated by configure_model
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
-        setup_speech_encoder(self, pretrained_weights=self.cfg.pretrained_weights)
+        #setup_speech_encoder(self, pretrained_weights=self.cfg.pretrained_weights)
 
         self._use_fsdp = False
         self._use_tp = False
@@ -434,6 +435,9 @@ class SALM(LightningModule, HFHubMixin):
         self.embed_tokens = self.llm.model.embed_tokens
         del self.llm.model.embed_tokens
         maybe_install_lora(self)
+
+        # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
+        setup_speech_encoder(self, pretrained_weights=self.cfg.pretrained_weights)
 
         if device_mesh is None:
             return
