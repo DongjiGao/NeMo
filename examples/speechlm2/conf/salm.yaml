@@ -7,9 +7,8 @@ model:
 
   # Regexp (re.compile) patterns matching parameters to be frozen.
   freeze_params:
-    # Frozen LLM
-    - "^llm\\..+$"  # LLM
-    - "^embed_tokens\\..+$"  # LLM embedding is moved
+    # Frozen LLM (embed_tokens stays inside llm, so this pattern covers it too)
+    - "^llm\\..+$"
     # Frozen pretrained ASR (only the modality adapter layers are trainable)
     - "^perception\\.preprocessor\\..+$"
     - "^perception\\.encoder\\..+$"
@@ -72,13 +71,38 @@ trainer:
   gradient_clip_val: 1.0
   accumulate_grad_batches: 1
   strategy:
-    # Replace DDPStrategy with ModelParallelStrategy to enable model parallelism
+    # Replace DDPStrategy with AutomodelParallelStrategy to enable FSDP2/TP/MoE parallelism.
+    # AutomodelParallelStrategy delegates device mesh creation to nemo_automodel and supports
+    # FSDP2, TP, PP, CP, EP (MoE), and HSDP. The model's configure_model() receives the
+    # device_mesh and passes it to automodel's from_pretrained for memory-efficient loading
+    # (each GPU only loads its own shard).
     _target_: lightning.pytorch.strategies.DDPStrategy
     gradient_as_bucket_view: true
     find_unused_parameters: true
-    # _target_: lightning.pytorch.strategies.ModelParallelStrategy
-    # tensor_parallel_size: 1
-    # data_parallel_size: 8  # This is FSDP2
+    #
+    # _target_: nemo.collections.speechlm2.parts.parallel.AutomodelParallelStrategy
+    #
+    # --- Parallelism dimensions ---
+    # dp_size: null       # Data parallel size (null = inferred from world_size / other dims)
+    # dp_replicate_size: 1  # HSDP replication group size (>1 enables hybrid sharding)
+    # tp_size: 1          # Tensor parallel size
+    # pp_size: 1          # Pipeline parallel size
+    # cp_size: 1          # Context parallel size
+    # ep_size: 1          # Expert parallel size (for MoE models)
+    #
+    # --- FSDP2 distributed config (plain dict, resolved to FSDP2Config automatically) ---
+    # distributed_config:
+    #   sequence_parallel: false    # Enable sequence parallelism (requires tp_size > 1)
+    #   activation_checkpointing: false  # Checkpoint activations to save memory
+    #   # offload_policy:           # Uncomment to enable CPU offloading
+    #   #   _target_: torch.distributed.fsdp.CPUOffloadPolicy
+    #
+    # --- MoE config (plain dict, resolved to MoEParallelizerConfig automatically) ---
+    # moe_config:
+    #   activation_checkpointing: false  # Checkpoint activations in MoE blocks
+    #   reshard_after_forward: false      # Reshard params after forward (saves memory, more comms)
+    #
+    # save_distributed_checkpoint: true  # Each rank saves its shard (false = gather to rank 0)
 
 data:
   train_ds:
