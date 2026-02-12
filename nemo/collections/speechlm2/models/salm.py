@@ -432,6 +432,15 @@ class SALM(LightningModule, HFHubMixin):
     def configure_model(self) -> None:
         device_mesh = self.device_mesh
 
+        # Derive dtype from trainer precision (e.g. "bf16-true" -> bfloat16).
+        dtype = torch.float32
+        if self._trainer is not None:
+            precision = str(self._trainer.precision)
+            if "bf16" in precision:
+                dtype = torch.bfloat16
+            elif "16" in precision:
+                dtype = torch.float16
+
         # Get parallelism config from strategy (if using AutomodelParallelStrategy)
         distributed_config = None
         moe_mesh = None
@@ -462,6 +471,7 @@ class SALM(LightningModule, HFHubMixin):
         self.llm = load_pretrained_automodel(
             self.cfg.pretrained_llm,
             pretrained_weights=self.cfg.pretrained_weights,
+            dtype=dtype,
             **automodel_kwargs,
         )
 
