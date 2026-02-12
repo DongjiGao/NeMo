@@ -296,6 +296,24 @@ class SALM(LightningModule, HFHubMixin):
         with loss_parallel():
             super().backward(*args, **kwargs)
 
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val, gradient_clip_algorithm=None):
+        """Override Lightning's gradient clipping to handle mixed FSDP device meshes.
+
+        When automodel parallelizes the LLM, some parameters end up as DTensors
+        on the ``(dp_replicate, dp_shard_cp)`` mesh while others may be on the
+        flattened ``dp`` mesh.  PyTorch's ``clip_grad_norm_`` requires all norms
+        to share the same mesh for ``torch.stack``.  We delegate to automodel's
+        mesh-aware ``_clip_grad_norm_impl`` which groups parameters by
+        ``(mesh_id, placements)`` and combines per-group norms as plain tensors.
+        """
+        if not self._use_fsdp or gradient_clip_val is None or gradient_clip_val <= 0:
+            return super().configure_gradient_clipping(optimizer, gradient_clip_val, gradient_clip_algorithm)
+        from nemo_automodel.components.training.utils import _clip_grad_norm_impl
+
+        params = [p for group in optimizer.param_groups for p in group["params"] if p.grad is not None]
+        if params:
+            _clip_grad_norm_impl(params, max_norm=gradient_clip_val)
+
     @torch.no_grad()
     def generate(
         self,
