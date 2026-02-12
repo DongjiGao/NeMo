@@ -444,12 +444,20 @@ class SALM(LightningModule, HFHubMixin):
         automodel_kwargs = {}
         if device_mesh is not None:
             automodel_kwargs["device_mesh"] = device_mesh
-        if distributed_config is not None:
+            # automodel's instantiate_infrastructure unconditionally calls
+            # .to_dict() on these configs, so we must always provide defaults.
+            if distributed_config is None:
+                from nemo_automodel.components.distributed.config import FSDP2Config
+
+                distributed_config = FSDP2Config()
+            if moe_config is None:
+                from nemo_automodel.components.moe.config import MoEParallelizerConfig
+
+                moe_config = MoEParallelizerConfig()
             automodel_kwargs["distributed_config"] = distributed_config
+            automodel_kwargs["moe_config"] = moe_config
         if moe_mesh is not None:
             automodel_kwargs["moe_mesh"] = moe_mesh
-        if moe_config is not None:
-            automodel_kwargs["moe_config"] = moe_config
 
         self.llm = load_pretrained_automodel(
             self.cfg.pretrained_llm,
