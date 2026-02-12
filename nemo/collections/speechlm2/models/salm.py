@@ -13,7 +13,6 @@
 # limitations under the License.
 import warnings
 from collections import defaultdict
-from contextlib import contextmanager
 from itertools import repeat
 from pathlib import Path
 from typing import Any, Optional
@@ -24,6 +23,7 @@ from lightning import LightningModule
 from omegaconf import DictConfig
 from torch import Tensor
 from torch.distributed.fsdp import fully_shard
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import loss_parallel
 from transformers import GenerationConfig
 
@@ -58,7 +58,6 @@ class SALM(LightningModule, HFHubMixin):
 
         self._use_fsdp = False
         self._use_tp = False
-        self._fsdp_lazy_init_done = False
 
     @property
     def embed_tokens(self):
@@ -67,16 +66,21 @@ class SALM(LightningModule, HFHubMixin):
             return None
         return self.llm.model.embed_tokens
 
-    @contextmanager
-    def _unshard_embed_tokens(self):
-        """Temporarily unshard root FSDP params so embed_tokens is accessible outside LLM forward."""
-        if self._use_fsdp:
-            self.llm.unshard()
-        try:
-            yield
-        finally:
-            if self._use_fsdp:
-                self.llm.reshard()
+    def _embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed token IDs using the LLM's embedding table.
+
+        Uses ``F.embedding`` instead of calling the ``nn.Embedding`` module to
+        avoid triggering FSDP2 pre-forward hooks (which lazily initialize the
+        child before the root LLM module, causing a ``RuntimeError``).
+
+        When the weight is a sharded ``DTensor`` (FSDP2), we ``full_tensor()``
+        it first to all-gather the complete embedding table — the same operation
+        FSDP2 performs inside the LLM's forward pass.
+        """
+        weight = self.embed_tokens.weight
+        if isinstance(weight, DTensor):
+            weight = weight.full_tensor()
+        return torch.nn.functional.embedding(input_ids, weight)
 
     @property
     def text_vocab_size(self):
@@ -163,8 +167,7 @@ class SALM(LightningModule, HFHubMixin):
         )
         audio_embs = [emb[:emblen] for emb, emblen in zip(audio_embs, audio_emb_lens)]
         input_ids_to_embed = torch.where(batch["input_ids"] == self.audio_locator_tag_id, 0, batch["input_ids"])
-        with self._unshard_embed_tokens():
-            text_embs = self.embed_tokens(input_ids_to_embed)
+        text_embs = self._embed_tokens(input_ids_to_embed)
         input_embs, target_ids, attention_mask = replace_placeholders_and_build_targets(
             input_ids=batch["input_ids"],
             embeds=text_embs,
@@ -413,8 +416,7 @@ class SALM(LightningModule, HFHubMixin):
             # Audio + text input for generation.
             # Prepare token embeddings and audio embeddings.
             tokens_to_embed = tokens.where(tokens != self.audio_locator_tag_id, 0)
-            with self._unshard_embed_tokens():
-                token_embeds = self.embed_tokens(tokens_to_embed)
+            token_embeds = self._embed_tokens(tokens_to_embed)
             # TODO: temporary workaround to perform batch_size=1 inference for audio encoder
             #   due to accuracy issues at bs>1
             audio_embeds, audio_embed_lens = self.perception(audios, audio_lens)
@@ -444,19 +446,6 @@ class SALM(LightningModule, HFHubMixin):
                 generation_config=generation_config,
             )
         return answer_tokens
-
-    def setup(self, stage=None):
-        super().setup(stage)
-        if self._use_fsdp and not self._fsdp_lazy_init_done:
-            # FSDP2 lazy-initializes internal state on the first root forward.
-            # Our _unshard_embed_tokens() calls llm.unshard() which partially
-            # triggers that lazy init, causing "FSDP state has already been
-            # lazily initialized" errors.  A single dummy forward through the
-            # LLM completes lazy init so that subsequent unshard/reshard work.
-            device = torch.device("cuda", torch.cuda.current_device())
-            with torch.no_grad():
-                self.llm(input_ids=torch.zeros(1, 1, dtype=torch.long, device=device))
-            self._fsdp_lazy_init_done = True
 
     def configure_optimizers(self):
         return configure_optimizers(self)
