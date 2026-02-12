@@ -22,13 +22,15 @@ from nemo.core.config import hydra_runner
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg
 
-torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+if torch.cuda.is_available():
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 
 @hydra_runner(config_path="conf", config_name="salm")
 def train(cfg):
     OmegaConf.resolve(cfg)
-    torch.distributed.init_process_group(backend="nccl")
+    if torch.cuda.is_available():
+        torch.distributed.init_process_group(backend="nccl")
     torch.set_float32_matmul_precision("medium")
     trainer = Trainer(**resolve_trainer_cfg(cfg.trainer))
     log_dir = exp_manager(trainer, cfg.get("exp_manager", None))

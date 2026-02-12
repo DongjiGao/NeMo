@@ -59,12 +59,15 @@ class SALM(LightningModule, HFHubMixin):
 
         self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
         self.tokenizer.add_special_tokens({"additional_special_tokens": [self.audio_locator_tag]})
-        self.llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights)
+        self.llm = None  # populated by configure_model
+        self.embed_tokens = None  # populated by configure_model
+        # self.llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights)
+
         # Note: we have to "move out" the token embedding outside of LLM to avoid
         #       messing up FSDP/TP hooks.
-        self.embed_tokens = self.llm.model.embed_tokens
-        del self.llm.model.embed_tokens
-        maybe_install_lora(self)
+        # self.embed_tokens = self.llm.model.embed_tokens
+        # del self.llm.model.embed_tokens
+        # maybe_install_lora(self)
 
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
         setup_speech_encoder(self, pretrained_weights=self.cfg.pretrained_weights)
@@ -423,6 +426,15 @@ class SALM(LightningModule, HFHubMixin):
     def configure_model(self) -> None:
         # TODO(pzelasko): refactor into separate module re-usable across models
         device_mesh = self.device_mesh
+
+        self.llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights)
+
+        # Note: we have to "move out" the token embedding outside of LLM to avoid
+        #       messing up FSDP/TP hooks.
+        self.embed_tokens = self.llm.model.embed_tokens
+        del self.llm.model.embed_tokens
+        maybe_install_lora(self)
+
         if device_mesh is None:
             return
 
