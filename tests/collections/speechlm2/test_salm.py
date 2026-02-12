@@ -105,6 +105,7 @@ def model():
         "optimizer": {"_target_": "torch.optim.AdamW"},
     }
     model = SALM(cfg)
+    model.configure_model()
     if torch.cuda.is_available():
         model.to("cuda")
     return model

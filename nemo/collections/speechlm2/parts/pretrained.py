@@ -55,6 +55,45 @@ def load_pretrained_hf(model_path_or_name: str, pretrained_weights: bool = True,
         return AutoModelForCausalLM.from_config(config, torch_dtype=dtype)
 
 
+def load_pretrained_automodel(model_path_or_name: str, pretrained_weights: bool = True, dtype=torch.float32, **kwargs):
+    """
+    Load a causal LM using NeMo Automodel (``NeMoAutoModelForCausalLM``).
+
+    Automodel is a drop-in HuggingFace replacement that provides Liger kernel +
+    SDPA attention optimizations and model-type-aware parallelization.
+
+    Setting ``pretrained_weights=False`` returns a model that has identical architecture
+    with the checkpoint, but is randomly initialized.
+
+    Extra ``kwargs`` (e.g. ``device_mesh``, ``distributed_config``, ``moe_mesh``,
+    ``moe_config``) are forwarded to the underlying ``from_pretrained`` /
+    ``from_config`` call so that parallelization happens during loading.
+    """
+    from nemo_automodel import NeMoAutoModelForCausalLM
+
+    if pretrained_weights:
+        return NeMoAutoModelForCausalLM.from_pretrained(model_path_or_name, torch_dtype=dtype, **kwargs)
+    else:
+        config = AutoConfig.from_pretrained(model_path_or_name)
+        return NeMoAutoModelForCausalLM.from_config(config, torch_dtype=dtype, **kwargs)
+
+
+def update_perception_output_dim(model):
+    """
+    Align the perception module's output projection with the actual LLM hidden size.
+
+    When the LLM is loaded after the perception module (deferred init in
+    ``configure_model``), the projection layer may have been created with an
+    ``output_dim`` from the YAML config that doesn't match the LLM.  This
+    helper replaces ``perception.proj`` with a correctly-sized ``nn.Linear``
+    when the dimensions disagree.
+    """
+    hidden_size = model.llm.config.hidden_size
+    proj = model.perception.proj
+    if isinstance(proj, torch.nn.Linear) and proj.out_features != hidden_size:
+        model.perception.proj = torch.nn.Linear(proj.in_features, hidden_size, bias=proj.bias is not None)
+
+
 @contextmanager
 def move_embedding(model):
     """Temporarily restores the embedding layer into HF LLM. Supports LoRA models."""
@@ -96,7 +135,8 @@ def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True
         with open_dict(model.cfg):
             model.cfg.perception.preprocessor = asr.cfg.preprocessor
             model.cfg.perception.encoder = asr.cfg.encoder
-            model.cfg.perception.output_dim = model.llm.config.hidden_size
+            if model.llm is not None:
+                model.cfg.perception.output_dim = model.llm.config.hidden_size
         model.perception = AudioPerceptionModule(model.cfg.perception).train()
         model.perception.load_state_dict(asr.state_dict(), strict=False)
     else:
