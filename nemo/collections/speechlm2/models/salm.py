@@ -58,6 +58,7 @@ class SALM(LightningModule, HFHubMixin):
 
         self._use_fsdp = False
         self._use_tp = False
+        self._fsdp_lazy_init_done = False
 
     @property
     def embed_tokens(self):
@@ -443,6 +444,19 @@ class SALM(LightningModule, HFHubMixin):
                 generation_config=generation_config,
             )
         return answer_tokens
+
+    def setup(self, stage=None):
+        super().setup(stage)
+        if self._use_fsdp and not self._fsdp_lazy_init_done:
+            # FSDP2 lazy-initializes internal state on the first root forward.
+            # Our _unshard_embed_tokens() calls llm.unshard() which partially
+            # triggers that lazy init, causing "FSDP state has already been
+            # lazily initialized" errors.  A single dummy forward through the
+            # LLM completes lazy init so that subsequent unshard/reshard work.
+            device = torch.device("cuda", torch.cuda.current_device())
+            with torch.no_grad():
+                self.llm(input_ids=torch.zeros(1, 1, dtype=torch.long, device=device))
+            self._fsdp_lazy_init_done = True
 
     def configure_optimizers(self):
         return configure_optimizers(self)
