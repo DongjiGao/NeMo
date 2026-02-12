@@ -488,10 +488,20 @@ class SALM(LightningModule, HFHubMixin):
 
         if device_mesh["tp"].size() > 1:
             self._use_tp = True
-        dp_mesh = device_mesh["dp"]
-        if dp_mesh.size() > 1:
+
+        # Use the same FSDP mesh as automodel uses for the LLM so that
+        # gradient clipping can torch.stack norms from all parameters.
+        dim_names = device_mesh.mesh_dim_names
+        if "dp_replicate" in dim_names and "dp_shard_cp" in dim_names:
+            fsdp_mesh = device_mesh["dp_replicate", "dp_shard_cp"]
+        elif "dp_shard_cp" in dim_names:
+            fsdp_mesh = device_mesh["dp_shard_cp"]
+        else:
+            fsdp_mesh = device_mesh["dp"]
+
+        if fsdp_mesh.size() > 1:
             self._use_fsdp = True
-            self.perception = fully_shard(self.perception, mesh=dp_mesh)
+            self.perception = fully_shard(self.perception, mesh=fsdp_mesh)
 
     @property
     def oomptimizer_schema(self) -> dict:
