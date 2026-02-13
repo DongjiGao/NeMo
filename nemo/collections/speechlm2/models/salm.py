@@ -143,9 +143,13 @@ class SALM(LightningModule, HFHubMixin):
             use_cache=cache is not None,
             return_dict=True,
         )
-        ans = {"logits": out['logits']}  # (B, T, text_vocab_size)
-        if cache is not None:
-            ans["cache"] = out["past_key_values"]
+        if not isinstance(out, dict):
+            # NeMo Automodel doesn't respect return_dict=True yet
+            ans = {"logits": out}
+        else:
+            ans = {"logits": out['logits']}  # (B, T, text_vocab_size)
+            if cache is not None:
+                ans["cache"] = out["past_key_values"]
         return ans
 
     def prepare_inputs(self, batch: dict):
@@ -731,3 +735,4 @@ def _resolve_audios_in_prompt(
         torch.as_tensor(audio).to(device, non_blocking=True),
         torch.as_tensor(audio_lens).to(device, non_blocking=True),
     )
+
