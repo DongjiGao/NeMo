@@ -74,8 +74,6 @@ class HFHubMixin(
             revision=revision,
             cache_dir=cache_dir,
             force_download=force_download,
-            proxies=proxies,
-            resume_download=resume_download,
             local_files_only=local_files_only,
             token=token,
             map_location=map_location,
