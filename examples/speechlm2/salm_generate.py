@@ -58,7 +58,6 @@ def main(cfg: SalmEvalConfig):
         model = SALMWithAsrDecoder.from_pretrained(cfg.pretrained_name)
     else:
         model = SALM.from_pretrained(cfg.pretrained_name)
-        model.configure_model()
     model = model.eval().to(getattr(torch, cfg.dtype)).to(cfg.device)
 
     conversations = (

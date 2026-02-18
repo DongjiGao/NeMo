@@ -59,6 +59,9 @@ class SALM(LightningModule, HFHubMixin):
         self._use_fsdp = False
         self._use_tp = False
 
+        if self.cfg.init_configure_model:
+            self.configure_model()
+
     @property
     def embed_tokens(self):
         """Navigate to the LLM's embedding layer (kept inside the LLM)."""
@@ -735,4 +738,3 @@ def _resolve_audios_in_prompt(
         torch.as_tensor(audio).to(device, non_blocking=True),
         torch.as_tensor(audio_lens).to(device, non_blocking=True),
     )
-

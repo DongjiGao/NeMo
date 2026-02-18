@@ -61,9 +61,9 @@ def main(cfg: HfExportConfig):
     """
     model_cfg = OmegaConf.to_container(OmegaConf.load(cfg.ckpt_config).model, resolve=True)
     model_cfg["torch_dtype"] = cfg.dtype
+    model_cfg["init_configure_model"] = True  # triggers self.configure_model() at the end of __init__
     cls = import_class_by_path(cfg.class_path)
     model = cls(model_cfg)
-    model.configure_model()
     load_checkpoint(model, cfg.ckpt_path)
     model = model.to(getattr(torch, cfg.dtype))
     model.save_pretrained(cfg.output_dir)
