@@ -236,10 +236,16 @@ def _load_state_dict_with_dtensors(model, weight_dir):
     # Build state dict from named_parameters/named_buffers.
     # This avoids FSDP2 state-dict hooks that model.state_dict() triggers.
     # DCP will write directly into these tensors in-place.
-    state_dict = dict(chain(model.named_parameters(), model.named_buffers()))
+    all_params = dict(chain(model.named_parameters(), model.named_buffers()))
+
+    # DCP is strict by default — it errors on model keys missing from the
+    # checkpoint (e.g. positional-encoding buffers computed at init).
+    # Read the checkpoint metadata first and keep only matching keys.
+    reader = _HuggingFaceStorageReader(path=weight_dir)
+    checkpoint_keys = reader.read_metadata().state_dict_metadata.keys()
+    state_dict = {k: v for k, v in all_params.items() if k in checkpoint_keys}
 
     # DCP + HF storage reader: parses safetensors header for byte offsets,
     # the planner narrows each tensor to the local DTensor shard,
     # and copies directly into model parameter storage.
-    reader = _HuggingFaceStorageReader(path=weight_dir)
     dcp.load(state_dict, storage_reader=reader)
