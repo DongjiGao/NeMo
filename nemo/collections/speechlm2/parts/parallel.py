@@ -103,13 +103,19 @@ class AutomodelParallelStrategy(ModelParallelStrategy):
         """The nemo_automodel MoE configuration."""
         return self._moe_config
 
-    @override
-    def setup_environment(self) -> None:
+    def create_device_mesh(self):
+        """Create the device mesh from the configured parallelism sizes.
+
+        Requires ``torch.distributed`` to already be initialized.  This is
+        called automatically by :meth:`setup_environment`, but can also be
+        called standalone (e.g. in checkpoint-conversion scripts) after
+        manual ``dist.init_process_group``.
+
+        Returns:
+            Tuple of ``(device_mesh, moe_mesh)``.
+        """
         from nemo_automodel.components.distributed.config import FSDP2Config
         from nemo_automodel.components.distributed.device_mesh import create_device_mesh
-
-        # Initialize accelerator device and distributed process group.
-        self._setup_distributed()
 
         if self._distributed_config is None:
             self._distributed_config = FSDP2Config()
@@ -124,6 +130,14 @@ class AutomodelParallelStrategy(ModelParallelStrategy):
             ep_size=self._ep_size,
             world_size=dist.get_world_size(),
         )
+        return self._device_mesh, self._moe_mesh
+
+    @override
+    def setup_environment(self) -> None:
+        # Initialize accelerator device and distributed process group.
+        self._setup_distributed()
+
+        self.create_device_mesh()
 
         # Make device mesh accessible to the LightningModule via self.device_mesh
         assert self.lightning_module is not None
