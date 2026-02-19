@@ -211,20 +211,34 @@ def _distributed_from_pretrained(
     )
 
     # 3. Load weights
-    #    Plain load_state_dict fails because in-place copy from torch.Tensor
-    #    to DTensor is not supported.  We use set_model_state_dict which
-    #    properly distributes regular tensors into DTensor parameters
-    #    created by FSDP2/TP.
-    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
-
     weight_file = cached_file(model_id, SAFETENSORS_SINGLE_FILE, **cached_file_kwargs)
     if weight_file is None:
         raise RuntimeError(f"Missing {SAFETENSORS_SINGLE_FILE} file for {model_id=}")
     state_dict = safetensors.torch.load_file(str(weight_file))
-    set_model_state_dict(
-        instance,
-        model_state_dict=state_dict,
-        options=StateDictOptions(strict=False, full_state_dict=True),
-    )
+    _load_state_dict_with_dtensors(instance, state_dict)
 
     return instance
+
+
+def _load_state_dict_with_dtensors(model, state_dict):
+    """Load a full (non-sharded) state dict into a model with DTensor parameters.
+
+    Plain ``load_state_dict`` fails when the model has DTensor parameters
+    (from FSDP2/TP) because in-place copy from ``torch.Tensor`` to ``DTensor``
+    is not supported.
+
+    This function converts each tensor in the state dict to a DTensor matching
+    the corresponding model parameter's mesh and placements via
+    ``distribute_tensor``.  Since every rank already holds the full tensor,
+    ``distribute_tensor`` is a cheap local slice — no communication needed.
+    """
+    from torch.distributed.tensor import DTensor, distribute_tensor
+
+    model_state = model.state_dict()
+    for key in state_dict:
+        if key not in model_state:
+            continue
+        param = model_state[key]
+        if isinstance(param, DTensor):
+            state_dict[key] = distribute_tensor(state_dict[key], param.device_mesh, param.placements)
+    model.load_state_dict(state_dict, strict=False)
