@@ -399,7 +399,7 @@ class SALM(LightningModule, HFHubMixin):
         """
         # Encode prompt dicts into int token ids.
         if isinstance(prompts, torch.Tensor):
-            tokens = prompts
+            tokens = prompts.to(self.device)
         else:
             if (
                 maybe_audio := _resolve_audios_in_prompt(prompts, sampling_rate=self.sampling_rate, device=self.device)

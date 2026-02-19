@@ -191,8 +191,6 @@ def _distributed_from_pretrained(
     ``__init__`` frame, causing ``KeyError: 'self'``.  By moving the constructor
     call here (a plain module-level function), the problematic frame is avoided.
     """
-    import safetensors.torch
-
     model_kwargs['cfg']['init_configure_model'] = False
     if torch_dtype is not None:
         model_kwargs['cfg']['torch_dtype'] = (
@@ -214,31 +212,53 @@ def _distributed_from_pretrained(
     weight_file = cached_file(model_id, SAFETENSORS_SINGLE_FILE, **cached_file_kwargs)
     if weight_file is None:
         raise RuntimeError(f"Missing {SAFETENSORS_SINGLE_FILE} file for {model_id=}")
-    state_dict = safetensors.torch.load_file(str(weight_file))
-    _load_state_dict_with_dtensors(instance, state_dict)
+    _load_state_dict_with_dtensors(instance, str(weight_file))
 
     return instance
 
 
-def _load_state_dict_with_dtensors(model, state_dict):
-    """Load a full (non-sharded) state dict into a model with DTensor parameters.
+def _load_state_dict_with_dtensors(model, weight_file):
+    """Load a full (non-sharded) safetensors file into a model with DTensor parameters.
 
     Plain ``load_state_dict`` fails when the model has DTensor parameters
     (from FSDP2/TP) because in-place copy from ``torch.Tensor`` to ``DTensor``
     is not supported.
 
-    This function converts each tensor in the state dict to a DTensor matching
-    the corresponding model parameter's mesh and placements via
-    ``distribute_tensor``.  Since every rank already holds the full tensor,
-    ``distribute_tensor`` is a cheap local slice — no communication needed.
+    This function converts each tensor to a DTensor matching the corresponding
+    model parameter's mesh and placements via ``distribute_tensor``.  Since
+    every rank already holds the full tensor, ``distribute_tensor`` is a cheap
+    local slice — no communication needed.
+
+    Two optimizations over the naive approach:
+
+    1. DTensor metadata is read from ``named_parameters()`` / ``named_buffers()``
+       instead of ``model.state_dict()``, avoiding FSDP2 state-dict hooks.
+    2. Tensors are streamed one-at-a-time via ``safe_open`` instead of loading
+       the entire file at once, capping peak CPU memory at ~1 tensor.
     """
+    from itertools import chain
+
+    from safetensors import safe_open
     from torch.distributed.tensor import DTensor, distribute_tensor
 
-    model_state = model.state_dict()
-    for key in state_dict:
-        if key not in model_state:
-            continue
-        param = model_state[key]
+    # 1. Collect DTensor specs from parameters directly — no FSDP2 hooks.
+    dtensor_specs = {}
+    for name, param in chain(model.named_parameters(), model.named_buffers()):
         if isinstance(param, DTensor):
-            state_dict[key] = distribute_tensor(state_dict[key], param.device_mesh, param.placements)
+            dtensor_specs[name] = (param.device_mesh, param.placements)
+
+    # 2. Stream tensors one at a time via safe_open (memory-mapped).
+    #    For each tensor: load full to CPU -> distribute_tensor transfers
+    #    only the local shard (1/N) to GPU -> full CPU tensor freed.
+    state_dict = {}
+    with safe_open(weight_file, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            tensor = f.get_tensor(key)
+            if key in dtensor_specs:
+                mesh, placements = dtensor_specs[key]
+                state_dict[key] = distribute_tensor(tensor, mesh, placements)
+            else:
+                state_dict[key] = tensor
+
+    # 3. Load — types match (DTensor->DTensor), copy succeeds.
     model.load_state_dict(state_dict, strict=False)
