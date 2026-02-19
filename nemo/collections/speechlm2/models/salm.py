@@ -457,7 +457,7 @@ class SALM(LightningModule, HFHubMixin):
     def configure_optimizers(self):
         return configure_optimizers(self)
 
-    def configure_model(self) -> None:
+    def configure_model(self, strategy=None) -> None:
         device_mesh = self.device_mesh
 
         # Derive dtype from trainer precision (e.g. "bf16-true" -> bfloat16).
@@ -473,7 +473,11 @@ class SALM(LightningModule, HFHubMixin):
         distributed_config = None
         moe_mesh = None
         moe_config = None
-        if self._trainer is not None and hasattr(self._trainer.strategy, "distributed_config"):
+        if strategy is not None:
+            distributed_config = strategy.distributed_config
+            moe_mesh = strategy.moe_mesh
+            moe_config = strategy.moe_config
+        elif self._trainer is not None and hasattr(self._trainer.strategy, "distributed_config"):
             distributed_config = getattr(self._trainer.strategy, "distributed_config", None)
             moe_mesh = getattr(self._trainer.strategy, "moe_mesh", None)
             moe_config = getattr(self._trainer.strategy, "moe_config", None)

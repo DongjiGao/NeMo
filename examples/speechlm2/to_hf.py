@@ -77,7 +77,7 @@ def setup_distributed_with_strategy(strategy_cfg: dict):
 
     strategy = hydra.utils.instantiate(strategy_cfg)
     _resolve_automodel_configs(strategy)
-    return strategy.create_device_mesh()
+    return strategy
 
 
 def consolidate_state_dict(model: torch.nn.Module):
@@ -91,6 +91,21 @@ def consolidate_state_dict(model: torch.nn.Module):
         else:
             consolidated[key] = value.cpu()
     return consolidated
+
+
+def save_hf_checkpoint(model: torch.nn.Module, state_dict: dict, cfg: HfExportConfig):
+    """Save a consolidated state dict and model config in HuggingFace Hub format."""
+    output_dir = Path(cfg.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    target_dtype = getattr(torch, cfg.dtype)
+    state_dict = {k: v.to(target_dtype) for k, v in state_dict.items()}
+
+    save_file(state_dict, output_dir / "model.safetensors")
+
+    config = OmegaConf.to_container(model.cfg) if isinstance(model.cfg, DictConfig) else model.cfg
+    with open(output_dir / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
 
 
 def _uses_automodel_parallel(strategy_cfg: dict) -> bool:
@@ -139,14 +154,13 @@ def main(cfg: HfExportConfig):
     if is_distributed:
         import torch.distributed as dist
 
-        device_mesh, moe_mesh = setup_distributed_with_strategy(strategy_cfg)
+        strategy = setup_distributed_with_strategy(strategy_cfg)
 
         # Don't call configure_model() inside __init__ — we set device_mesh first.
         model_cfg["init_configure_model"] = False
         model = cls(model_cfg)
-        model._device_mesh = device_mesh
-        model._moe_mesh = moe_mesh
-        model.configure_model()
+        model._device_mesh = strategy.device_mesh
+        model.configure_model(strategy)
 
         load_checkpoint(model, cfg.ckpt_path)
 
