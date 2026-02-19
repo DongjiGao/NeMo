@@ -212,53 +212,34 @@ def _distributed_from_pretrained(
     weight_file = cached_file(model_id, SAFETENSORS_SINGLE_FILE, **cached_file_kwargs)
     if weight_file is None:
         raise RuntimeError(f"Missing {SAFETENSORS_SINGLE_FILE} file for {model_id=}")
-    _load_state_dict_with_dtensors(instance, str(weight_file))
+    _load_state_dict_with_dtensors(instance, str(Path(weight_file).parent))
 
     return instance
 
 
-def _load_state_dict_with_dtensors(model, weight_file):
-    """Load a full (non-sharded) safetensors file into a model with DTensor parameters.
+def _load_state_dict_with_dtensors(model, weight_dir):
+    """Load safetensors weights into a model with DTensor parameters using DCP.
 
-    Plain ``load_state_dict`` fails when the model has DTensor parameters
-    (from FSDP2/TP) because in-place copy from ``torch.Tensor`` to ``DTensor``
-    is not supported.
+    Uses ``torch.distributed.checkpoint`` with ``_HuggingFaceStorageReader``
+    to load weights directly into model parameters in-place.  This mirrors
+    the loading path used by ``NeMoAutoModelForCausalLM``.
 
-    This function converts each tensor to a DTensor matching the corresponding
-    model parameter's mesh and placements via ``distribute_tensor``.  Since
-    every rank already holds the full tensor, ``distribute_tensor`` is a cheap
-    local slice — no communication needed.
-
-    Two optimizations over the naive approach:
-
-    1. DTensor metadata is read from ``named_parameters()`` / ``named_buffers()``
-       instead of ``model.state_dict()``, avoiding FSDP2 state-dict hooks.
-    2. Tensors are streamed one-at-a-time via ``safe_open`` instead of loading
-       the entire file at once, capping peak CPU memory at ~1 tensor.
+    Args:
+        model: The model with DTensor parameters (after ``configure_model``).
+        weight_dir: Directory containing ``.safetensors`` file(s).
     """
     from itertools import chain
 
-    from safetensors import safe_open
-    from torch.distributed.tensor import DTensor, distribute_tensor
+    import torch.distributed.checkpoint as dcp
+    from nemo_automodel.components.checkpoint._backports.hf_storage import _HuggingFaceStorageReader
 
-    # 1. Collect DTensor specs from parameters directly — no FSDP2 hooks.
-    dtensor_specs = {}
-    for name, param in chain(model.named_parameters(), model.named_buffers()):
-        if isinstance(param, DTensor):
-            dtensor_specs[name] = (param.device_mesh, param.placements)
+    # Build state dict from named_parameters/named_buffers.
+    # This avoids FSDP2 state-dict hooks that model.state_dict() triggers.
+    # DCP will write directly into these tensors in-place.
+    state_dict = dict(chain(model.named_parameters(), model.named_buffers()))
 
-    # 2. Stream tensors one at a time via safe_open (memory-mapped).
-    #    For each tensor: load full to CPU -> distribute_tensor transfers
-    #    only the local shard (1/N) to GPU -> full CPU tensor freed.
-    state_dict = {}
-    with safe_open(weight_file, framework="pt", device="cpu") as f:
-        for key in f.keys():
-            tensor = f.get_tensor(key)
-            if key in dtensor_specs:
-                mesh, placements = dtensor_specs[key]
-                state_dict[key] = distribute_tensor(tensor, mesh, placements)
-            else:
-                state_dict[key] = tensor
-
-    # 3. Load — types match (DTensor->DTensor), copy succeeds.
-    model.load_state_dict(state_dict, strict=False)
+    # DCP + HF storage reader: parses safetensors header for byte offsets,
+    # the planner narrows each tensor to the local DTensor shard,
+    # and copies directly into model parameter storage.
+    reader = _HuggingFaceStorageReader(path=weight_dir)
+    dcp.load(state_dict, storage_reader=reader)
