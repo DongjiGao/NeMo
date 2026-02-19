@@ -110,33 +110,22 @@ class HFHubMixin(
             )
 
         # --- Distributed flow ---
-        import safetensors.torch
-
-        model_kwargs['cfg']['init_configure_model'] = False
-        if torch_dtype is not None:
-            model_kwargs['cfg']['torch_dtype'] = (
-                torch_dtype if isinstance(torch_dtype, str) else str(torch_dtype).replace("torch.", "")
-            )
-
-        # 1. Create instance (tokenizer only; llm=None, perception=None)
-        instance = cls(**model_kwargs)
-
-        # 2. Build parallelized architecture
-        instance.configure_model(
+        # Delegate to a module-level function so that ``cls(...)`` is not called
+        # from a frame that has ``__class__`` in its closure (which our classmethod
+        # has due to the ``super()`` call above).  Lightning's
+        # ``save_hyperparameters()`` walks the call stack and mistakes such frames
+        # for ``__init__`` frames, causing a ``KeyError: 'self'``.
+        return _distributed_from_pretrained(
+            cls=cls,
+            model_id=model_id,
+            model_kwargs=model_kwargs,
+            torch_dtype=torch_dtype,
             device_mesh=device_mesh,
             distributed_config=distributed_config,
             moe_config=moe_config,
             moe_mesh=moe_mesh,
+            cached_file_kwargs=_cached_file_kwargs,
         )
-
-        # 3. Load weights — DTensor-aware load_state_dict distributes tensors
-        weight_file = cached_file(model_id, SAFETENSORS_SINGLE_FILE, **_cached_file_kwargs)
-        if weight_file is None:
-            raise RuntimeError(f"Missing {SAFETENSORS_SINGLE_FILE} file for {model_id=}")
-        state_dict = safetensors.torch.load_file(str(weight_file))
-        instance.load_state_dict(state_dict, strict=False)
-
-        return instance
 
     def save_pretrained(
         self,
@@ -181,3 +170,51 @@ class HFHubMixin(
             model_card_kwargs=model_card_kwargs,
             **push_to_hub_kwargs,
         )
+
+
+def _distributed_from_pretrained(
+    cls,
+    model_id,
+    model_kwargs,
+    torch_dtype,
+    device_mesh,
+    distributed_config,
+    moe_config,
+    moe_mesh,
+    cached_file_kwargs,
+):
+    """Create a distributed model instance outside of a classmethod frame.
+
+    Lightning's ``save_hyperparameters()`` walks the call stack looking for
+    ``__init__`` frames.  Our ``_from_pretrained`` classmethod has ``__class__``
+    in its closure (due to a ``super()`` call), which Lightning mistakes for an
+    ``__init__`` frame, causing ``KeyError: 'self'``.  By moving the constructor
+    call here (a plain module-level function), the problematic frame is avoided.
+    """
+    import safetensors.torch
+
+    model_kwargs['cfg']['init_configure_model'] = False
+    if torch_dtype is not None:
+        model_kwargs['cfg']['torch_dtype'] = (
+            torch_dtype if isinstance(torch_dtype, str) else str(torch_dtype).replace("torch.", "")
+        )
+
+    # 1. Create instance (tokenizer only; llm=None, perception=None)
+    instance = cls(**model_kwargs)
+
+    # 2. Build parallelized architecture
+    instance.configure_model(
+        device_mesh=device_mesh,
+        distributed_config=distributed_config,
+        moe_config=moe_config,
+        moe_mesh=moe_mesh,
+    )
+
+    # 3. Load weights — DTensor-aware load_state_dict distributes tensors
+    weight_file = cached_file(model_id, SAFETENSORS_SINGLE_FILE, **cached_file_kwargs)
+    if weight_file is None:
+        raise RuntimeError(f"Missing {SAFETENSORS_SINGLE_FILE} file for {model_id=}")
+    state_dict = safetensors.torch.load_file(str(weight_file))
+    instance.load_state_dict(state_dict, strict=False)
+
+    return instance
