@@ -14,13 +14,54 @@
 
 from __future__ import annotations
 
+import os
 from datetime import timedelta
 from typing import Any, Dict, Optional
 
+import torch
 import torch.distributed as dist
 from lightning.fabric.plugins.collectives.torch_collective import default_pg_timeout
 from lightning.pytorch.strategies.model_parallel import ModelParallelStrategy
 from typing_extensions import override
+
+
+def setup_distributed(
+    tp_size: int = 1,
+    pp_size: int = 1,
+    cp_size: int = 1,
+    ep_size: int = 1,
+    dp_size: int | None = None,
+    dp_replicate_size: int | None = None,
+    distributed_config=None,
+    moe_config=None,
+    backend: str = "nccl",
+) -> AutomodelParallelStrategy:
+    """Initialize torch.distributed, set CUDA device, and create a device mesh.
+
+    This is a convenience function for inference scripts that need distributed
+    model-parallel loading without a Lightning Trainer.
+
+    Returns an :class:`AutomodelParallelStrategy` with ``device_mesh``,
+    ``distributed_config``, ``moe_config``, and ``moe_mesh`` ready to use.
+    """
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend)
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+
+    strategy = AutomodelParallelStrategy(
+        tp_size=tp_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        ep_size=ep_size,
+        dp_size=dp_size,
+        dp_replicate_size=dp_replicate_size,
+        distributed_config=distributed_config,
+        moe_config=moe_config,
+    )
+    strategy.create_device_mesh()
+    return strategy
 
 
 class AutomodelParallelStrategy(ModelParallelStrategy):

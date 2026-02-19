@@ -48,17 +48,38 @@ class SalmEvalConfig:
     system_prompt: Optional[str] = None
     user_prompt: Optional[str] = None
     use_asr_decoder: bool = False  # set this to True if using SALMWithAsrDecoder
+    # Parallelism sizes for distributed inference (launch with torchrun)
+    tp_size: int = 1
+    ep_size: int = 1
+    pp_size: int = 1
+    cp_size: int = 1
 
 
 @hydra_runner(config_name="SalmEvalConfig", schema=SalmEvalConfig)
 def main(cfg: SalmEvalConfig):
     logging.info(f"Hydra config:\n{OmegaConf.to_yaml(cfg)}")
 
-    if cfg.use_asr_decoder:
-        model = SALMWithAsrDecoder.from_pretrained(cfg.pretrained_name)
+    is_distributed = any(s > 1 for s in [cfg.tp_size, cfg.ep_size, cfg.pp_size, cfg.cp_size])
+    model_cls = SALMWithAsrDecoder if cfg.use_asr_decoder else SALM
+
+    if is_distributed:
+        from nemo.collections.speechlm2.parts.parallel import setup_distributed
+
+        strategy = setup_distributed(
+            tp_size=cfg.tp_size, ep_size=cfg.ep_size, pp_size=cfg.pp_size, cp_size=cfg.cp_size
+        )
+        model = model_cls.from_pretrained(
+            cfg.pretrained_name,
+            device_mesh=strategy.device_mesh,
+            distributed_config=strategy.distributed_config,
+            moe_config=strategy.moe_config,
+            moe_mesh=strategy.moe_mesh,
+            torch_dtype=cfg.dtype,
+        )
     else:
-        model = SALM.from_pretrained(cfg.pretrained_name)
-    model = model.eval().to(getattr(torch, cfg.dtype)).to(cfg.device)
+        model = model_cls.from_pretrained(cfg.pretrained_name)
+        model = model.to(getattr(torch, cfg.dtype)).to(cfg.device)
+    model = model.eval()
 
     conversations = (
         guess_parse_cutset(cfg.inputs)

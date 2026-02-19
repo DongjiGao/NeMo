@@ -457,8 +457,18 @@ class SALM(LightningModule, HFHubMixin):
     def configure_optimizers(self):
         return configure_optimizers(self)
 
-    def configure_model(self, strategy=None) -> None:
-        device_mesh = self.device_mesh
+    def configure_model(
+        self,
+        device_mesh=None,
+        distributed_config=None,
+        moe_config=None,
+        moe_mesh=None,
+    ) -> None:
+        # Use provided device_mesh, or fall back to LightningModule property
+        if device_mesh is not None:
+            self._device_mesh = device_mesh
+        else:
+            device_mesh = self.device_mesh
 
         # Derive dtype from trainer precision (e.g. "bf16-true" -> bfloat16).
         dtype = torch.float32
@@ -468,18 +478,16 @@ class SALM(LightningModule, HFHubMixin):
                 dtype = torch.bfloat16
             elif "16" in precision:
                 dtype = torch.float16
+        elif hasattr(self.cfg, 'torch_dtype') and self.cfg.torch_dtype is not None:
+            td = self.cfg.torch_dtype
+            dtype = getattr(torch, td) if isinstance(td, str) else td
 
-        # Get parallelism config from strategy (if using AutomodelParallelStrategy)
-        distributed_config = None
-        moe_mesh = None
-        moe_config = None
-        if strategy is not None:
-            distributed_config = strategy.distributed_config
-            moe_mesh = strategy.moe_mesh
-            moe_config = strategy.moe_config
-        elif self._trainer is not None and hasattr(self._trainer.strategy, "distributed_config"):
+        # Fall back to trainer.strategy for configs (Lightning training path)
+        if distributed_config is None and self._trainer is not None:
             distributed_config = getattr(self._trainer.strategy, "distributed_config", None)
+        if moe_mesh is None and self._trainer is not None:
             moe_mesh = getattr(self._trainer.strategy, "moe_mesh", None)
+        if moe_config is None and self._trainer is not None:
             moe_config = getattr(self._trainer.strategy, "moe_config", None)
 
         automodel_kwargs = {}

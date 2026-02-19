@@ -19,6 +19,8 @@ from huggingface_hub.hub_mixin import DataclassInstance
 from omegaconf import DictConfig, OmegaConf
 from transformers.utils import cached_file
 
+SAFETENSORS_SINGLE_FILE = "model.safetensors"
+
 
 class HFHubMixin(
     PyTorchModelHubMixin,
@@ -45,10 +47,27 @@ class HFHubMixin(
         """
         Load Pytorch pretrained weights and return the loaded model.
         Wrapper over PyTorchModelHubMixin that auto-handles config in **model_kwargs.
+
+        Supports distributed model-parallel loading via ``device_mesh``:
+
+            >>> from nemo.collections.speechlm2.parts.parallel import setup_distributed
+            >>> strategy = setup_distributed(tp_size=2)
+            >>> model = SALM.from_pretrained(
+            ...     "nvidia/salm-model",
+            ...     device_mesh=strategy.device_mesh,
+            ...     distributed_config=strategy.distributed_config,
+            ...     moe_config=strategy.moe_config,
+            ...     moe_mesh=strategy.moe_mesh,
+            ... )
         """
-        resolved_config_file = cached_file(
-            model_id,
-            CONFIG_NAME,
+        # Pop distributed kwargs before they reach the constructor.
+        device_mesh = model_kwargs.pop("device_mesh", None)
+        distributed_config = model_kwargs.pop("distributed_config", None)
+        moe_config = model_kwargs.pop("moe_config", None)
+        moe_mesh = model_kwargs.pop("moe_mesh", None)
+        torch_dtype = model_kwargs.pop("torch_dtype", None)
+
+        _cached_file_kwargs = dict(
             cache_dir=cache_dir,
             force_download=force_download,
             resume_download=resume_download,
@@ -60,6 +79,8 @@ class HFHubMixin(
             _raise_exceptions_for_missing_entries=False,
             _raise_exceptions_for_connection_errors=False,
         )
+
+        resolved_config_file = cached_file(model_id, CONFIG_NAME, **_cached_file_kwargs)
         if resolved_config_file is None:
             raise RuntimeError(f"Missing {CONFIG_NAME} file for {model_id=}")
         model_kwargs['cfg'] = OmegaConf.to_container(OmegaConf.load(resolved_config_file))
@@ -69,17 +90,53 @@ class HFHubMixin(
         # this setting skips loading the original pretrained ASR and LLM weights, and loads the
         # final trained model weights directly.
         model_kwargs['cfg']['pretrained_weights'] = False
-        return super()._from_pretrained(
-            model_id=model_id,
-            revision=revision,
-            cache_dir=cache_dir,
-            force_download=force_download,
-            local_files_only=local_files_only,
-            token=token,
-            map_location=map_location,
-            strict=strict,
-            **model_kwargs,
+
+        if device_mesh is None:
+            # Non-distributed: existing flow unchanged
+            if torch_dtype is not None:
+                model_kwargs['cfg']['torch_dtype'] = (
+                    torch_dtype if isinstance(torch_dtype, str) else str(torch_dtype).replace("torch.", "")
+                )
+            return super()._from_pretrained(
+                model_id=model_id,
+                revision=revision,
+                cache_dir=cache_dir,
+                force_download=force_download,
+                local_files_only=local_files_only,
+                token=token,
+                map_location=map_location,
+                strict=strict,
+                **model_kwargs,
+            )
+
+        # --- Distributed flow ---
+        import safetensors.torch
+
+        model_kwargs['cfg']['init_configure_model'] = False
+        if torch_dtype is not None:
+            model_kwargs['cfg']['torch_dtype'] = (
+                torch_dtype if isinstance(torch_dtype, str) else str(torch_dtype).replace("torch.", "")
+            )
+
+        # 1. Create instance (tokenizer only; llm=None, perception=None)
+        instance = cls(**model_kwargs)
+
+        # 2. Build parallelized architecture
+        instance.configure_model(
+            device_mesh=device_mesh,
+            distributed_config=distributed_config,
+            moe_config=moe_config,
+            moe_mesh=moe_mesh,
         )
+
+        # 3. Load weights — DTensor-aware load_state_dict distributes tensors
+        weight_file = cached_file(model_id, SAFETENSORS_SINGLE_FILE, **_cached_file_kwargs)
+        if weight_file is None:
+            raise RuntimeError(f"Missing {SAFETENSORS_SINGLE_FILE} file for {model_id=}")
+        state_dict = safetensors.torch.load_file(str(weight_file))
+        instance.load_state_dict(state_dict, strict=False)
+
+        return instance
 
     def save_pretrained(
         self,

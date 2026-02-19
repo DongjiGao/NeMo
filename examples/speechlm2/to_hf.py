@@ -54,15 +54,15 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str):
         model.load_state_dict(ckpt_data["state_dict"])
 
 
-def setup_distributed_with_strategy(strategy_cfg: dict):
-    """Initialize torch.distributed and create a device mesh by reusing AutomodelParallelStrategy.
+def setup_distributed_from_config(strategy_cfg: dict):
+    """Initialize torch.distributed and create a device mesh from a Hydra strategy config.
 
-    Instantiates the strategy from the trainer config, initializes the process
-    group, and calls :meth:`strategy.create_device_mesh` to build the mesh
-    with the same parallelism sizes that were used during training.
+    Instantiates the strategy from the trainer config dict (as found in the
+    experiment YAML), initializes the process group, resolves automodel
+    configs, and calls :meth:`strategy.create_device_mesh`.
 
     Returns:
-        Tuple of ``(device_mesh, moe_mesh)``.
+        An :class:`AutomodelParallelStrategy` with device_mesh ready.
     """
     import hydra
     import torch.distributed as dist
@@ -155,13 +155,18 @@ def main(cfg: HfExportConfig):
     if is_distributed:
         import torch.distributed as dist
 
-        strategy = setup_distributed_with_strategy(strategy_cfg)
+        strategy = setup_distributed_from_config(strategy_cfg)
 
         # Don't call configure_model() inside __init__ — we set device_mesh first.
         model_cfg["init_configure_model"] = False
         model = cls(model_cfg)
-        model._device_mesh = strategy.device_mesh
-        model.configure_model(strategy)
+        model.configure_model(
+            device_mesh=strategy.device_mesh,
+            distributed_config=strategy.distributed_config,
+            moe_config=strategy.moe_config,
+            moe_mesh=strategy.moe_mesh,
+        )
+        model_cfg["pretrained_weights"] = False
 
         load_checkpoint(model, cfg.ckpt_path)
 
@@ -177,6 +182,7 @@ def main(cfg: HfExportConfig):
         model = cls(model_cfg)
         load_checkpoint(model, cfg.ckpt_path)
         model = model.to(getattr(torch, cfg.dtype))
+        model_cfg["pretrained_weights"] = False
         model.save_pretrained(cfg.output_dir)
 
 
