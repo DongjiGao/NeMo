@@ -77,6 +77,7 @@ def setup_distributed_with_strategy(strategy_cfg: dict):
 
     strategy = hydra.utils.instantiate(strategy_cfg)
     _resolve_automodel_configs(strategy)
+    strategy.create_device_mesh()
     return strategy
 
 
