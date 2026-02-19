@@ -210,11 +210,21 @@ def _distributed_from_pretrained(
         moe_mesh=moe_mesh,
     )
 
-    # 3. Load weights — DTensor-aware load_state_dict distributes tensors
+    # 3. Load weights
+    #    Plain load_state_dict fails because in-place copy from torch.Tensor
+    #    to DTensor is not supported.  We use set_model_state_dict which
+    #    properly distributes regular tensors into DTensor parameters
+    #    created by FSDP2/TP.
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
     weight_file = cached_file(model_id, SAFETENSORS_SINGLE_FILE, **cached_file_kwargs)
     if weight_file is None:
         raise RuntimeError(f"Missing {SAFETENSORS_SINGLE_FILE} file for {model_id=}")
     state_dict = safetensors.torch.load_file(str(weight_file))
-    instance.load_state_dict(state_dict, strict=False)
+    set_model_state_dict(
+        instance,
+        model_state_dict=state_dict,
+        options=StateDictOptions(strict=False, full_state_dict=True),
+    )
 
     return instance
