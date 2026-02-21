@@ -59,7 +59,7 @@ class SALM(LightningModule, HFHubMixin):
         self._use_fsdp = False
         self._use_tp = False
 
-        if self.cfg.init_configure_model:
+        if self.cfg.get("init_configure_model", False):
             self.configure_model()
 
     @property
