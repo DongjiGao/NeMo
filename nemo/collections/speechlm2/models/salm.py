@@ -30,6 +30,7 @@ from transformers import GenerationConfig
 from nemo.collections.common.prompts import PromptFormatter
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.salm_dataset import left_collate_vectors
+from nemo.collections.speechlm2.parts.automodel_lora import ensure_lora_trainable, make_peft_config, maybe_install_lora
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import (
@@ -508,6 +509,13 @@ class SALM(LightningModule, HFHubMixin):
         if moe_mesh is not None:
             automodel_kwargs["moe_mesh"] = moe_mesh
 
+        # When LoRA is configured and we have a device_mesh, pass peft_config
+        # through automodel so LoRA is applied before FSDP2 sharding (handles
+        # meta-device init correctly).
+        peft_config = make_peft_config(self.cfg.lora) if "lora" in self.cfg else None
+        if peft_config is not None and device_mesh is not None:
+            automodel_kwargs["peft_config"] = peft_config
+
         self.llm = load_pretrained_automodel(
             self.cfg.pretrained_llm,
             pretrained_weights=self.cfg.pretrained_weights,
@@ -521,7 +529,15 @@ class SALM(LightningModule, HFHubMixin):
         # Fix projection dim for pretrained_weights=False (config output_dim may not match LLM)
         update_perception_output_dim(self)
 
-        # Note: LoRA is deferred — see salm-lora-future-work.md in memory
+        # Apply LoRA adapters to the LLM.
+        # When device_mesh is set, LoRA was already applied inside automodel's
+        # from_pretrained (before sharding).  Otherwise, apply it now.
+        if peft_config is not None and device_mesh is None:
+            maybe_install_lora(self)
+        elif peft_config is not None:
+            # LoRA was applied by automodel; still need to ensure the
+            # prevent_freeze_params pattern is set for configure_optimizers.
+            ensure_lora_trainable(self)
 
         if device_mesh is None:
             return

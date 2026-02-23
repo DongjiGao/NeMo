@@ -17,16 +17,19 @@ model:
   prompt_format: qwen
   audio_locator_tag: "<|audioplaceholder|>"  # placeholder token for audio turn is expected
 
-  # Note: Uncomment the block below to enable LoRA on LLM via HuggingFace PEFT library.
-  #   It will automatically freeze LLM parameters even if freeze_params was unused,
-  #   and prevent freezing any parameter that has the string '.lora_' in its name.
+  # Uncomment the block below to enable LoRA on the LLM via Automodel.
+  # LoRA parameters are kept trainable even when the LLM is frozen.
   # lora:
-  #   task_type: CAUSAL_LM
-  #   r: 128
-  #   lora_alpha: 256
-  #   lora_dropout: 0.01
-  #   # target_modules are only necessary if the `pretrained_llm` is not yet registered in PEFT library
+  #   dim: 128
+  #   alpha: 256
+  #   dropout: 0.01
   #   target_modules: ["q_proj", "v_proj"]
+  #   # match_all_linear: false
+  #   # exclude_modules: []
+  #   # use_dora: false
+  #   # dropout_position: post
+  #   # lora_A_init: xavier
+  #   # use_triton: false
 
   perception:
      target: nemo.collections.speechlm2.modules.perception.AudioPerceptionModule
