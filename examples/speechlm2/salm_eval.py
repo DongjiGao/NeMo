@@ -88,7 +88,8 @@ def main(cfg: SalmEvalConfig):
     cuts = guess_parse_cutset(cfg.inputs).sort_by_duration()
     dloader = torch.utils.data.DataLoader(
         dataset=ToAudio(),
-        sampler=lhotse.dataset.DynamicCutSampler(cuts, max_cuts=cfg.batch_size),
+        # rank=0 world_size=1 hardcoded so lhotse doesn't accidentally auto-split batches in model parallel settings
+        sampler=lhotse.dataset.DynamicCutSampler(cuts, max_cuts=cfg.batch_size, rank=0, world_size=1),
         num_workers=1,
         batch_size=None,
     )

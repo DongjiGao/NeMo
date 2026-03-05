@@ -116,7 +116,8 @@ def main(cfg: SalmEvalConfig):
     dloader = torch.utils.data.DataLoader(
         dataset=IterableDatasetWrapper(
             dataset=SALMDataset(model.tokenizer),
-            sampler=lhotse.dataset.DynamicCutSampler(conversations, max_cuts=cfg.batch_size),
+            # rank=0 world_size=1 hardcoded so lhotse doesn't accidentally auto-split batches in model parallel settings
+            sampler=lhotse.dataset.DynamicCutSampler(conversations, max_cuts=cfg.batch_size, rank=0, world_size=1),
         ),
         num_workers=1,
         batch_size=None,
