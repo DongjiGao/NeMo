@@ -23,10 +23,24 @@ LORA_PARAM_PATTERN = r"^.+\.lora_.+$"
 
 
 def make_peft_config(lora_cfg: DictConfig):
-    """Create an Automodel ``PeftConfig`` from the ``model.lora`` config section."""
+    """Create an Automodel ``PeftConfig`` from the ``model.lora`` config section.
+
+    Automodel's ``ModuleMatcher`` matches target-module patterns against the
+    **full** dotted module path (e.g. ``model.layers.0.self_attn.q_proj``).
+    Short names like ``q_proj`` won't match because the regex is anchored at
+    both ends.  To stay compatible with HuggingFace-style configs that use
+    short leaf names, we auto-prepend ``*.`` to any entry that doesn't already
+    contain a wildcard (``*``) or a dot (``.``).
+    """
     from nemo_automodel.components._peft.lora import PeftConfig
 
     kwargs = {k: list(v) if isinstance(v, ListConfig) else v for k, v in lora_cfg.items()}
+    if "target_modules" in kwargs:
+        kwargs["target_modules"] = [f"*.{m}" if "*" not in m and "." not in m else m for m in kwargs["target_modules"]]
+    if "exclude_modules" in kwargs:
+        kwargs["exclude_modules"] = [
+            f"*.{m}" if "*" not in m and "." not in m else m for m in kwargs["exclude_modules"]
+        ]
     return PeftConfig(**kwargs)
 
 
@@ -41,7 +55,7 @@ def maybe_install_lora(model):
     from nemo_automodel.components._peft.lora import apply_lora_to_linear_modules
 
     peft_config = make_peft_config(model.cfg.lora)
-    n_modified = apply_lora_to_linear_modules(model.llm, peft_config, skip_freeze=True)
+    n_modified = apply_lora_to_linear_modules(model.llm, peft_config)
     logging.info(f"LoRA adapters installed on {n_modified} modules: {peft_config}")
 
     ensure_lora_trainable(model)

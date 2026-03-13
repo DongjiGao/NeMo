@@ -130,7 +130,7 @@ class TestMakePeftConfig:
         pc = make_peft_config(cfg)
         assert pc.dim == 32
         assert pc.alpha == 64
-        assert pc.target_modules == ["q_proj"]
+        assert pc.target_modules == ["*.q_proj"]
 
     def test_defaults(self):
         cfg = DictConfig({})
@@ -159,7 +159,21 @@ class TestMakePeftConfig:
         assert pc.use_dora is True
         assert pc.dropout_position == "pre"
         assert pc.lora_A_init == "kaiming_uniform"
-        assert pc.exclude_modules == ["lm_head"]
+        assert pc.exclude_modules == ["*.lm_head"]
+
+    def test_short_names_get_wildcard_prefix(self):
+        """Short leaf names like 'q_proj' should be auto-prefixed with '*.' so
+        that automodel's ModuleMatcher matches them against full dotted paths."""
+        cfg = DictConfig({"target_modules": ["q_proj", "v_proj"], "exclude_modules": ["lm_head"]})
+        pc = make_peft_config(cfg)
+        assert pc.target_modules == ["*.q_proj", "*.v_proj"]
+        assert pc.exclude_modules == ["*.lm_head"]
+
+    def test_already_qualified_names_unchanged(self):
+        """Names that already contain '*' or '.' should not be double-prefixed."""
+        cfg = DictConfig({"target_modules": ["*.q_proj", "model.layers.*.self_attn.v_proj"]})
+        pc = make_peft_config(cfg)
+        assert pc.target_modules == ["*.q_proj", "model.layers.*.self_attn.v_proj"]
 
 
 class TestEnsureLoraTrainable:
