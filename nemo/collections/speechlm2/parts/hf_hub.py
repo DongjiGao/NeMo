@@ -36,8 +36,6 @@ class HFHubMixin(
         revision: Optional[str],
         cache_dir: Optional[Union[str, Path]],
         force_download: bool,
-        proxies: Optional[dict] = None,
-        resume_download: Optional[bool] = None,
         local_files_only: bool,
         token: Union[str, bool, None],
         map_location: str = "cpu",
@@ -70,8 +68,6 @@ class HFHubMixin(
         _cached_file_kwargs = dict(
             cache_dir=cache_dir,
             force_download=force_download,
-            resume_download=resume_download,
-            proxies=proxies,
             local_files_only=local_files_only,
             token=token,
             revision=revision,
