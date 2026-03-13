@@ -64,6 +64,21 @@ class SALM(LightningModule, HFHubMixin):
             self.configure_model()
 
     @property
+    def device(self) -> torch.device:
+        """Infer device from the LLM's parameters.
+
+        ``LightningModule.device`` is set by the Trainer and defaults to CPU
+        during standalone inference (no Trainer).  Override to query the actual
+        parameter storage so that ``.to(self.device)`` works correctly for
+        both regular and DTensor (FSDP2/distributed) parameters.
+        """
+        if self.llm is not None:
+            p = next(self.llm.parameters(), None)
+            if p is not None:
+                return p._local_tensor.device if isinstance(p, DTensor) else p.device
+        return super().device
+
+    @property
     def embed_tokens(self):
         """Navigate to the LLM's embedding layer (kept inside the LLM)."""
         if self.llm is None:

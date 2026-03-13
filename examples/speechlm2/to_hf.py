@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 from safetensors.torch import save_file
 
@@ -65,12 +66,8 @@ def setup_distributed_from_config(strategy_cfg: dict):
         An :class:`AutomodelParallelStrategy` with device_mesh ready.
     """
     import hydra
-    import torch.distributed as dist
 
     from nemo.utils.trainer_utils import _resolve_automodel_configs
-
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
@@ -150,11 +147,14 @@ def main(cfg: HfExportConfig):
     cls = import_class_by_path(cfg.class_path)
 
     strategy_cfg = full_cfg.get("trainer", {}).get("strategy", {})
-    is_distributed = Path(cfg.ckpt_path).is_dir() and _uses_automodel_parallel(strategy_cfg)
+
+    if dist.is_available() and not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    is_distributed = (
+        Path(cfg.ckpt_path).is_dir() and _uses_automodel_parallel(strategy_cfg) and dist.get_world_size() > 1
+    )
 
     if is_distributed:
-        import torch.distributed as dist
-
         strategy = setup_distributed_from_config(strategy_cfg)
 
         # Don't call configure_model() inside __init__ — we set device_mesh first.
