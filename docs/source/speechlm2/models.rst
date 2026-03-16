@@ -49,6 +49,42 @@ SALM is particularly useful for:
 * Speech understanding tasks that benefit from the contextual understanding of an LLM
 * Applications that need to handle mixed text and speech inputs
 
+SALMAutomodel (NeMo Automodel variant)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+SALMAutomodel is a variant of SALM that replaces HuggingFace Transformers with
+`NeMo Automodel <https://github.com/NVIDIA-NeMo/Automodel>`_ for the LLM backbone.
+It provides the same speech-augmented language model capabilities with additional
+benefits for distributed training and inference — especially with Mixture-of-Experts
+(MoE) models like `NVIDIA Nemotron Nano V3 <https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16>`_.
+
+Key differences from SALM:
+
+* **Deferred initialization**: The LLM and perception module are not loaded until
+  ``configure_model()`` is called, enabling memory-efficient distributed loading
+  where each GPU only loads its own shard.
+* **Native LoRA**: Uses NeMo Automodel's built-in LoRA instead of HuggingFace PEFT.
+  LoRA is applied before FSDP2 sharding for correct meta-device handling.
+* **AutomodelParallelStrategy**: Integrates with a custom Lightning strategy that
+  delegates device mesh creation to NeMo Automodel, supporting FSDP2, TP, PP, CP,
+  EP (MoE), and HSDP.
+* **MoE optimizations**: NeMo Automodel provides first-class support for
+  Mixture-of-Experts architectures with **Grouped GEMM** (fused expert computation
+  for higher throughput) and **DeepEP** (Deep Expert Parallelism for efficient
+  all-to-all expert routing across GPUs). This makes it possible to efficiently
+  train Speech LLMs using MoE backbones like NVIDIA Nemotron Nano V3 (30B total,
+  3B active parameters).
+* **Embedding stays in LLM**: Unlike SALM (which moves ``embed_tokens`` out of the
+  LLM to avoid FSDP/TP hook issues), SALMAutomodel keeps embeddings inside the LLM
+  and uses ``F.embedding`` with explicit DTensor handling.
+
+SALMAutomodel is particularly useful for:
+
+* Efficient training of Speech LLMs with MoE backbones (e.g., Nemotron Nano V3)
+* Large-scale distributed training with advanced parallelism strategies (FSDP2, TP, EP)
+* Models that benefit from native Automodel LoRA integration
+* Inference with model parallelism (TP/EP)
+
 DuplexS2SModel
 ^^^^^^^^^^^^^^
 
@@ -253,6 +289,9 @@ All models in the speechlm2 collection can be instantiated from pretrained check
     # Load SALM model
     salm_model = slm.models.SALM.from_pretrained("path/to/checkpoint")
     
+    # Load SALMAutomodel
+    salm_automodel = slm.models.SALMAutomodel.from_pretrained("path/to/checkpoint")
+
     # Load DuplexS2SModel
     duplex_model = slm.models.DuplexS2SModel.from_pretrained("path/to/checkpoint")
 

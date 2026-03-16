@@ -94,6 +94,68 @@ See the `SALM paper <https://arxiv.org/abs/2310.09424>`_ for more details.
           dropout_pre_encoder: 0
           dropout_emb: 0.0
 
+SALMAutomodel Configuration
+----------------------------
+
+The SALMAutomodel configuration extends the SALM configuration with NeMo Automodel
+support. The key difference is ``use_nemo_automodel: true`` and the use of
+``AutomodelParallelStrategy`` instead of ``DDPStrategy``.
+
+The example below shows a configuration for training with NVIDIA Nemotron Nano V3
+MoE as the LLM backbone, with Expert Parallelism across 8 GPUs:
+
+.. code-block:: yaml
+
+    model:
+      use_nemo_automodel: true  # Selects SALMAutomodel in salm_train.py
+      pretrained_llm: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+      pretrained_asr: "nvidia/canary-1b-flash"
+      pretrained_weights: True
+
+      freeze_params:
+        - "^llm\\..+$"
+        - "^perception\\.preprocessor\\..+$"
+        - "^perception\\.encoder\\..+$"
+      prevent_freeze_params: []
+
+      # LoRA uses Automodel-native format (not HF PEFT):
+      # lora:
+      #   dim: 128
+      #   alpha: 256
+      #   dropout: 0.01
+      #   target_modules: ["q_proj", "v_proj"]
+
+      perception:
+        target: nemo.collections.speechlm2.modules.perception.AudioPerceptionModule
+        output_dim: 2048
+        modality_adapter:
+          _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
+          d_model: 1024
+
+    trainer:
+      strategy:
+        _target_: nemo.collections.speechlm2.parts.parallel.AutomodelParallelStrategy
+        ep_size: 8  # Expert Parallelism across 8 GPUs for MoE
+        # tp_size: 1
+        # dp_size: null  # inferred
+
+NeMo Automodel applies MoE-specific optimizations automatically when an MoE model
+is detected:
+
+* **Grouped GEMM** — fuses expert computations into a single batched matrix multiply
+  for higher GPU throughput.
+* **DeepEP** (Deep Expert Parallelism) — efficient all-to-all expert routing across
+  GPUs, minimizing communication overhead for MoE layers.
+
+Note the differences from the SALM configuration:
+
+* ``model.use_nemo_automodel: true`` — selects ``SALMAutomodel`` in the training script.
+* ``model.pretrained_llm`` can point to MoE models like ``nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16``.
+* ``trainer.strategy._target_`` uses ``AutomodelParallelStrategy`` instead of ``ModelParallelStrategy``.
+* ``ep_size`` controls Expert Parallelism (how many GPUs participate in MoE expert routing).
+* LoRA config uses ``dim``/``alpha`` keys (Automodel native) instead of ``r``/``lora_alpha`` (HF PEFT).
+* No ``embed_tokens`` freeze pattern — embeddings stay inside the LLM.
+
 DuplexS2SModel Configuration
 -----------------------------
 
@@ -291,6 +353,7 @@ Example Configuration Files
 Example configurations for all model types can be found in the example directory:
 
 - SALM: `examples/speechlm2/conf/salm.yaml`
+- SALMAutomodel: `examples/speechlm2/conf/salm_automodel.yaml`
 - DuplexS2SModel: `examples/speechlm2/conf/s2s_duplex.yaml`
 - DuplexS2SSpeechDecoderModel: `examples/speechlm2/conf/s2s_duplex_speech_decoder.yaml`
 - DuplexSTTModel: `examples/speechlm2/conf/duplex_stt.yaml`
@@ -306,6 +369,10 @@ You can use these configurations with the training scripts by specifying the con
     python examples/speechlm2/salm_train.py \
       --config-path=conf \
       --config-name=salm
+
+    # Train SALMAutomodel
+    python examples/speechlm2/salm_train.py \
+      --config-name=salm_automodel
 
 You can also override configuration values from the command line:
 

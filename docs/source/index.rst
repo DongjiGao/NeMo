@@ -10,7 +10,7 @@ Models
 - **TTS:** `MagpieTTS <https://huggingface.co/nvidia/magpie_tts_multilingual_357m>`_, `FastPitch <https://huggingface.co/nvidia/tts_en_fastpitch>`_ + `HiFi-GAN <https://huggingface.co/nvidia/tts_hifigan>`_ -- multi-language, multi-speaker
 - **Speaker:** `Sortformer <https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2.1>`_ streaming diarization, `TitaNet <https://huggingface.co/nvidia/speakerverification_en_titanet_large>`_ speaker recognition, `MarbleNet <https://huggingface.co/nvidia/Frame_VAD_Multilingual_MarbleNet_v2.0>`_ VAD
 - **Audio:** `Speech enhancement <https://huggingface.co/nvidia/sr_ssl_flowmatching_16k_430m>`_, source separation, neural audio codecs
-- **SpeechLM2:** `Canary-Qwen 2.5B <https://huggingface.co/nvidia/canary-qwen-2.5b>`_ (SALM), Duplex Speech-to-Speech -- HuggingFace Transformers backbone integration
+- **SpeechLM2:** `Canary-Qwen 2.5B <https://huggingface.co/nvidia/canary-qwen-2.5b>`_ (SALM), Duplex Speech-to-Speech -- HuggingFace Transformers and NeMo Automodel (MoE/Nemotron Nano) backbone integration
 
 Inference & Deployment
 ----------------------
