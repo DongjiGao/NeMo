@@ -152,7 +152,7 @@ Note the differences from the SALM configuration:
 * ``model.use_nemo_automodel: true`` — selects ``SALMAutomodel`` in the training script.
 * ``model.pretrained_llm`` can point to MoE models like ``nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16``.
 * ``trainer.strategy._target_`` uses ``AutomodelParallelStrategy`` instead of ``ModelParallelStrategy``.
-* ``ep_size`` controls Expert Parallelism (how many GPUs participate in MoE expert routing).
+* ``ep_size`` controls Expert Parallelism on the FSDP data-parallel axis — dense layers are sharded via FSDP2, while MoE layers use EP for expert routing on the same GPUs.
 * LoRA config uses ``dim``/``alpha`` keys (Automodel native) instead of ``r``/``lora_alpha`` (HF PEFT).
 * No ``embed_tokens`` freeze pattern — embeddings stay inside the LLM.
 

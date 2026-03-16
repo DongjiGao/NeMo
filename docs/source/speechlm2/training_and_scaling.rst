@@ -122,6 +122,13 @@ loads its own shard).
 
 The speech encoder / perception module currently only supports FSDP2 (controlled via ``dp_size``).
 
+.. note::
+   Expert Parallelism (EP) reuses the FSDP2 data-parallel axis (``dp_size``).
+   Dense layers are sharded via FSDP2, while MoE expert layers use EP for
+   all-to-all expert routing — both operate on the same set of GPUs.
+   Setting ``ep_size`` controls how many GPUs participate in expert routing;
+   it does not add a separate dimension.
+
 Training with MoE LLM Backbones
 """"""""""""""""""""""""""""""""
 

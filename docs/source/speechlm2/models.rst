@@ -81,7 +81,7 @@ Key differences from SALM:
 SALMAutomodel is particularly useful for:
 
 * Efficient training of Speech LLMs with MoE backbones (e.g., Nemotron Nano V3)
-* Large-scale distributed training with advanced parallelism strategies (FSDP2, TP, EP)
+* Large-scale distributed training with advanced parallelism strategies (FSDP2 with EP for MoE, TP)
 * Models that benefit from native Automodel LoRA integration
 * Inference with model parallelism (TP/EP)
 
