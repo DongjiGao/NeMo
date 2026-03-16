@@ -26,7 +26,7 @@ from nemo.collections.common.data.lhotse.text_adapters import AudioTurn, TextTur
 from nemo.collections.common.data.utils import move_data_to_device
 from nemo.collections.common.prompts import PromptFormatter
 from nemo.collections.speechlm2.data import SALMDataset
-from nemo.collections.speechlm2.models import SALM
+from nemo.collections.speechlm2.models import SALMAutomodel
 from nemo.collections.speechlm2.parts.automodel_lora import (
     LORA_PARAM_PATTERN,
     ensure_lora_trainable,
@@ -240,7 +240,7 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="Automo
 def salm_with_lora():
     if not torch.cuda.is_available():
         pytest.skip("Automodel requires CUDA")
-    model = SALM(BASE_CFG)
+    model = SALMAutomodel(BASE_CFG)
     model.configure_model()
     model.to("cuda")
     return model
@@ -251,7 +251,7 @@ def salm_without_lora():
     if not torch.cuda.is_available():
         pytest.skip("Automodel requires CUDA")
     cfg = {k: v for k, v in BASE_CFG.items() if k != "lora"}
-    model = SALM(cfg)
+    model = SALMAutomodel(cfg)
     model.configure_model()
     model.to("cuda")
     return model
@@ -361,7 +361,7 @@ def test_lora_match_all_linear():
     """Test match_all_linear=True applies LoRA to all linear layers in the LLM."""
     cfg = {**BASE_CFG}
     cfg["lora"] = {"dim": 8, "alpha": 16, "match_all_linear": True}
-    model = SALM(cfg)
+    model = SALMAutomodel(cfg)
     model.configure_model()
 
     lora_params = {n for n, _ in model.named_parameters() if ".lora_" in n}

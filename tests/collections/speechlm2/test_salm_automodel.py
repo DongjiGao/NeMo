@@ -24,7 +24,9 @@ from nemo.collections.common.data.lhotse.text_adapters import AudioTurn, TextTur
 from nemo.collections.common.data.utils import move_data_to_device
 from nemo.collections.common.prompts import PromptFormatter
 from nemo.collections.speechlm2.data import SALMDataset
-from nemo.collections.speechlm2.models import SALM
+from nemo.collections.speechlm2.models import SALMAutomodel
+
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="SALMAutomodel requires CUDA")
 
 if torch.cuda.is_available():
     torch.set_default_device('cuda')
@@ -51,6 +53,8 @@ PROMPT = "llama2"
 
 @pytest.fixture(scope="session")
 def model():
+    if not torch.cuda.is_available():
+        pytest.skip("SALMAutomodel requires CUDA")
     cfg = {
         **resolve_pretrained_models(),
         "pretrained_weights": False,
@@ -104,9 +108,9 @@ def model():
         },
         "optimizer": {"_target_": "torch.optim.AdamW"},
     }
-    model = SALM(cfg)
-    if torch.cuda.is_available():
-        model.to("cuda")
+    model = SALMAutomodel(cfg)
+    model.configure_model()
+    model.to("cuda")
     return model
 
 
@@ -143,7 +147,8 @@ def training_cutset_batch():
     )
 
 
-def test_salm_dataset(dataset, prompt_formatter, training_cutset_batch):
+@requires_cuda
+def test_salm_automodel_dataset(dataset, prompt_formatter, training_cutset_batch):
     # This first step pre-tokenizes the examples, usually handled within `get_lhotse_dataloder_from_config`.
     training_cutset_batch = training_cutset_batch.map(lambda c: c.apply_prompt_format(prompt_formatter), apply_fn=None)
     # fmt: off
@@ -159,7 +164,8 @@ def test_salm_dataset(dataset, prompt_formatter, training_cutset_batch):
         assert torch.is_tensor(batch[key])
 
 
-def test_salm_training_step(model, dataset, prompt_formatter, training_cutset_batch):
+@requires_cuda
+def test_salm_automodel_training_step(model, dataset, prompt_formatter, training_cutset_batch):
     training_cutset_batch = training_cutset_batch.map(lambda c: c.apply_prompt_format(prompt_formatter), apply_fn=None)
     batch = dataset[training_cutset_batch]
     batch = move_data_to_device(batch, device=model.device)
@@ -169,7 +175,8 @@ def test_salm_training_step(model, dataset, prompt_formatter, training_cutset_ba
     assert results["loss"] > 0
 
 
-def test_salm_validation_step(model, dataset, prompt_formatter, training_cutset_batch):
+@requires_cuda
+def test_salm_automodel_validation_step(model, dataset, prompt_formatter, training_cutset_batch):
     model.on_validation_epoch_start()
     training_cutset_batch = training_cutset_batch.map(lambda c: c.apply_prompt_format(prompt_formatter), apply_fn=None)
     batch = dataset[training_cutset_batch]
@@ -178,7 +185,8 @@ def test_salm_validation_step(model, dataset, prompt_formatter, training_cutset_
     assert results is None
 
 
-def test_salm_generation(model):
+@requires_cuda
+def test_salm_automodel_generation(model):
     answer = model.generate(
         prompts=[
             [
@@ -195,7 +203,8 @@ def test_salm_generation(model):
     assert (answer < model.text_vocab_size).all()
 
 
-def test_salm_generation_audios_via_prompt(model, tmp_path):
+@requires_cuda
+def test_salm_automodel_generation_audios_via_prompt(model, tmp_path):
     audio_path = tmp_path / "audio.wav"
     dummy_cut(0, with_data=True).save_audio(audio_path)
 
@@ -218,7 +227,8 @@ def test_salm_generation_audios_via_prompt(model, tmp_path):
     assert (answer < model.text_vocab_size).all()
 
 
-def test_salm_generation_prompts_as_tensor(model):
+@requires_cuda
+def test_salm_automodel_generation_prompts_as_tensor(model):
     answer = model.generate(
         prompts=torch.tensor([[1, 2, 3, 4, 5, 6, 7, model.audio_locator_tag_id]]),
         audios=torch.randn(1, 16000),

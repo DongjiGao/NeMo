@@ -13,43 +13,36 @@
 # limitations under the License.
 import warnings
 from collections import defaultdict
-from itertools import repeat
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import torch
-from lhotse import CutSet
 from lightning import LightningModule
 from omegaconf import DictConfig
-from peft import PeftModel
 from torch import Tensor
 from torch.distributed.fsdp import fully_shard
-from torch.distributed.tensor import Replicate, Shard
-from torch.distributed.tensor.parallel import (
-    ColwiseParallel,
-    PrepareModuleInput,
-    RowwiseParallel,
-    SequenceParallel,
-    loss_parallel,
-    parallelize_module,
-)
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.parallel import loss_parallel
 from transformers import GenerationConfig
 
 from nemo.collections.common.prompts import PromptFormatter
 from nemo.collections.common.tokenizers import AutoTokenizer
 from nemo.collections.speechlm2.data.salm_dataset import left_collate_vectors
+from nemo.collections.speechlm2.models.salm import _resolve_audios_in_prompt, replace_placeholders_and_build_targets
+from nemo.collections.speechlm2.parts.automodel_lora import ensure_lora_trainable, make_peft_config, maybe_install_lora
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
-from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
-from nemo.collections.speechlm2.parts.pretrained import load_pretrained_hf, move_embedding, setup_speech_encoder
+from nemo.collections.speechlm2.parts.pretrained import (
+    load_pretrained_automodel,
+    setup_speech_encoder,
+    update_perception_output_dim,
+)
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, MaskType, NeuralType
-from nemo.utils import logging
 
 
-class SALM(LightningModule, HFHubMixin):
+class SALMAutomodel(LightningModule, HFHubMixin):
     def __init__(self, cfg) -> None:
         assert isinstance(cfg, dict), (
-            "You must pass the config to SALM as a Python dict to support hyperparameter serialization "
+            "You must pass the config to SALMAutomodel as a Python dict to support hyperparameter serialization "
             f"in PTL checkpoints (we got: '{type(cfg)=}')."
         )
         super().__init__()
@@ -59,18 +52,52 @@ class SALM(LightningModule, HFHubMixin):
 
         self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
         self.tokenizer.add_special_tokens({"additional_special_tokens": [self.audio_locator_tag]})
-        self.llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights)
-        # Note: we have to "move out" the token embedding outside of LLM to avoid
-        #       messing up FSDP/TP hooks.
-        self.embed_tokens = self.llm.model.embed_tokens
-        del self.llm.model.embed_tokens
-
-        maybe_install_lora(self)
-        # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
-        setup_speech_encoder(self, pretrained_weights=self.cfg.pretrained_weights)
+        self.llm = None  # populated by configure_model
+        self.perception = None  # populated by configure_model
 
         self._use_fsdp = False
         self._use_tp = False
+
+        if self.cfg.get("init_configure_model", False):
+            self.configure_model()
+
+    @property
+    def device(self) -> torch.device:
+        """Infer device from the LLM's parameters.
+
+        ``LightningModule.device`` is set by the Trainer and defaults to CPU
+        during standalone inference (no Trainer).  Override to query the actual
+        parameter storage so that ``.to(self.device)`` works correctly for
+        both regular and DTensor (FSDP2/distributed) parameters.
+        """
+        if self.llm is not None:
+            p = next(self.llm.parameters(), None)
+            if p is not None:
+                return p._local_tensor.device if isinstance(p, DTensor) else p.device
+        return super().device
+
+    @property
+    def embed_tokens(self):
+        """Navigate to the LLM's embedding layer (kept inside the LLM)."""
+        if self.llm is None:
+            return None
+        return self.llm.model.embed_tokens
+
+    def _embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed token IDs using the LLM's embedding table.
+
+        Uses ``F.embedding`` instead of calling the ``nn.Embedding`` module to
+        avoid triggering FSDP2 pre-forward hooks (which lazily initialize the
+        child before the root LLM module, causing a ``RuntimeError``).
+
+        When the weight is a sharded ``DTensor`` (FSDP2), we ``full_tensor()``
+        it first to all-gather the complete embedding table — the same operation
+        FSDP2 performs inside the LLM's forward pass.
+        """
+        weight = self.embed_tokens.weight
+        if isinstance(weight, DTensor):
+            weight = weight.full_tensor()
+        return torch.nn.functional.embedding(input_ids, weight)
 
     @property
     def text_vocab_size(self):
@@ -133,9 +160,13 @@ class SALM(LightningModule, HFHubMixin):
             use_cache=cache is not None,
             return_dict=True,
         )
-        ans = {"logits": out['logits']}  # (B, T, text_vocab_size)
-        if cache is not None:
-            ans["cache"] = out["past_key_values"]
+        if not isinstance(out, dict):
+            # NeMo Automodel doesn't respect return_dict=True yet
+            ans = {"logits": out}
+        else:
+            ans = {"logits": out['logits']}  # (B, T, text_vocab_size)
+            if cache is not None:
+                ans["cache"] = out["past_key_values"]
         return ans
 
     def prepare_inputs(self, batch: dict):
@@ -157,7 +188,7 @@ class SALM(LightningModule, HFHubMixin):
         )
         audio_embs = [emb[:emblen] for emb, emblen in zip(audio_embs, audio_emb_lens)]
         input_ids_to_embed = torch.where(batch["input_ids"] == self.audio_locator_tag_id, 0, batch["input_ids"])
-        text_embs = self.embed_tokens(input_ids_to_embed)
+        text_embs = self._embed_tokens(input_ids_to_embed)
         input_embs, target_ids, attention_mask = replace_placeholders_and_build_targets(
             input_ids=batch["input_ids"],
             embeds=text_embs,
@@ -175,7 +206,7 @@ class SALM(LightningModule, HFHubMixin):
         # when TP is enabled.
         # Input ids: (B, T, K+1)
         if self._use_tp:
-            tp_world_size = self.device_mesh["tensor_parallel"].size()
+            tp_world_size = self.device_mesh["tp"].size()
             if (remainder := (input_embs.shape[1] - 1) % tp_world_size) != 0:
                 # Truncate some tokens from the end to make the sequence lenght shape divisible by tensor parallelism
                 # world size. Otherwise, sequence parallelism will change the input shape making leading to mismatches.
@@ -195,6 +226,9 @@ class SALM(LightningModule, HFHubMixin):
                 m.eval()
 
         inputs = self.prepare_inputs(batch)
+        if torch.distributed.get_rank() == 0:
+            B, T = inputs["input_embeds"].shape[:2]
+            print(f'bs={B} seqlen={T}')
         forward_outputs = self(inputs["input_embeds"], attention_mask=inputs["attention_mask"])
         num_frames = (inputs["target_ids"] != -100).long().sum()
         with loss_parallel():
@@ -207,6 +241,8 @@ class SALM(LightningModule, HFHubMixin):
                 )
                 / num_frames
             )
+        if torch.distributed.get_rank() == 0:
+            print(f'loss={loss.detach().cpu().item()}')
 
         B, T = inputs["input_embeds"].shape[:2]
         ans = {
@@ -285,6 +321,24 @@ class SALM(LightningModule, HFHubMixin):
         with loss_parallel():
             super().backward(*args, **kwargs)
 
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val, gradient_clip_algorithm=None):
+        """Override Lightning's gradient clipping to handle mixed FSDP device meshes.
+
+        When automodel parallelizes the LLM, some parameters end up as DTensors
+        on the ``(dp_replicate, dp_shard_cp)`` mesh while others may be on the
+        flattened ``dp`` mesh.  PyTorch's ``clip_grad_norm_`` requires all norms
+        to share the same mesh for ``torch.stack``.  We delegate to automodel's
+        mesh-aware ``_clip_grad_norm_impl`` which groups parameters by
+        ``(mesh_id, placements)`` and combines per-group norms as plain tensors.
+        """
+        if not self._use_fsdp or gradient_clip_val is None or gradient_clip_val <= 0:
+            return super().configure_gradient_clipping(optimizer, gradient_clip_val, gradient_clip_algorithm)
+        from nemo_automodel.components.training.utils import _clip_grad_norm_impl
+
+        params = [p for group in optimizer.param_groups for p in group["params"] if p.grad is not None]
+        if params:
+            _clip_grad_norm_impl(params, max_norm=gradient_clip_val)
+
     @torch.no_grad()
     def generate(
         self,
@@ -359,7 +413,7 @@ class SALM(LightningModule, HFHubMixin):
         """
         # Encode prompt dicts into int token ids.
         if isinstance(prompts, torch.Tensor):
-            tokens = prompts
+            tokens = prompts.to(self.device)
         else:
             if (
                 maybe_audio := _resolve_audios_in_prompt(prompts, sampling_rate=self.sampling_rate, device=self.device)
@@ -373,11 +427,17 @@ class SALM(LightningModule, HFHubMixin):
                 [formatter.encode_dialog(turns=prompt)["input_ids"] for prompt in prompts],
                 padding_value=self.text_pad_id,
             ).to(self.device)
+        if generation_config is None:
+            generation_config = GenerationConfig(
+                bos_token_id=self.text_bos_id,
+                eos_token_id=self.text_eos_id,
+                pad_token_id=self.text_pad_id,
+            )
         if audios is not None:
             # Audio + text input for generation.
             # Prepare token embeddings and audio embeddings.
             tokens_to_embed = tokens.where(tokens != self.audio_locator_tag_id, 0)
-            token_embeds = self.embed_tokens(tokens_to_embed)
+            token_embeds = self._embed_tokens(tokens_to_embed)
             # TODO: temporary workaround to perform batch_size=1 inference for audio encoder
             #   due to accuracy issues at bs>1
             audio_embeds, audio_embed_lens = self.perception(audios, audio_lens)
@@ -391,22 +451,18 @@ class SALM(LightningModule, HFHubMixin):
                 replacements=audio_embeds,
                 target_ids=None,
             )
-            generation_inputs = {"inputs_embeds": input_embeds, "attention_mask": attention_mask}
-        else:
-            # Text-only generation.
-            attention_mask = tokens != self.text_pad_id
-            generation_inputs = {"input_ids": tokens, "attention_mask": attention_mask}
-        if generation_config is None:
-            generation_config = GenerationConfig(
-                bos_token_id=self.text_bos_id,
-                eos_token_id=self.text_eos_id,
-                pad_token_id=self.text_pad_id,
-            )
-        # Generate the answers using HF Generate API.
-        # Note: we need to put the text embedding layer back to the LLM for processing.
-        with move_embedding(self):
             answer_tokens = self.llm.generate(
-                **generation_inputs,
+                inputs_embeds=input_embeds,
+                attention_mask=attention_mask,
+                **generation_kwargs,
+                generation_config=generation_config,
+            )
+        else:
+            # Text-only generation — embed_tokens stays in LLM, HF generate uses it natively.
+            attention_mask = tokens != self.text_pad_id
+            answer_tokens = self.llm.generate(
+                input_ids=tokens,
+                attention_mask=attention_mask,
                 **generation_kwargs,
                 generation_config=generation_config,
             )
@@ -415,101 +471,106 @@ class SALM(LightningModule, HFHubMixin):
     def configure_optimizers(self):
         return configure_optimizers(self)
 
-    def configure_model(self) -> None:
-        # TODO(pzelasko): refactor into separate module re-usable across models
-        device_mesh = self.device_mesh
+    def configure_model(
+        self,
+        device_mesh=None,
+        distributed_config=None,
+        moe_config=None,
+        moe_mesh=None,
+    ) -> None:
+        # Use provided device_mesh, or fall back to LightningModule property
+        if device_mesh is not None:
+            self._device_mesh = device_mesh
+        else:
+            device_mesh = self.device_mesh
+
+        # Derive dtype from trainer precision (e.g. "bf16-true" -> bfloat16).
+        dtype = torch.float32
+        if self._trainer is not None:
+            precision = str(self._trainer.precision)
+            if "bf16" in precision:
+                dtype = torch.bfloat16
+            elif "16" in precision:
+                dtype = torch.float16
+        elif hasattr(self.cfg, 'torch_dtype') and self.cfg.torch_dtype is not None:
+            td = self.cfg.torch_dtype
+            dtype = getattr(torch, td) if isinstance(td, str) else td
+
+        # Fall back to trainer.strategy for configs (Lightning training path)
+        if distributed_config is None and self._trainer is not None:
+            distributed_config = getattr(self._trainer.strategy, "distributed_config", None)
+        if moe_mesh is None and self._trainer is not None:
+            moe_mesh = getattr(self._trainer.strategy, "moe_mesh", None)
+        if moe_config is None and self._trainer is not None:
+            moe_config = getattr(self._trainer.strategy, "moe_config", None)
+
+        automodel_kwargs = {}
+        if device_mesh is not None:
+            automodel_kwargs["device_mesh"] = device_mesh
+            # automodel's instantiate_infrastructure unconditionally calls
+            # .to_dict() on these configs, so we must always provide defaults.
+            if distributed_config is None:
+                from nemo_automodel.components.distributed.config import FSDP2Config
+
+                distributed_config = FSDP2Config()
+            if moe_config is None:
+                from nemo_automodel.components.moe.config import MoEParallelizerConfig
+
+                moe_config = MoEParallelizerConfig()
+            automodel_kwargs["distributed_config"] = distributed_config
+            automodel_kwargs["moe_config"] = moe_config
+        if moe_mesh is not None:
+            automodel_kwargs["moe_mesh"] = moe_mesh
+
+        # When LoRA is configured and we have a device_mesh, pass peft_config
+        # through automodel so LoRA is applied before FSDP2 sharding (handles
+        # meta-device init correctly).
+        peft_config = make_peft_config(self.cfg.lora) if "lora" in self.cfg else None
+        if peft_config is not None and device_mesh is not None:
+            automodel_kwargs["peft_config"] = peft_config
+
+        self.llm = load_pretrained_automodel(
+            self.cfg.pretrained_llm,
+            pretrained_weights=self.cfg.pretrained_weights,
+            dtype=dtype,
+            **automodel_kwargs,
+        )
+
+        # Create perception module (must happen after LLM so output_dim matches)
+        setup_speech_encoder(self, pretrained_weights=self.cfg.pretrained_weights)
+
+        # Fix projection dim for pretrained_weights=False (config output_dim may not match LLM)
+        update_perception_output_dim(self)
+
+        # Apply LoRA adapters to the LLM.
+        # When device_mesh is set, LoRA was already applied inside automodel's
+        # from_pretrained (before sharding).  Otherwise, apply it now.
+        if peft_config is not None and device_mesh is None:
+            maybe_install_lora(self)
+        elif peft_config is not None:
+            # LoRA was applied by automodel; still need to ensure the
+            # prevent_freeze_params pattern is set for configure_optimizers.
+            ensure_lora_trainable(self)
+
         if device_mesh is None:
             return
 
-        llm = self.llm
-        if isinstance(llm, PeftModel):
-            llm = llm.base_model.model
-
-        if (tp_mesh := device_mesh["tensor_parallel"]).size() > 1:
+        if device_mesh["tp"].size() > 1:
             self._use_tp = True
 
-            # TODO: Distributing embeddings with TP in this setup is tricky
-            #       because we're adding with the output of a non-parallelized
-            #       speech encoder.
-            # for m in (self.embed_tokens, self.embed_audio_tokens):
-            #     parallelize_module(
-            #         m,
-            #         tp_mesh,
-            #         ColwiseParallel(
-            #             # input_layouts=Shard(1),
-            #             # # Optional: Shard the output along the class dimension to compute the loss in parallel.
-            #             # # See `loss_parallel` in `train.py`
-            #             # output_layouts=Shard(1),
-            #             # use_local_output=False,
-            #         ),
-            #     )
+        # Use the same FSDP mesh as automodel uses for the LLM so that
+        # gradient clipping can torch.stack norms from all parameters.
+        dim_names = device_mesh.mesh_dim_names
+        if "dp_replicate" in dim_names and "dp_shard_cp" in dim_names:
+            fsdp_mesh = device_mesh["dp_replicate", "dp_shard_cp"]
+        elif "dp_shard_cp" in dim_names:
+            fsdp_mesh = device_mesh["dp_shard_cp"]
+        else:
+            fsdp_mesh = device_mesh["dp"]
 
-            # # Parallelize the first embedding and the last linear out projection
-            plan = {
-                "layers.0": PrepareModuleInput(
-                    input_layouts=(Replicate(),),  # , None)
-                    desired_input_layouts=(Shard(1),),  # , None)
-                    use_local_output=True,
-                ),
-                "norm": SequenceParallel(),
-            }
-            parallelize_module(llm, tp_mesh, plan)
-
-            # Parallelize each transformer block
-            for transformer_block in llm.model.layers:
-                plan = {
-                    "input_layernorm": SequenceParallel(),
-                    "self_attn.q_proj": ColwiseParallel(),
-                    "self_attn.k_proj": ColwiseParallel(),
-                    "self_attn.v_proj": ColwiseParallel(),
-                    "self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
-                    "post_attention_layernorm": SequenceParallel(),
-                    "mlp": PrepareModuleInput(
-                        input_layouts=(Shard(1),),
-                        desired_input_layouts=(Replicate(),),
-                    ),
-                    "mlp.gate_proj": ColwiseParallel(),
-                    "mlp.up_proj": ColwiseParallel(),
-                    "mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
-                    # "pre_feedforward_layernorm": SequenceParallel(),
-                    # "post_feedforward_layernorm": SequenceParallel(),
-                }
-
-                # Adjust attention module to use the local number of heads
-                attn_layer = transformer_block.self_attn
-                for attr in ("num_heads", "num_key_value_heads", "hidden_size"):
-                    val = getattr(attn_layer, attr)
-                    if val % tp_mesh.size() != 0:
-                        logging.warning(
-                            f"attn_layer.{attr}={val} is not divisible by {tp_mesh.size()=}: set a different tensor parallelism size to avoid errors."
-                        )
-                    setattr(attn_layer, attr, val // tp_mesh.size())
-
-                # Apply the plan for the current transformer block
-                parallelize_module(transformer_block, tp_mesh, plan)
-
-            parallelize_module(
-                llm.lm_head,
-                tp_mesh,
-                ColwiseParallel(
-                    input_layouts=Shard(1),
-                    # Optional: Shard the output along the class dimension to compute the loss in parallel.
-                    # See `loss_parallel` in `train.py`
-                    output_layouts=Shard(-1),
-                    use_local_output=False,
-                ),
-            )
-
-        if (dp_mesh := device_mesh["data_parallel"]).size() > 1:
-            assert dp_mesh.ndim == 1  # Hybrid-sharding not supported
+        if fsdp_mesh.size() > 1:
             self._use_fsdp = True
-            fsdp_config = {"mesh": dp_mesh}
-            for idx, layer in enumerate(llm.model.layers):
-                llm.model.layers[idx] = fully_shard(layer, **fsdp_config)
-            self.embed_tokens = fully_shard(self.embed_tokens, **fsdp_config)
-            llm.lm_head = fully_shard(llm.lm_head, **fsdp_config)
-            self.llm = fully_shard(self.llm, **fsdp_config)
-            self.perception = fully_shard(self.perception, **fsdp_config)
+            self.perception = fully_shard(self.perception, mesh=fsdp_mesh)
 
     @property
     def oomptimizer_schema(self) -> dict:
@@ -531,190 +592,3 @@ class SALM(LightningModule, HFHubMixin):
                 {"name": "loss_mask", "type": NeuralType(("B", "T"), MaskType()), "seq_length": "output"},
             ],
         }
-
-
-def replace_placeholders_and_build_targets(
-    input_ids: torch.Tensor,
-    embeds: torch.Tensor,
-    padding_id: int,
-    placeholder_id: int,
-    replacements: list[torch.Tensor],
-    target_ids: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-    """Replaces each occurrence of the placeholder_id in input_ids with the corresponding tensor
-    from the replacements list in the embeds tensor, and creates corresponding adjusted target_ids.
-
-    Note: when padding is necessary, we apply left-padding to the examples not to introduce
-        anomalies at generation time.
-
-    Args:
-      input_ids (Tensor): shape (batch, sequence_length); input token ids.
-      embeds (Tensor): shape (batch, sequence_length, hidden_dim); embeddings for each token.
-      padding_id (int): these IDs will be marked as ignore_index in target_ids.
-      placeholder_id (int): an id to be replaced.
-      replacements (list of Tensor): each Tensor has shape (L_i, hidden_dim), with L_i arbitrary.
-      target_ids (Tensor): shape (batch, sequence_length); target token ids.
-
-    Returns:
-      Tuple[Tensor, Tensor, Tensor]:
-        - Tensor of shape (batch, max_new_sequence_length, hidden_dim) corresponding to
-          ``embeds`` after replacements.
-        - Tensor of shape (batch, max_new_sequence_length) with adjusted target IDs where:
-          * Original target values are preserved where input was not a placeholder or padding
-          * Positions that were placeholders, padding, or added by replacements are set to -100
-          Will be None if target_ids input was None.
-        - Tensor of shape (batch, max_new_sequence_length) with attention padding masks
-          updated to account for shape changes due to replacements.
-    """
-    batch_size, seq_len = input_ids.size()
-    if target_ids is not None:
-        assert target_ids.size() == input_ids.size(), "target_ids must have the same shape as input_ids"
-
-    hidden_dim = embeds.size(2)
-    device, dtype = embeds.device, embeds.dtype
-    ignore_index = -100  # Standard ignore_index value for CrossEntropyLoss
-
-    # Un-pad the tensors because we'll need to re-apply new padding after replacements anyway.
-    input_ids, embeds, target_ids = _unpad_inputs(input_ids, embeds, target_ids, padding_id)
-
-    output_sequences = []
-    output_target_ids = []
-    output_att_masks = []
-    replacement_idx = 0
-
-    for i in range(batch_size):
-        # Find all placeholder positions at once using tensor operations
-        placeholder_positions = (input_ids[i] == placeholder_id).nonzero(as_tuple=True)[0]
-
-        # Handle the case with no placeholders more efficiently
-        if len(placeholder_positions) == 0:
-            output_sequences.append(embeds[i])
-
-            # Start with original target_ids and replace positions where input was padding
-            if target_ids is not None:
-                new_target_ids = target_ids[i].clone()
-                new_target_ids[input_ids[i] == padding_id] = ignore_index
-                output_target_ids.append(new_target_ids)
-            output_att_masks.append(input_ids[i] != padding_id)
-            continue
-
-        # Build segments between placeholders
-        segments = []  # For embeddings
-        target_segments = []  # For target IDs
-        att_masks = []
-        prev_pos = 0
-
-        for pos in placeholder_positions:
-            # Add segment before placeholder (if any)
-            if pos > prev_pos:
-                segments.append(embeds[i][prev_pos:pos])
-
-                # For target IDs: keep original targets but mark positions that were padding in input
-                if target_ids is not None:
-                    segment_target_ids = target_ids[i][prev_pos:pos].clone()
-                    segment_target_ids[segment_target_ids == padding_id] = ignore_index
-                    target_segments.append(segment_target_ids)
-                att_masks.append(input_ids[i][prev_pos:pos] != padding_id)
-
-            # Add replacement for embeddings
-            rep = replacements[replacement_idx]
-            segments.append(rep)
-
-            # For target IDs: all replacement positions get ignore_index
-            target_segments.append(torch.full((rep.size(0),), ignore_index, dtype=torch.long, device=device))
-            att_masks.append(torch.ones((rep.size(0),), dtype=torch.bool, device=device))
-
-            replacement_idx += 1
-            prev_pos = pos + 1  # Skip placeholder
-
-        # Add remaining segment after last placeholder (if any)
-        if prev_pos < seq_len:
-            segments.append(embeds[i][prev_pos:seq_len])
-
-            # For target IDs: keep original targets but mark positions that were padding in input
-            if target_ids is not None:
-                segment_target_ids = target_ids[i][prev_pos:seq_len].clone()
-                segment_target_ids[segment_target_ids == padding_id] = ignore_index
-                target_segments.append(segment_target_ids)
-            att_masks.append(input_ids[i][prev_pos:seq_len] != padding_id)
-
-        # Concatenate all segments for this example
-        output_sequences.append(torch.cat(segments, dim=0))
-        output_att_masks.append(torch.cat(att_masks, dim=0))
-        if target_ids is not None:
-            output_target_ids.append(torch.cat(target_segments, dim=0))
-
-    # Verify all replacements were used
-    if replacement_idx != len(replacements):
-        raise ValueError(f"Expected {len(replacements)} replacements but used {replacement_idx}")
-
-    # Create padded output tensors
-    max_seq_length = max(seq.size(0) for seq in output_sequences)
-    output = torch.zeros(batch_size, max_seq_length, hidden_dim, device=device, dtype=dtype)
-    if target_ids is not None:
-        new_target_ids = torch.full((batch_size, max_seq_length), ignore_index, dtype=torch.long, device=device)
-    else:
-        new_target_ids = None
-    attention_masks = torch.zeros((batch_size, max_seq_length), dtype=torch.bool, device=device)
-
-    if target_ids is None:
-        output_target_ids = repeat(None)
-    for i, (seq, tgt, att) in enumerate(zip(output_sequences, output_target_ids, output_att_masks)):
-        seq_len = seq.size(0)
-        output[i, -seq_len:] = seq
-        if tgt is not None:
-            new_target_ids[i, -seq_len:] = tgt
-        attention_masks[i, -seq_len:] = att
-
-    return output, new_target_ids, attention_masks
-
-
-def _unpad_inputs(
-    input_ids: torch.Tensor,
-    embeds: torch.Tensor,
-    target_ids: Optional[torch.Tensor],
-    padding_id: int,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    def first_index_not_value(tensor, value):
-        mask = tensor != value
-        indices = torch.nonzero(mask, as_tuple=False)
-        if indices.numel() > 0:
-            return indices[0].item()
-        else:
-            return -1
-
-    input_ids_unpad, embeds_unpad = [], []
-    target_ids_unpad = [] if target_ids is not None else None
-    for i in range(input_ids.shape[0]):
-        idx = first_index_not_value(input_ids[i], padding_id)
-        input_ids_unpad.append(input_ids[i, idx:])
-        embeds_unpad.append(embeds[i, idx:])
-        if target_ids is not None:
-            target_ids_unpad.append(target_ids[i, idx:])
-    return input_ids_unpad, embeds_unpad, target_ids_unpad
-
-
-def _resolve_audios_in_prompt(
-    prompts: list[list[dict]], sampling_rate: int, device: str | torch.device
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    from lhotse import Recording
-
-    paths = []
-    for conversation in prompts:
-        for turn in conversation:
-            if "audio" in turn:
-                turn_audio = turn["audio"]
-                if isinstance(turn_audio, (str, Path)):
-                    turn_audio = [turn_audio]
-                for p in turn_audio:
-                    assert isinstance(p, (str, Path)), f"Invalid value under prompt key 'audio': {p}"
-                    paths.append(p)
-    if not paths:
-        return None
-    cuts = CutSet([Recording.from_file(p).to_cut() for p in paths])
-    with torch.device("cpu"):  # workaround for a Lhotse issue when default device is CUDA during collation
-        audio, audio_lens = cuts.resample(sampling_rate).load_audio(collate=True)
-    return (
-        torch.as_tensor(audio).to(device, non_blocking=True),
-        torch.as_tensor(audio_lens).to(device, non_blocking=True),
-    )

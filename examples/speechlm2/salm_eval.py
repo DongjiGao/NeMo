@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Optional
@@ -37,6 +38,32 @@ class ToAudio(torch.utils.data.Dataset):
         return {"cuts": cuts, "audios": audios, "audio_lens": audio_lens}
 
 
+def _resolve_model_cls(pretrained_name: str, use_asr_decoder: bool, use_nemo_automodel: bool | None):
+    """Pick model class. Auto-detects from config.json when use_nemo_automodel is None."""
+    if use_asr_decoder:
+        return SALMWithAsrDecoder
+    if use_nemo_automodel is None:
+        # Auto-detect: peek at config.json
+        from transformers.utils import cached_file
+
+        config_path = cached_file(
+            pretrained_name,
+            "config.json",
+            _raise_exceptions_for_missing_entries=False,
+            _raise_exceptions_for_connection_errors=False,
+        )
+        if config_path is not None:
+            with open(config_path) as f:
+                use_nemo_automodel = json.load(f).get("use_nemo_automodel", False)
+        else:
+            use_nemo_automodel = False
+    if use_nemo_automodel:
+        from nemo.collections.speechlm2.models import SALMAutomodel
+
+        return SALMAutomodel
+    return SALM
+
+
 @dataclass
 class SalmEvalConfig:
     pretrained_name: str
@@ -52,6 +79,7 @@ class SalmEvalConfig:
     system_prompt: Optional[str] = None
     user_prompt: Optional[str] = None
     use_asr_decoder: bool = False  # set this to True if using SALMWithAsrDecoder
+    use_nemo_automodel: Optional[bool] = None  # None = auto-detect from config.json
     # Parallelism sizes for distributed inference (launch with torchrun)
     tp_size: int = 1
     ep_size: int = 1
@@ -64,7 +92,13 @@ def main(cfg: SalmEvalConfig):
     logging.info(f'Hydra config:\n{OmegaConf.to_yaml(cfg)}')
 
     is_distributed = any(s > 1 for s in [cfg.tp_size, cfg.ep_size, cfg.pp_size, cfg.cp_size])
-    model_cls = SALMWithAsrDecoder if cfg.use_asr_decoder else SALM
+    model_cls = _resolve_model_cls(cfg.pretrained_name, cfg.use_asr_decoder, cfg.use_nemo_automodel)
+
+    if is_distributed and model_cls is SALM:
+        raise RuntimeError(
+            "Distributed inference requires SALMAutomodel. Set use_nemo_automodel=true or use a checkpoint "
+            "exported from SALMAutomodel."
+        )
 
     if is_distributed:
         from nemo.collections.speechlm2.parts.parallel import setup_distributed

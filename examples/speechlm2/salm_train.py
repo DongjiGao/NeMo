@@ -36,8 +36,14 @@ def train(cfg):
     log_dir = exp_manager(trainer, cfg.get("exp_manager", None))
     OmegaConf.save(cfg, log_dir / "exp_config.yaml")
 
+    model_cls = SALM
+    if cfg.model.get("use_nemo_automodel", False):
+        from nemo.collections.speechlm2 import SALMAutomodel
+
+        model_cls = SALMAutomodel
+
     with trainer.init_module():
-        model = SALM(OmegaConf.to_container(cfg.model, resolve=True))
+        model = model_cls(OmegaConf.to_container(cfg.model, resolve=True))
 
     dataset = SALMDataset(tokenizer=model.tokenizer)
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)

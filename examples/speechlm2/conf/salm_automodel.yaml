@@ -5,11 +5,13 @@ model:
 
   pretrained_weights: True  # When False, we use pretrained_name to load the architecture, but with random init
 
+  # Set to true to use SALMAutomodel (NeMo Automodel backend) instead of SALM (HF Transformers backend).
+  use_nemo_automodel: true
+
   # Regexp (re.compile) patterns matching parameters to be frozen.
   freeze_params:
-    # Frozen LLM
-    - "^llm\\..+$"  # LLM
-    - "^embed_tokens\\..+$"  # LLM embedding is moved
+    # Frozen LLM (embed_tokens stays inside llm, so this pattern covers it too)
+    - "^llm\\..+$"
     # Frozen pretrained ASR (only the modality adapter layers are trainable)
     - "^perception\\.preprocessor\\..+$"
     - "^perception\\.encoder\\..+$"
@@ -18,16 +20,19 @@ model:
   prompt_format: qwen
   audio_locator_tag: "<|audioplaceholder|>"  # placeholder token for audio turn is expected
 
-  # Note: Uncomment the block below to enable LoRA on LLM via HuggingFace PEFT library.
-  #   It will automatically freeze LLM parameters even if freeze_params was unused,
-  #   and prevent freezing any parameter that has the string '.lora_' in its name.
+  # Uncomment the block below to enable LoRA on the LLM via Automodel.
+  # LoRA parameters are kept trainable even when the LLM is frozen.
   # lora:
-  #   task_type: CAUSAL_LM
-  #   r: 128
-  #   lora_alpha: 256
-  #   lora_dropout: 0.01
-  #   # target_modules are only necessary if the `pretrained_llm` is not yet registered in PEFT library
+  #   dim: 128
+  #   alpha: 256
+  #   dropout: 0.01
   #   target_modules: ["q_proj", "v_proj"]
+  #   # match_all_linear: false
+  #   # exclude_modules: []
+  #   # use_dora: false
+  #   # dropout_position: post
+  #   # lora_A_init: xavier
+  #   # use_triton: false
 
   perception:
      target: nemo.collections.speechlm2.modules.perception.AudioPerceptionModule
@@ -72,13 +77,33 @@ trainer:
   gradient_clip_val: 1.0
   accumulate_grad_batches: 1
   strategy:
-    # Replace DDPStrategy with ModelParallelStrategy to enable model parallelism
-    _target_: lightning.pytorch.strategies.DDPStrategy
-    gradient_as_bucket_view: true
-    find_unused_parameters: true
-    # _target_: lightning.pytorch.strategies.ModelParallelStrategy
-    # tensor_parallel_size: 1
-    # data_parallel_size: 8  # This is FSDP2
+    # AutomodelParallelStrategy delegates device mesh creation to nemo_automodel and supports
+    # FSDP2, TP, PP, CP, EP (MoE), and HSDP. The model's configure_model() receives the
+    # device_mesh and passes it to automodel's from_pretrained for memory-efficient loading
+    # (each GPU only loads its own shard).
+    _target_: nemo.collections.speechlm2.parts.parallel.AutomodelParallelStrategy
+
+    # --- Parallelism dimensions ---
+    dp_size: null       # Data parallel size (null = inferred from world_size / other dims)
+    dp_replicate_size: 1  # HSDP replication group size (>1 enables hybrid sharding)
+    tp_size: 1          # Tensor parallel size
+    pp_size: 1          # Pipeline parallel size
+    cp_size: 1          # Context parallel size
+    ep_size: 1          # Expert parallel size (for MoE models)
+
+    # --- FSDP2 distributed config (plain dict, resolved to FSDP2Config automatically) ---
+    # distributed_config:
+    #   sequence_parallel: false    # Enable sequence parallelism (requires tp_size > 1)
+    #   activation_checkpointing: false  # Checkpoint activations to save memory
+    #   # offload_policy:           # Uncomment to enable CPU offloading
+    #   #   _target_: torch.distributed.fsdp.CPUOffloadPolicy
+
+    # --- MoE config (plain dict, resolved to MoEParallelizerConfig automatically) ---
+    # moe_config:
+    #   activation_checkpointing: false  # Checkpoint activations in MoE blocks
+    #   reshard_after_forward: false      # Reshard params after forward (saves memory, more comms)
+    #
+    # save_distributed_checkpoint: true  # Each rank saves its shard (false = gather to rank 0)
 
 data:
   train_ds:
@@ -92,7 +117,7 @@ data:
         tags:
           # Uncomment below line to include a system prompt for supported models (e.g. Llama; not Qwen).
           # system_prompt: "some system prompt"
-          context: "Repeat after me, typing in lowercase."
+          context: ""
     seed: 42
     shuffle: true
     shard_seed: "randomized"
@@ -127,7 +152,7 @@ data:
             tags:
               # Uncomment below line to include a system prompt for supported models (e.g. Llama; not Qwen).
               # system_prompt: "some system prompt"
-              context: "Repeat after me, typing in lowercase."
+              context: "Transcribe the following:"
     sample_rate: 16000
     batch_size: 1
     seed: 42

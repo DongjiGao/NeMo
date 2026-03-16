@@ -127,16 +127,23 @@ def main(cfg: HfExportConfig):
     script via ``torchrun`` with the same number of GPUs used for training.
 
     Examples:
-        # Single-file checkpoint (no parallelism needed):
+        # Single-file checkpoint — original SALM (HF Transformers backend):
         python to_hf.py \\
             class_path=nemo.collections.speechlm2.models.SALM \\
             ckpt_path=/path/to/checkpoint.ckpt \\
             ckpt_config=/path/to/config.yaml \\
             output_dir=/path/to/hf_output
 
+        # Single-file checkpoint — SALMAutomodel (NeMo Automodel backend):
+        python to_hf.py \\
+            class_path=nemo.collections.speechlm2.models.SALMAutomodel \\
+            ckpt_path=/path/to/checkpoint.ckpt \\
+            ckpt_config=/path/to/config.yaml \\
+            output_dir=/path/to/hf_output
+
         # Distributed checkpoint (parallelism read from config automatically):
         torchrun --nproc-per-node=8 to_hf.py \\
-            class_path=nemo.collections.speechlm2.models.SALM \\
+            class_path=nemo.collections.speechlm2.models.SALMAutomodel \\
             ckpt_path=/path/to/distributed_ckpt_dir \\
             ckpt_config=/path/to/config.yaml \\
             output_dir=/path/to/hf_output
