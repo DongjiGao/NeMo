@@ -111,9 +111,7 @@ class HuggingFaceFileIO(ABC):
         # Search for all valid models after filtering
         api = HfApi()
 
-        results = api.list_models(
-            token=hf_token, sort="lastModified", **model_filter
-        )  # type: Iterable[ModelInfo]
+        results = api.list_models(token=hf_token, sort="lastModified", **model_filter)  # type: Iterable[ModelInfo]
 
         return results
 
