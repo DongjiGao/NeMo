@@ -226,9 +226,6 @@ class SALMAutomodel(LightningModule, HFHubMixin):
                 m.eval()
 
         inputs = self.prepare_inputs(batch)
-        if torch.distributed.get_rank() == 0:
-            B, T = inputs["input_embeds"].shape[:2]
-            print(f'bs={B} seqlen={T}')
         forward_outputs = self(inputs["input_embeds"], attention_mask=inputs["attention_mask"])
         num_frames = (inputs["target_ids"] != -100).long().sum()
         with loss_parallel():
@@ -241,8 +238,6 @@ class SALMAutomodel(LightningModule, HFHubMixin):
                 )
                 / num_frames
             )
-        if torch.distributed.get_rank() == 0:
-            print(f'loss={loss.detach().cpu().item()}')
 
         B, T = inputs["input_embeds"].shape[:2]
         ans = {

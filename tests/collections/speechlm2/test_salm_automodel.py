@@ -36,19 +36,19 @@ def resolve_pretrained_models():
     if os.path.exists("/home/TestData/speechlm/pretrained_models"):
         # CI pre-cached paths:
         return {
-            "pretrained_llm": "/home/TestData/speechlm/pretrained_models/TinyLlama--TinyLlama_v1.1",
+            "pretrained_llm": "/home/TestData/speechlm/pretrained_models/Qwen--Qwen3-1.7B",
             "pretrained_asr": "/home/TestData/speechlm/pretrained_models/canary-1b-flash.nemo",
         }
     else:
         # HF URLs:
         return {
             "pretrained_asr": "nvidia/canary-1b-flash",
-            "pretrained_llm": "TinyLlama/TinyLlama_v1.1",
+            "pretrained_llm": "Qwen/Qwen3-1.7B",
         }
 
 
 AUDIO_LOCATOR_TAG = "<|audioplaceholder|>"
-PROMPT = "llama2"
+PROMPT = "qwen"
 
 
 @pytest.fixture(scope="session")
@@ -155,7 +155,7 @@ def test_salm_automodel_dataset(dataset, prompt_formatter, training_cutset_batch
     tokenized = training_cutset_batch[0].input_ids
     assert (
         prompt_formatter.tokenizer.tokenizer.decode(tokenized) ==
-        f"<s> [INST] Repeat after me: {AUDIO_LOCATOR_TAG} [/INST] Some text transcription. </s>"
+        f"<|im_start|>user\nRepeat after me: {AUDIO_LOCATOR_TAG}<|im_end|>\n<|im_start|>assistant\nSome text transcription.<|im_end|>\n"
     )
     # fmt: on
     batch = dataset[training_cutset_batch]

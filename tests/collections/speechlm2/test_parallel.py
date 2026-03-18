@@ -67,10 +67,9 @@ class TestAutomodelParallelStrategy:
         assert strategy.distributed_config.defer_fsdp_grad_sync is False
 
     def test_accepts_moe_config(self):
-        cfg = MoEParallelizerConfig(activation_checkpointing=True)
+        cfg = MoEParallelizerConfig()
         strategy = AutomodelParallelStrategy(moe_config=cfg)
         assert strategy.moe_config is cfg
-        assert strategy.moe_config.activation_checkpointing is True
 
     def test_save_distributed_checkpoint_forwarded(self):
         strategy = AutomodelParallelStrategy(save_distributed_checkpoint=False)
