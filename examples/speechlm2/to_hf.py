@@ -148,6 +148,9 @@ def main(cfg: HfExportConfig):
             ckpt_config=/path/to/config.yaml \\
             output_dir=/path/to/hf_output
     """
+    if not Path(cfg.ckpt_path).exists():
+        raise RuntimeError(f"No such file or directory: {cfg.ckpt_path}")
+
     full_cfg = OmegaConf.to_container(OmegaConf.load(cfg.ckpt_config), resolve=True)
     model_cfg = full_cfg["model"]
     model_cfg["torch_dtype"] = cfg.dtype
