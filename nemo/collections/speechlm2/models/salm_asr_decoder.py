@@ -403,6 +403,7 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
         audios: torch.Tensor = None,
         audio_lens: torch.Tensor = None,
         generation_config: GenerationConfig = None,
+        enable_thinking: bool | None = None,
         **generation_kwargs,
     ) -> torch.Tensor:
         """
@@ -466,6 +467,8 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
                 Each prompt can have multiple audios.
             audio_lens: Optional. Length of each audio example.
             generation_config: Optional HuggingFace GenerationConfig object.
+            enable_thinking: Optional prompt-formatter hint forwarded to ``encode_dialog``.
+                Relevant for prompt formats that support thinking/reasoning mode.
             generation_kwargs: Keyword arguments passed directly to the underlying LLM's ``generate`` method.
         """
         # Encode prompt dicts into int token ids.
@@ -480,8 +483,11 @@ class SALMWithAsrDecoder(LightningModule, HFHubMixin):
                 ), "Audios cannot be provided via ``prompts`` and ``audios``/``audio_lens`` arguments simultaneously."
                 audios, audio_lens = maybe_audio
             formatter = PromptFormatter.resolve(self.cfg.prompt_format)(self.tokenizer)
+            formatter_kwargs = {}
+            if enable_thinking is not None:
+                formatter_kwargs["enable_thinking"] = enable_thinking
             tokens = left_collate_vectors(
-                [formatter.encode_dialog(turns=prompt)["input_ids"] for prompt in prompts],
+                [formatter.encode_dialog(turns=prompt, **formatter_kwargs)["input_ids"] for prompt in prompts],
                 padding_value=self.text_pad_id,
             ).to(self.device)
         tokens_to_embed = tokens.where(tokens != self.audio_locator_tag_id, 0)

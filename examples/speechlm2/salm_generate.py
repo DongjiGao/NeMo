@@ -74,6 +74,7 @@ class SalmEvalConfig:
     extra_eos_tokens: Optional[list[str]] = None
     system_prompt: Optional[str] = None
     user_prompt: Optional[str] = None
+    enable_thinking: Optional[bool] = None
     use_asr_decoder: bool = False  # set this to True if using SALMWithAsrDecoder
     use_nemo_automodel: Optional[bool] = None  # None = auto-detect from config.json
     # Parallelism sizes for distributed inference (launch with torchrun)
@@ -142,6 +143,7 @@ def main(cfg: SalmEvalConfig):
                 tokenize_with_prompt,
                 tokenizer=model.tokenizer,
                 prompt_format=model.cfg.prompt_format,
+                enable_thinking=cfg.enable_thinking,
             ),
             apply_fn=None,
         )

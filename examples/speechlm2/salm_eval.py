@@ -78,6 +78,7 @@ class SalmEvalConfig:
     extra_eos_tokens: Optional[list[str]] = None
     system_prompt: Optional[str] = None
     user_prompt: Optional[str] = None
+    enable_thinking: Optional[bool] = None
     use_asr_decoder: bool = False  # set this to True if using SALMWithAsrDecoder
     use_nemo_automodel: Optional[bool] = None  # None = auto-detect from config.json
     # Parallelism sizes for distributed inference (launch with torchrun)
@@ -171,6 +172,7 @@ def main(cfg: SalmEvalConfig):
                 eos_token_id=eos_tokens,
                 pad_token_id=model.text_pad_id,
             ),
+            enable_thinking=cfg.enable_thinking,
         )
         answer_ids = answer_ids.cpu()
         batch_infer_duration = perf_counter() - ts
