@@ -66,7 +66,11 @@ def load_pretrained_hf(
 
 
 def load_pretrained_automodel(
-    model_path_or_name: str, pretrained_weights: bool = True, dtype=torch.float32, trust_remote_code: bool = False, **kwargs
+    model_path_or_name: str,
+    pretrained_weights: bool = True,
+    dtype=torch.float32,
+    trust_remote_code: bool = False,
+    **kwargs,
 ):
     """
     Load a causal LM using NeMo Automodel (``NeMoAutoModelForCausalLM``).
