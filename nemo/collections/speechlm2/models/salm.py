@@ -220,7 +220,8 @@ class SALM(LightningModule, HFHubMixin):
             "target_to_input_ratio": num_frames / (B * T),
             "padding_ratio": (batch["input_ids"] != self.text_pad_id).long().sum() / batch["input_ids"].numel(),
         }
-        self.log_dict(ans, on_step=True)
+        self.log("loss", loss, on_step=True, prog_bar=True)
+        self.log_dict({k: v for k, v in ans.items() if k != "loss"}, on_step=True)
         return ans
 
     def on_validation_epoch_start(self) -> None:
