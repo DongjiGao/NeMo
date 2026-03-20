@@ -57,9 +57,15 @@ class SALM(LightningModule, HFHubMixin):
         self.cfg = DictConfig(cfg)
         self.audio_locator_tag = self.cfg.audio_locator_tag
 
-        self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
+        self.tokenizer = AutoTokenizer(
+            self.cfg.pretrained_llm, use_fast=True, trust_remote_code=self.cfg.get("trust_remote_code", False)
+        )
         self.tokenizer.add_special_tokens({"additional_special_tokens": [self.audio_locator_tag]})
-        self.llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights)
+        self.llm = load_pretrained_hf(
+            self.cfg.pretrained_llm,
+            pretrained_weights=self.cfg.pretrained_weights,
+            trust_remote_code=self.cfg.get("trust_remote_code", False),
+        )
         # Note: we have to "move out" the token embedding outside of LLM to avoid
         #       messing up FSDP/TP hooks.
         self.embed_tokens = self.llm.model.embed_tokens
@@ -220,7 +226,8 @@ class SALM(LightningModule, HFHubMixin):
             "target_to_input_ratio": num_frames / (B * T),
             "padding_ratio": (batch["input_ids"] != self.text_pad_id).long().sum() / batch["input_ids"].numel(),
         }
-        self.log_dict(ans, on_step=True)
+        self.log("loss", loss, on_step=True, prog_bar=True)
+        self.log_dict({k: v for k, v in ans.items() if k != "loss"}, on_step=True)
         return ans
 
     def on_validation_epoch_start(self) -> None:
@@ -292,6 +299,7 @@ class SALM(LightningModule, HFHubMixin):
         audios: torch.Tensor = None,
         audio_lens: torch.Tensor = None,
         generation_config: GenerationConfig = None,
+        enable_thinking: bool | None = None,
         **generation_kwargs,
     ) -> torch.Tensor:
         """
@@ -355,6 +363,8 @@ class SALM(LightningModule, HFHubMixin):
                 Each prompt can have multiple audios.
             audio_lens: Optional. Length of each audio example.
             generation_config: Optional HuggingFace GenerationConfig object.
+            enable_thinking: Optional prompt-formatter hint forwarded to ``encode_dialog``.
+                Relevant for prompt formats that support thinking/reasoning mode.
             generation_kwargs: Keyword arguments passed directly to the underlying LLM's ``generate`` method.
         """
         # Encode prompt dicts into int token ids.
@@ -369,8 +379,11 @@ class SALM(LightningModule, HFHubMixin):
                 ), "Audios cannot be provided via ``prompts`` and ``audios``/``audio_lens`` arguments simultaneously."
                 audios, audio_lens = maybe_audio
             formatter = PromptFormatter.resolve(self.cfg.prompt_format)(self.tokenizer)
+            formatter_kwargs = {}
+            if enable_thinking is not None:
+                formatter_kwargs["enable_thinking"] = enable_thinking
             tokens = left_collate_vectors(
-                [formatter.encode_dialog(turns=prompt)["input_ids"] for prompt in prompts],
+                [formatter.encode_dialog(turns=prompt, **formatter_kwargs)["input_ids"] for prompt in prompts],
                 padding_value=self.text_pad_id,
             ).to(self.device)
         if audios is not None:

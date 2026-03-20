@@ -30,6 +30,7 @@ from nemo.collections.common.data.lhotse.cutset import guess_parse_cutset
 from nemo.collections.speechlm2.models import SALM, SALMWithAsrDecoder
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
+from nemo.utils.get_rank import is_global_rank_zero
 
 
 class ToAudio(torch.utils.data.Dataset):
@@ -78,6 +79,7 @@ class SalmEvalConfig:
     extra_eos_tokens: Optional[list[str]] = None
     system_prompt: Optional[str] = None
     user_prompt: Optional[str] = None
+    enable_thinking: Optional[bool] = None
     use_asr_decoder: bool = False  # set this to True if using SALMWithAsrDecoder
     use_nemo_automodel: Optional[bool] = None  # None = auto-detect from config.json
     # Parallelism sizes for distributed inference (launch with torchrun)
@@ -171,6 +173,7 @@ def main(cfg: SalmEvalConfig):
                 eos_token_id=eos_tokens,
                 pad_token_id=model.text_pad_id,
             ),
+            enable_thinking=cfg.enable_thinking,
         )
         answer_ids = answer_ids.cpu()
         batch_infer_duration = perf_counter() - ts
@@ -197,10 +200,9 @@ def main(cfg: SalmEvalConfig):
     logging.info(f"WER: {wer:.2%} [ins={nins:.2%} del={ndel:.2%} sub={nsub:.2%}]")
     logging.info(f"RTFx: {rtfx:.1f}")
 
-    if cfg.output_manifest is not None:
-        with SequentialJsonlWriter(cfg.output_manifest) as writer:
-            for cut, ref, hyp in zip(cuts, refs, hyps):
-                writer.write({"id": cut.id, "duration": cut.duration, "text": ref, "pred_text": hyp})
+    with _create_output_writer(cfg.output_manifest) as writer:
+        for cut, ref, hyp in zip(cuts, refs, hyps):
+            writer.write({"id": cut.id, "duration": cut.duration, "text": ref, "pred_text": hyp})
 
 
 def parse_hyp(answer: torch.Tensor, eos_tokens: list[int]):
@@ -209,6 +211,23 @@ def parse_hyp(answer: torch.Tensor, eos_tokens: list[int]):
         return answer
     end = end[0]
     return answer[:end]
+
+
+class _NullWriter:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    def write(self, data):
+        pass
+
+
+def _create_output_writer(output_manifest: Optional[str]):
+    if output_manifest is None or not is_global_rank_zero():
+        return _NullWriter()
+    return SequentialJsonlWriter(output_manifest)
 
 
 if __name__ == '__main__':
