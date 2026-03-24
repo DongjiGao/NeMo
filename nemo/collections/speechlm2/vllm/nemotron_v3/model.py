@@ -69,11 +69,13 @@ _MAX_AUDIO_DURATION_S = 40.0
 
 
 def _ensure_special_tokens(tokenizer):
-    special = [_AUDIO_PLACEHOLDER]
-    existing = set(tokenizer.get_vocab().keys())
-    to_add = [t for t in special if t not in existing]
-    if to_add:
-        tokenizer.add_special_tokens({"additional_special_tokens": to_add})
+    """No-op: assume the tokenizer already has <|audio|>.
+
+    The token is added once at model init time (see __init__ below).
+    Mutating the tokenizer during request processing causes "Already
+    borrowed" errors with vLLM's concurrent Rust tokenizer backend.
+    """
+    pass
 
 
 def _load_nemo_perception(perception_cfg: dict, output_dim: int) -> nn.Module:
