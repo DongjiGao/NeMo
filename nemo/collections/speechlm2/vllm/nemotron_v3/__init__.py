@@ -14,21 +14,20 @@
 
 """vLLM plugin registration for NeMo Speech LM models.
 
-Registers NeMoSpeechLMConfig and NeMoSpeechLMForConditionalGeneration
-into vLLM's model and config registries via the ``vllm.general_plugins``
+Registers NeMoSpeechLMConfig and both model classes into vLLM's
+model and config registries via the ``vllm.general_plugins``
 entry point.
+
+Model classes:
+  - NeMoSpeechLMForConditionalGeneration   — hybrid (Mamba+MoE, e.g. NemotronH)
+  - NeMoSpeechLMStdForConditionalGeneration — standard transformer (e.g. Qwen3)
 """
 
 _PKG = "nemo.collections.speechlm2.vllm.nemotron_v3"
 
 
 def register():
-    """Register the NeMo Speech LM model and config with vLLM.
-
-    Called automatically by vLLM when ``VLLM_PLUGINS=nemo_speechlm``
-    is set, via the ``vllm.general_plugins`` entry point in
-    ``pyproject.toml``.
-    """
+    """Register the NeMo Speech LM models and config with vLLM."""
     from transformers import AutoConfig
 
     from nemo.collections.speechlm2.vllm.nemotron_v3.config import NeMoSpeechLMConfig
@@ -45,16 +44,23 @@ def register():
         "NeMoSpeechLMForConditionalGeneration",
         f"{_PKG}.model:NeMoSpeechLMForConditionalGeneration",
     )
+    ModelRegistry.register_model(
+        "NeMoSpeechLMStdForConditionalGeneration",
+        f"{_PKG}.model:NeMoSpeechLMStdForConditionalGeneration",
+    )
 
     _apply_backend_patches()
 
 
 def _apply_backend_patches():
-    """Apply patches for LLM backends that need them.
+    """Apply runtime patches needed for vLLM compatibility.
 
-    NemotronH's HF config uses ``layer_norm_epsilon`` but vLLM expects
-    ``rms_norm_eps``.  This patches the config class at runtime.
+    Called at plugin registration time. All patches here must be
+    pickle-safe (no closures) since vLLM spawns EngineCore as a
+    subprocess.
     """
+    _patch_tokenizer_thread_safety()
+
     try:
         from transformers import AutoConfig as _AC
 
@@ -75,3 +81,43 @@ def _apply_backend_patches():
         NHConfigCls.__getattr__ = _patched_getattr
     except Exception:
         pass
+
+
+def _thread_safe_batch_encode_plus(self, *args, **kwargs):
+    """Wrapper that serializes _batch_encode_plus calls per instance."""
+    import threading
+
+    if not hasattr(self, "_tokenizer_lock"):
+        self._tokenizer_lock = threading.Lock()
+    with self._tokenizer_lock:
+        return type(self)._orig_batch_encode_plus(self, *args, **kwargs)
+
+
+def _patch_tokenizer_thread_safety():
+    """Make HuggingFace fast tokenizer thread-safe for vLLM.
+
+    ``PreTrainedTokenizerFast._batch_encode_plus`` first mutates the
+    underlying Rust tokenizer (``set_truncation_and_padding`` calls
+    ``enable_truncation`` / ``no_truncation``), then encodes text via
+    ``self._tokenizer.encode_batch``.  When vLLM dispatches tokenizer
+    calls to a thread pool, concurrent threads race on the Rust borrow
+    checker and panic with ``RuntimeError: Already borrowed``.
+
+    This patch wraps the entire ``_batch_encode_plus`` method in a
+    per-instance ``threading.Lock`` so the truncation-setup + encode +
+    cleanup cycle is atomic.
+
+    Uses a module-level function (not a closure) so the patch survives
+    multiprocessing spawn/pickle.
+    """
+    from transformers import PreTrainedTokenizerFast
+
+    if hasattr(PreTrainedTokenizerFast, "_orig_batch_encode_plus"):
+        return  # already patched
+
+    PreTrainedTokenizerFast._orig_batch_encode_plus = (
+        PreTrainedTokenizerFast._batch_encode_plus
+    )
+    PreTrainedTokenizerFast._batch_encode_plus = (
+        _thread_safe_batch_encode_plus
+    )

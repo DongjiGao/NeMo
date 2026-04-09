@@ -17,18 +17,28 @@
 Provides ``NeMoSpeechLMConfig``, a HuggingFace-compatible config class
 that wraps the LLM backbone's text config with NeMo-specific fields
 (perception, audio_locator_tag, etc.).  The checkpoint's ``config.json``
-determines which LLM backbone and encoder are used.
+determines which LLM backbone and encoder are used; hybrid (Mamba+MoE)
+vs standard transformer backends are auto-detected.
 """
 
 from transformers import AutoConfig, PretrainedConfig
+
+_HYBRID_ARCHITECTURES = frozenset({
+    "NemotronHForCausalLM",
+    "NemotronHybridForCausalLM",
+})
+
+
+def _is_hybrid_backend(architectures: list[str]) -> bool:
+    return bool(set(architectures) & _HYBRID_ARCHITECTURES)
 
 
 class NeMoSpeechLMConfig(PretrainedConfig):
     """HuggingFace config for NeMo Speech LM multimodal models.
 
     Wraps a pretrained LLM config (e.g. NemotronH, Qwen3) with
-    additional fields for the speech perception module.  The LLM
-    backbone config is loaded from ``pretrained_llm`` at init time.
+    additional fields for the speech perception module.  Hybrid vs
+    standard transformer is auto-detected from ``pretrained_llm``.
     """
 
     model_type = "nemo_speechlm"
@@ -41,6 +51,7 @@ class NeMoSpeechLMConfig(PretrainedConfig):
         audio_locator_tag: str = "<|audio|>",
         prompt_format: str = "nemotron-nano-v3",
         pretrained_weights: bool = True,
+        lora: dict | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -50,23 +61,37 @@ class NeMoSpeechLMConfig(PretrainedConfig):
         self.audio_locator_tag = audio_locator_tag
         self.prompt_format = prompt_format
         self.pretrained_weights = pretrained_weights
+        self.lora = lora
 
-        self.text_config = AutoConfig.from_pretrained(pretrained_llm, trust_remote_code=True)
-        self.text_config.architectures = ["NemotronHForCausalLM"]
+        self.text_config = AutoConfig.from_pretrained(
+            pretrained_llm, trust_remote_code=True
+        )
 
-        if not hasattr(self.text_config, "total_num_kv_heads") or self.text_config.total_num_kv_heads is None:
-            self.text_config.total_num_kv_heads = getattr(self.text_config, "num_key_value_heads", 2)
+        raw_archs = getattr(self.text_config, "architectures", [])
+        self.is_hybrid = _is_hybrid_backend(raw_archs)
 
-        if not hasattr(self.text_config, "rms_norm_eps"):
-            self.text_config.rms_norm_eps = getattr(self.text_config, "layer_norm_epsilon", 1e-5)
+        if self.is_hybrid:
+            self.text_config.architectures = ["NemotronHForCausalLM"]
+            if (
+                not hasattr(self.text_config, "total_num_kv_heads")
+                or self.text_config.total_num_kv_heads is None
+            ):
+                self.text_config.total_num_kv_heads = getattr(
+                    self.text_config, "num_key_value_heads", 2
+                )
+            if not hasattr(self.text_config, "rms_norm_eps"):
+                self.text_config.rms_norm_eps = getattr(
+                    self.text_config, "layer_norm_epsilon", 1e-5
+                )
 
-        # Extend vocab to accommodate audio special tokens added at runtime.
-        # The embedding layer uses org_num_embeddings for weight loading
-        # so the checkpoint stays compatible.
         self.text_config.vocab_size = self.text_config.vocab_size + 10
 
+    @property
+    def llm_architectures(self) -> list[str]:
+        """Return the LLM backbone architectures list."""
+        return getattr(self.text_config, "architectures", [])
+
     def get_text_config(self, decoder=False) -> PretrainedConfig:
-        """Return the LLM backbone's text config."""
         return self.text_config
 
     _ATTR_ALIASES = {
@@ -84,9 +109,11 @@ class NeMoSpeechLMConfig(PretrainedConfig):
             "pretrained_weights",
             "text_config",
             "_ATTR_ALIASES",
+            "lora",
+            "is_hybrid",
         ):
             raise AttributeError(name)
-        alias = self._ATTR_ALIASES.get(name, name)
+        alias = self._ATTR_ALIASES.get(name, name) if self.is_hybrid else name
         try:
             return getattr(self.text_config, alias)
         except AttributeError:
@@ -95,4 +122,6 @@ class NeMoSpeechLMConfig(PretrainedConfig):
                     return getattr(self.text_config, name)
                 except AttributeError:
                     pass
-            raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+            raise AttributeError(
+                f"'{type(self).__name__}' has no attribute '{name}'"
+            )
