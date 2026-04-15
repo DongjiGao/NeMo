@@ -48,6 +48,52 @@ class NemotronNanoV3PromptFormatter(PromptFormatter):
         },
     }
 
+    @classmethod
+    def to_jinja(cls, audio_token="<|audio|>", enable_thinking=False, **kwargs) -> str:
+        bot, eot = NANO_BOT, NANO_EOT
+        if enable_thinking:
+            gen_suffix = "<think>\\n"
+        else:
+            gen_suffix = "<think></think>"
+        return (
+            # Auto-insert empty system turn if none provided (matches encode_dialog line 71-72)
+            "{%- set ns = namespace(has_system=false) %}"
+            "{%- for message in messages %}"
+            '  {%- if message.role == "system" %}'
+            "    {%- set ns.has_system = true %}"
+            "  {%- endif %}"
+            "{%- endfor %}"
+            "{%- if not ns.has_system %}"
+            f'  {{{{- "{bot}system\\n{eot}\\n" }}}}'
+            "{%- endif %}"
+            # Render all messages
+            "{%- for message in messages %}"
+            '  {%- if message.role == "system" %}'
+            f'    {{{{- "{bot}system\\n" + message.content + "{eot}\\n" }}}}'
+            "  {%- elif message.content is string %}"
+            f'    {{{{- "{bot}" + message.role + "\\n" + message.content + "{eot}\\n" }}}}'
+            "  {%- else %}"
+            f'    {{{{- "{bot}" + message.role + "\\n" }}}}'
+            "    {%- set parts = namespace(texts=[], has_audio=false) %}"
+            "    {%- for part in message.content %}"
+            '      {%- if part.type == "text" %}'
+            "        {%- set parts.texts = parts.texts + [part.text] %}"
+            '      {%- elif part.type == "input_audio" or part.type == "audio" %}'
+            "        {%- set parts.has_audio = true %}"
+            "      {%- endif %}"
+            "    {%- endfor %}"
+            '    {{- parts.texts | join("") }}'
+            "    {%- if parts.has_audio %}"
+            f'      {{{{- " {audio_token}" }}}}'
+            "    {%- endif %}"
+            f'    {{{{- "{eot}\\n" }}}}'
+            "  {%- endif %}"
+            "{%- endfor %}"
+            "{%- if add_generation_prompt %}"
+            f'  {{{{- "{bot}assistant\\n{gen_suffix}" }}}}'
+            "{%- endif %}"
+        )
+
     def encode_dialog(self, turns: list[dict], enable_thinking: bool = True) -> dict[str, torch.Tensor]:
         """Encode a dialog for Nemotron Nano v3 with <think> reasoning support.
 

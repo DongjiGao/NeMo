@@ -40,6 +40,35 @@ class QwenPromptFormatter(PromptFormatter):
         },
     }
 
+    @classmethod
+    def to_jinja(cls, audio_token="<|audio|>", **kwargs) -> str:
+        bot, eot = QWEN_BOT, QWEN_EOT
+        return (
+            "{%- for message in messages %}"
+            "  {%- if message.content is string %}"
+            f'    {{{{- "{bot}" + message.role + "\\n" + message.content + "{eot}\\n" }}}}'
+            "  {%- else %}"
+            f'    {{{{- "{bot}" + message.role + "\\n" }}}}'
+            "    {%- set ns = namespace(texts=[], has_audio=false) %}"
+            "    {%- for part in message.content %}"
+            '      {%- if part.type == "text" %}'
+            "        {%- set ns.texts = ns.texts + [part.text] %}"
+            '      {%- elif part.type == "input_audio" or part.type == "audio" %}'
+            "        {%- set ns.has_audio = true %}"
+            "      {%- endif %}"
+            "    {%- endfor %}"
+            '    {{- ns.texts | join("") }}'
+            "    {%- if ns.has_audio %}"
+            f'      {{{{- " {audio_token}" }}}}'
+            "    {%- endif %}"
+            f'    {{{{- "{eot}\\n" }}}}'
+            "  {%- endif %}"
+            "{%- endfor %}"
+            "{%- if add_generation_prompt %}"
+            f'  {{{{- "{bot}assistant\\n" }}}}'
+            "{%- endif %}"
+        )
+
 
 class Qwen3PromptFormatter(PromptFormatter):
     NAME = "qwen3"
