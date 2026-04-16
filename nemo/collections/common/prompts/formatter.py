@@ -202,6 +202,24 @@ class PromptFormatter(ABC):
         super().__init_subclass__(**kwargs)
 
     @classmethod
+    def to_jinja(cls, audio_token: str = "<|audio|>", **kwargs) -> str:
+        """Generate a Jinja2 chat template for vLLM inference.
+
+        Subclasses override this to produce a template that matches their
+        ``encode_dialog`` behavior, including multimodal (audio) support.
+
+        Args:
+            audio_token: Placeholder token for audio content in multimodal messages.
+
+        Returns:
+            A Jinja2 template string compatible with HuggingFace ``tokenizer_config.json``.
+        """
+        raise NotImplementedError(
+            f"{cls.__name__} does not support Jinja chat template export. "
+            f"Implement to_jinja() on {cls.__name__} to enable vLLM-ready checkpoint saving."
+        )
+
+    @classmethod
     def resolve(cls, name: str) -> Type["PromptFormatter"]:
         if name not in cls._REGISTERED_FORMATTERS:
             raise RuntimeError(
