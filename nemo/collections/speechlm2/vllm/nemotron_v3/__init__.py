@@ -19,8 +19,9 @@ model and config registries via the ``vllm.general_plugins``
 entry point.
 
 Model classes:
-  - NeMoSpeechLMForConditionalGeneration   — hybrid (Mamba+MoE, e.g. NemotronH)
-  - NeMoSpeechLMStdForConditionalGeneration — standard transformer (e.g. Qwen3)
+  - NeMoSpeechLMHybridForConditionalGeneration — hybrid (Mamba+MoE, e.g. NemotronH)
+  - NeMoSpeechLMForConditionalGeneration       — alias for hybrid (legacy compat)
+  - NeMoSpeechLMStdForConditionalGeneration    — standard transformer (e.g. Qwen3)
 """
 
 _PKG = "nemo.collections.speechlm2.vllm.nemotron_v3"
@@ -40,6 +41,10 @@ def register():
 
     from vllm.model_executor.models.registry import ModelRegistry
 
+    ModelRegistry.register_model(
+        "NeMoSpeechLMHybridForConditionalGeneration",
+        f"{_PKG}.model:NeMoSpeechLMForConditionalGeneration",
+    )
     ModelRegistry.register_model(
         "NeMoSpeechLMForConditionalGeneration",
         f"{_PKG}.model:NeMoSpeechLMForConditionalGeneration",
