@@ -17,10 +17,10 @@
 Architecture: NeMo speech encoder (e.g. FastConformer) + projection + LLM.
 Two concrete classes share a common base:
 
-  NeMoSpeechLMForConditionalGeneration
+  NeMoSpeechLMHybridForConditionalGeneration
       Hybrid backends (Mamba+MoE, e.g. NemotronH).
 
-  NeMoSpeechLMStdForConditionalGeneration
+  NeMoSpeechLMForConditionalGeneration
       Standard transformer backends (e.g. Qwen3, Parakeet-TDT).
       Includes inline LoRA merging for PEFT checkpoints.
 
@@ -429,7 +429,7 @@ class _NeMoSpeechLMBase(nn.Module):
     info=NeMoSpeechLMProcessingInfo,
     dummy_inputs=NeMoSpeechLMDummyInputsBuilder,
 )
-class NeMoSpeechLMForConditionalGeneration(
+class NeMoSpeechLMHybridForConditionalGeneration(
     _NeMoSpeechLMBase,
     SupportsMultiModal,
     SupportsPP,
@@ -545,7 +545,7 @@ class NeMoSpeechLMForConditionalGeneration(
     info=NeMoSpeechLMProcessingInfo,
     dummy_inputs=NeMoSpeechLMDummyInputsBuilder,
 )
-class NeMoSpeechLMStdForConditionalGeneration(
+class NeMoSpeechLMForConditionalGeneration(
     _NeMoSpeechLMBase,
     SupportsMultiModal,
     SupportsPP,
@@ -617,7 +617,7 @@ class NeMoSpeechLMStdForConditionalGeneration(
             lora_cfg = {"r": 128, "lora_alpha": 256}
         scaling = lora_cfg.get("lora_alpha", 1) / lora_cfg.get("r", 1)
 
-        normalize = NeMoSpeechLMStdForConditionalGeneration._normalize_lora_name
+        normalize = NeMoSpeechLMForConditionalGeneration._normalize_lora_name
         base: dict[str, torch.Tensor] = {}
         lora_a: dict[str, torch.Tensor] = {}
         lora_b: dict[str, torch.Tensor] = {}
