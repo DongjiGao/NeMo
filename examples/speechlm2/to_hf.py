@@ -106,6 +106,125 @@ def save_hf_checkpoint(model: torch.nn.Module, state_dict: dict, cfg: HfExportCo
         json.dump(config, f, indent=2)
 
 
+_HYBRID_ARCHITECTURES = {"NemotronHForCausalLM", "NemotronHybridForCausalLM"}
+_AUDIO_TOKEN = "<|audio|>"
+
+
+def _detect_vllm_architecture(model_cfg: dict) -> str:
+    """Determine the vLLM plugin model class from the pretrained LLM backbone.
+
+    Raises:
+        ValueError: if the HF config can't be loaded or has no 'architectures'.
+    """
+    pretrained_llm = model_cfg.get("pretrained_llm", "")
+    try:
+        from transformers import AutoConfig
+
+        llm_cfg = AutoConfig.from_pretrained(pretrained_llm, trust_remote_code=True)
+    except Exception as e:
+        raise ValueError(
+            f"Could not load HF config for pretrained_llm={pretrained_llm!r}: {e}. "
+            f"Fix the 'pretrained_llm' field or ensure HF access during conversion."
+        ) from e
+
+    archs = getattr(llm_cfg, "architectures", [])
+    if not archs:
+        raise ValueError(
+            f"HF config for {pretrained_llm!r} has empty 'architectures'."
+        )
+
+    if set(archs) & _HYBRID_ARCHITECTURES:
+        return "NeMoSpeechLMHybridForConditionalGeneration"
+    return "NeMoSpeechLMForConditionalGeneration"
+
+
+def prepare_for_vllm(output_dir: str, model_cfg: dict) -> None:
+    """Patch a saved checkpoint to be vLLM-ready.
+
+    Adds tokenizer (with audio token and chat template), patches config.json
+    with model_type/architectures, and writes generation_config.json.
+
+    Args:
+        output_dir: Path to the HuggingFace checkpoint directory.
+        model_cfg: Model config dict (from experiment YAML).
+
+    Raises:
+        ValueError: If ``pretrained_llm`` is missing.
+    """
+    from transformers import AutoTokenizer
+
+    from nemo.utils import logging as LOG
+
+    output_dir = Path(output_dir)
+    pretrained_llm = model_cfg.get("pretrained_llm", "")
+    if not pretrained_llm:
+        raise ValueError("model config has no 'pretrained_llm'; cannot load tokenizer for vLLM")
+
+    # 1. Detect architecture and patch config.json
+    arch = _detect_vllm_architecture(model_cfg)
+    config_path = output_dir / "config.json"
+    config = json.loads(config_path.read_text())
+    config["model_type"] = "nemo_speechlm"
+    config["architectures"] = [arch]
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+
+    # 2. Save tokenizer (backbone chat_template carries over via save_pretrained)
+    existing = [
+        f.name
+        for f in output_dir.iterdir()
+        if f.name in ("tokenizer_config.json", "tokenizer.json", "generation_config.json")
+    ]
+    if existing:
+        LOG.info("Overwriting existing files in %s: %s", output_dir, existing)
+    tok = AutoTokenizer.from_pretrained(pretrained_llm, trust_remote_code=True)
+    if _AUDIO_TOKEN not in tok.get_vocab():
+        tok.add_special_tokens({"additional_special_tokens": [_AUDIO_TOKEN]})
+    tok.save_pretrained(str(output_dir))
+    # A separate chat_template.jinja file, if present, overrides the inline copy
+    # in tokenizer_config.json. Remove it so tokenizer_config.json wins.
+    jinja_file = output_dir / "chat_template.jinja"
+    if jinja_file.exists():
+        jinja_file.unlink()
+    # Normalize extra_special_tokens: transformers writes our added audio token
+    # as a list, but HF/vLLM loaders expect a dict keyed by semantic name.
+    tok_cfg_path = output_dir / "tokenizer_config.json"
+    tok_cfg = json.loads(tok_cfg_path.read_text())
+    tok_cfg["extra_special_tokens"] = {"audio_token": _AUDIO_TOKEN}
+    # Some reasoning backbones (e.g. nemotron-nano-v3) ship a chat_template whose
+    # default ``enable_thinking`` is ``True``; our SpeechLM fine-tuning renders
+    # without thinking, so the exported template must also default to ``False``
+    # to keep vLLM-time rendering identical to training-time rendering.
+    tok_cfg["chat_template"] = tok_cfg.get("chat_template", "").replace(
+        "enable_thinking if enable_thinking is defined else True",
+        "enable_thinking if enable_thinking is defined else False",
+    )
+    tok_cfg_path.write_text(json.dumps(tok_cfg, indent=2) + "\n")
+
+    # 4. Write generation_config.json (model-specific EOS only; inference
+    #    params like temperature/max_tokens are task-specific and should be
+    #    passed via server args, not baked into the checkpoint)
+    gen_cfg = {"eos_token_id": [tok.eos_token_id]}
+    (output_dir / "generation_config.json").write_text(json.dumps(gen_cfg, indent=2) + "\n")
+
+
+def _try_prepare_for_vllm(output_dir: str, model_cfg: dict) -> None:
+    """Run vLLM prep; on ``ValueError``, warn and keep the HF-only output.
+
+    Backward compat for callers that never needed vLLM (e.g., NeMo SALM).
+    """
+    from nemo.utils import logging as LOG
+
+    try:
+        prepare_for_vllm(output_dir, model_cfg)
+    except ValueError as e:
+        LOG.warning(
+            "Checkpoint saved as HF-only; vLLM prep skipped: %s. "
+            "The checkpoint is still loadable by NeMo SALM and plain HF, but "
+            "is NOT vLLM-ready until prep succeeds.",
+            e,
+        )
+
+
 def _uses_automodel_parallel(strategy_cfg: dict) -> bool:
     """Check if the strategy config targets AutomodelParallelStrategy."""
     target = strategy_cfg.get("_target_", "")
@@ -158,14 +277,10 @@ def main(cfg: HfExportConfig):
 
     strategy_cfg = full_cfg.get("trainer", {}).get("strategy", {})
 
-    _is_torchrun = "RANK" in os.environ
-    if _is_torchrun and dist.is_available() and not dist.is_initialized():
+    if dist.is_available() and not dist.is_initialized():
         dist.init_process_group(backend="nccl")
     is_distributed = (
-        _is_torchrun
-        and Path(cfg.ckpt_path).is_dir()
-        and _uses_automodel_parallel(strategy_cfg)
-        and dist.get_world_size() > 1
+        Path(cfg.ckpt_path).is_dir() and _uses_automodel_parallel(strategy_cfg) and dist.get_world_size() > 1
     )
 
     if is_distributed:
@@ -188,6 +303,7 @@ def main(cfg: HfExportConfig):
         consolidated = consolidate_state_dict(model)
         if dist.get_rank() == 0:
             save_hf_checkpoint(model, consolidated, cfg)
+            _try_prepare_for_vllm(cfg.output_dir, model_cfg)
 
         dist.barrier()
         dist.destroy_process_group()
@@ -198,6 +314,7 @@ def main(cfg: HfExportConfig):
         model = model.to(getattr(torch, cfg.dtype))
         model_cfg["pretrained_weights"] = False
         model.save_pretrained(cfg.output_dir)
+        _try_prepare_for_vllm(cfg.output_dir, model_cfg)
 
 
 if __name__ == "__main__":
