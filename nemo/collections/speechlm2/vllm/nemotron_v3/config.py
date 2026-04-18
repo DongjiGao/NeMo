@@ -28,6 +28,13 @@ _HYBRID_ARCHITECTURES = frozenset({
     "NemotronHybridForCausalLM",
 })
 
+# Number of extra embedding rows the SpeechLM adds on top of the backbone's
+# native vocab during training: ``<|audio|>`` locator plus headroom for other
+# special tokens and TensorCore-friendly alignment. Must match the actual
+# number of rows added at training time so ``model.safetensors`` loads
+# without a shape mismatch on the embedding matrix.
+_SPEECHLM_EMBED_EXTRA_ROWS = 10
+
 
 def _is_hybrid_backend(architectures: list[str]) -> bool:
     return bool(set(architectures) & _HYBRID_ARCHITECTURES)
@@ -68,9 +75,21 @@ class NeMoSpeechLMConfig(PretrainedConfig):
         )
 
         raw_archs = getattr(self.text_config, "architectures", [])
+        if len(raw_archs) != 1:
+            raise ValueError(
+                f"Expected exactly one architecture in the backbone config, "
+                f"got {raw_archs!r}. NeMo SpeechLM checkpoints must target a "
+                f"single backbone; a mixed list makes the hybrid-vs-standard "
+                f"routing ambiguous."
+            )
         self.is_hybrid = _is_hybrid_backend(raw_archs)
 
         if self.is_hybrid:
+            # Some checkpoints list the hybrid class under different aliases
+            # (``NemotronHybridForCausalLM`` vs ``NemotronHForCausalLM``);
+            # vLLM's registry only resolves the latter. Normalize here so any
+            # downstream ``init_vllm_registered_model(architectures=...)`` call
+            # that threads this text_config through resolves correctly.
             self.text_config.architectures = ["NemotronHForCausalLM"]
             if (
                 not hasattr(self.text_config, "total_num_kv_heads")
@@ -84,7 +103,7 @@ class NeMoSpeechLMConfig(PretrainedConfig):
                     self.text_config, "layer_norm_epsilon", 1e-5
                 )
 
-        self.text_config.vocab_size = self.text_config.vocab_size + 10
+        self.text_config.vocab_size += _SPEECHLM_EMBED_EXTRA_ROWS
 
     @property
     def llm_architectures(self) -> list[str]:
@@ -100,6 +119,22 @@ class NeMoSpeechLMConfig(PretrainedConfig):
     }
 
     def __getattr__(self, name):
+        """Delegate unknown attribute lookups to the wrapped backbone config.
+
+        Called only when the attribute is not found in the normal lookup chain
+        (instance ``__dict__`` + class hierarchy). Short-circuits in two cases:
+
+        * names starting with ``_`` (dunders and privates) -- pickling,
+          copying, and reflection rely on the default ``AttributeError`` path;
+        * plugin-specific fields (``perception``, ``pretrained_llm``, ...) --
+          guards against infinite recursion if one of them is queried before
+          ``__init__`` finishes, and prevents accidental delegation to a
+          same-named attribute on ``text_config``.
+
+        For everything else, translate aliases (``rms_norm_eps`` ->
+        ``layer_norm_epsilon`` on hybrid backends) and delegate to
+        ``self.text_config``.
+        """
         if name.startswith("_") or name in (
             "perception",
             "pretrained_llm",
@@ -108,7 +143,6 @@ class NeMoSpeechLMConfig(PretrainedConfig):
             "prompt_format",
             "pretrained_weights",
             "text_config",
-            "_ATTR_ALIASES",
             "lora",
             "is_hybrid",
         ):
