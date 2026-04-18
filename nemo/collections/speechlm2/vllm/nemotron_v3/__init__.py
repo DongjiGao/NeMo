@@ -21,8 +21,6 @@ entry point.
 Model classes:
   - NeMoSpeechLMForConditionalGeneration       — standard transformer (e.g. Qwen3, Parakeet-TDT)
   - NeMoSpeechLMHybridForConditionalGeneration — hybrid Mamba+MoE (e.g. NemotronH)
-  - NeMoSpeechLMStdForConditionalGeneration    — legacy alias for the standard class,
-    kept so checkpoints exported before the rename still resolve.
 """
 
 _PKG = "nemo.collections.speechlm2.vllm.nemotron_v3"
@@ -51,13 +49,6 @@ def register():
     ModelRegistry.register_model(
         "NeMoSpeechLMHybridForConditionalGeneration",
         f"{_PKG}.model:NeMoSpeechLMHybridForConditionalGeneration",
-    )
-    # Legacy alias: older checkpoints may have been exported with the
-    # pre-rename "Std" name; keep it working by pointing at the new
-    # base-named class.
-    ModelRegistry.register_model(
-        "NeMoSpeechLMStdForConditionalGeneration",
-        f"{_PKG}.model:NeMoSpeechLMForConditionalGeneration",
     )
 
     _apply_backend_patches()
