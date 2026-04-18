@@ -21,6 +21,12 @@ entry point.
 Model classes:
   - NeMoSpeechLMForConditionalGeneration       — standard transformer (e.g. Qwen3, Parakeet-TDT)
   - NeMoSpeechLMHybridForConditionalGeneration — hybrid Mamba+MoE (e.g. NemotronH)
+
+Note on the ``nemotron_v3`` package name: this plugin is backbone-agnostic
+and covers every SpeechLM variant we export today (Qwen3-based canary-qwen,
+NemotronH, etc.). The folder name is historical — the plugin started as a
+NemotronH-only experiment and later grew a standard-transformer variant in
+the same package rather than moving.
 """
 
 _PKG = "nemo.collections.speechlm2.vllm.nemotron_v3"
