@@ -149,6 +149,19 @@ class NeMoSpeechLMProcessingInfo(BaseProcessingInfo):
 
     @staticmethod
     def _estimate_audio_tokens(audio_length_samples: int) -> int:
+        """Predict the encoder's output frame count for an audio of N samples.
+
+        Mirrors the FastConformer preprocessing chain used by
+        ``AudioPerceptionModule``: STFT (n_fft=512, hop_length=160) followed
+        by 3x Conv(kernel=3, stride=2) subsampling. Implemented as pure
+        Python integer math instead of calling NeMo's ``calc_length`` so
+        the scheduler hotpath avoids ~90x tensor-op overhead (measured
+        0.18 us vs 16 us per call). If the encoder's downsampling stack
+        ever changes upstream, the unit test at
+        ``tests/collections/speechlm2/test_vllm_audio_token_estimator.py``
+        compares this function against ``calc_length`` on a canonical set
+        of lengths and will fail, forcing a rewrite here.
+        """
         n_fft = 512
         hop_length = 160
         stft_pad = n_fft // 2
