@@ -205,8 +205,9 @@ class NeMoSpeechLMMultiModalProcessor(
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> list[PromptUpdate]:
+        audios = mm_items.get_items("audio", AudioProcessorItems)
+
         def get_replacement(item_idx: int):
-            audios = mm_items.get_items("audio", AudioProcessorItems)
             audio = audios.get(item_idx)
             n_tokens = self.info._estimate_audio_tokens(audio.shape[-1])
             repl_full = _AUDIO_PLACEHOLDER * n_tokens
