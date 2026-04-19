@@ -92,7 +92,7 @@ def _ensure_special_tokens(tokenizer):
         tokenizer.add_special_tokens({"additional_special_tokens": to_add})
 
 
-def _load_nemo_perception(perception_cfg: dict, output_dim: int) -> nn.Module:
+def _load_nemo_perception(perception_cfg: dict) -> nn.Module:
     try:
         from nemo.collections.speechlm2.modules import AudioPerceptionModule
         from omegaconf import DictConfig
@@ -103,8 +103,6 @@ def _load_nemo_perception(perception_cfg: dict, output_dim: int) -> nn.Module:
         ) from e
 
     cfg = DictConfig(perception_cfg)
-    if "output_dim" not in cfg:
-        cfg.output_dim = output_dim
     perception = AudioPerceptionModule(cfg)
     perception.eval()
     return perception
@@ -291,11 +289,8 @@ class _NeMoSpeechLMBase(nn.Module):
     def _init_perception(
         self, config, vllm_config: VllmConfig
     ):
-        llm_hidden = config.text_config.hidden_size
         with self._mark_tower_model(vllm_config, {"audio"}):
-            self.perception = _load_nemo_perception(
-                config.perception, output_dim=llm_hidden
-            )
+            self.perception = _load_nemo_perception(config.perception)
             self.perception = self.perception.to(torch.float32)
 
     @classmethod
