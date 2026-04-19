@@ -30,11 +30,11 @@ Requires NeMo toolkit for the audio encoder:
 
 import re
 from collections.abc import Iterable, Mapping
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import torch
 from torch import nn
-from transformers import BatchFeature
+from transformers import BatchFeature, PreTrainedTokenizerBase
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
@@ -84,7 +84,7 @@ _MAX_AUDIO_DURATION_S = 40.0
 # ── Helpers ─────────────────────────────────────────────────────────
 
 
-def _ensure_special_tokens(tokenizer):
+def _ensure_special_tokens(tokenizer: PreTrainedTokenizerBase) -> None:
     special = [_AUDIO_PLACEHOLDER]
     existing = set(tokenizer.get_vocab().keys())
     to_add = [t for t in special if t not in existing]
@@ -287,8 +287,8 @@ class _NeMoSpeechLMBase(nn.Module):
     """Common perception loading, audio processing, forward, and logits."""
 
     def _init_perception(
-        self, config, vllm_config: VllmConfig
-    ):
+        self, config: Any, vllm_config: VllmConfig
+    ) -> None:
         with self._mark_tower_model(vllm_config, {"audio"}):
             self.perception = _load_nemo_perception(config.perception)
             self.perception = self.perception.to(torch.float32)
@@ -434,7 +434,7 @@ class NeMoSpeechLMHybridForConditionalGeneration(
     """NeMo Speech LM with hybrid Mamba+MoE backbone (e.g. NemotronH)."""
 
     @classmethod
-    def get_mamba_state_dtype_from_config(cls, vllm_config):
+    def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig) -> Any:
         from vllm.model_executor.models.nemotron_h import (
             NemotronHForCausalLM,
         )
@@ -443,7 +443,7 @@ class NeMoSpeechLMHybridForConditionalGeneration(
         )
 
     @classmethod
-    def get_mamba_state_shape_from_config(cls, vllm_config):
+    def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig) -> Any:
         from vllm.model_executor.models.nemotron_h import (
             NemotronHForCausalLM,
         )
@@ -452,7 +452,7 @@ class NeMoSpeechLMHybridForConditionalGeneration(
         )
 
     @classmethod
-    def get_mamba_state_copy_func(cls):
+    def get_mamba_state_copy_func(cls) -> Any:
         from vllm.model_executor.models.nemotron_h import (
             NemotronHForCausalLM,
         )
