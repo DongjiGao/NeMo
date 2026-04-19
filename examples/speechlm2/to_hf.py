@@ -15,6 +15,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -43,7 +44,7 @@ class HfExportConfig:
     dtype: str = "bfloat16"
 
 
-def load_checkpoint(model: torch.nn.Module, checkpoint_path: str):
+def load_checkpoint(model: torch.nn.Module, checkpoint_path: str) -> None:
     if Path(checkpoint_path).is_dir():
         from torch.distributed.checkpoint import load
 
@@ -55,7 +56,7 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: str):
         model.load_state_dict(ckpt_data["state_dict"])
 
 
-def setup_distributed_from_config(strategy_cfg: dict):
+def setup_distributed_from_config(strategy_cfg: dict) -> Any:
     """Initialize torch.distributed and create a device mesh from a Hydra strategy config.
 
     Instantiates the strategy from the trainer config dict (as found in the
@@ -78,7 +79,7 @@ def setup_distributed_from_config(strategy_cfg: dict):
     return strategy
 
 
-def consolidate_state_dict(model: torch.nn.Module):
+def consolidate_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     """Gather a full (non-sharded) state dict from a model with DTensor parameters."""
     from torch.distributed.tensor import DTensor
 
@@ -91,7 +92,9 @@ def consolidate_state_dict(model: torch.nn.Module):
     return consolidated
 
 
-def save_hf_checkpoint(model: torch.nn.Module, state_dict: dict, cfg: HfExportConfig):
+def save_hf_checkpoint(
+    model: torch.nn.Module, state_dict: dict, cfg: HfExportConfig
+) -> None:
     """Save a consolidated state dict and model config in HuggingFace Hub format."""
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -232,7 +235,7 @@ def _uses_automodel_parallel(strategy_cfg: dict) -> bool:
 
 
 @hydra_runner(config_name="HfExportConfig", schema=HfExportConfig)
-def main(cfg: HfExportConfig):
+def main(cfg: HfExportConfig) -> None:
     """
     Read PyTorch Lightning checkpoint and export the model to HuggingFace Hub format.
     The resulting model can be then initialized via ModelClass.from_pretrained(path).
