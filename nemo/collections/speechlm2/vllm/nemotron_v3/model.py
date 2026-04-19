@@ -108,7 +108,7 @@ def _load_nemo_perception(perception_cfg: dict) -> nn.Module:
     return perception
 
 
-def _pad_vocab_tensor(tensor: torch.Tensor, target_vocab: int) -> torch.Tensor:
+def _pad_to_vocab_size(tensor: torch.Tensor, target_vocab: int) -> torch.Tensor:
     if tensor.shape[0] < target_vocab:
         pad = torch.zeros(
             target_vocab - tensor.shape[0],
@@ -510,7 +510,7 @@ class NeMoSpeechLMHybridForConditionalGeneration(
                 "lm_head.weight",
             ):
                 if target_vocab:
-                    tensor = _pad_vocab_tensor(tensor, target_vocab)
+                    tensor = _pad_to_vocab_size(tensor, target_vocab)
                 yield (hf_name, tensor)
             else:
                 yield (hf_name, tensor)
@@ -668,7 +668,7 @@ class NeMoSpeechLMForConditionalGeneration(
         for name, tensor in weights:
             if name == "embed_tokens.weight":
                 if target_vocab:
-                    tensor = _pad_vocab_tensor(tensor, target_vocab)
+                    tensor = _pad_to_vocab_size(tensor, target_vocab)
                 yield ("model.embed_tokens.weight", tensor)
                 has_embed_tokens = True
                 continue
@@ -681,7 +681,7 @@ class NeMoSpeechLMForConditionalGeneration(
 
             if hf.startswith("lm_head") or hf.startswith("model.embed_tokens"):
                 if target_vocab:
-                    tensor = _pad_vocab_tensor(tensor, target_vocab)
+                    tensor = _pad_to_vocab_size(tensor, target_vocab)
                 if hf.startswith("model.embed_tokens"):
                     has_embed_tokens = True
 
@@ -693,7 +693,7 @@ class NeMoSpeechLMForConditionalGeneration(
         if not has_embed_tokens and lm_head_tensor is not None:
             logger.info("No embed_tokens found; duplicating lm_head (weight tying)")
             if target_vocab:
-                lm_head_tensor = _pad_vocab_tensor(lm_head_tensor, target_vocab)
+                lm_head_tensor = _pad_to_vocab_size(lm_head_tensor, target_vocab)
             yield ("model.embed_tokens.weight", lm_head_tensor)
 
     def load_weights(
