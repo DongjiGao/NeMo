@@ -92,9 +92,7 @@ def consolidate_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return consolidated
 
 
-def save_hf_checkpoint(
-    model: torch.nn.Module, state_dict: dict, cfg: HfExportConfig
-) -> None:
+def save_hf_checkpoint(model: torch.nn.Module, state_dict: dict, cfg: HfExportConfig) -> None:
     """Save a consolidated state dict and model config in HuggingFace Hub format."""
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
