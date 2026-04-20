@@ -181,15 +181,22 @@ def prepare_for_vllm(output_dir: str, model_cfg: dict) -> None:
     if _AUDIO_TOKEN not in tok.get_vocab():
         tok.add_special_tokens({"additional_special_tokens": [_AUDIO_TOKEN]})
     tok.save_pretrained(str(output_dir))
-    # A separate chat_template.jinja file, if present, overrides the inline copy
-    # in tokenizer_config.json. Remove it so tokenizer_config.json wins.
+    # Newer transformers writes long chat templates to a separate
+    # ``chat_template.jinja`` file instead of inlining them in
+    # ``tokenizer_config.json`` (Qwen3's 4k-char template triggers this,
+    # Nemotron's shorter one stays inline). Read whichever is populated,
+    # inline it into tokenizer_config.json, and delete the .jinja file so
+    # downstream tooling sees a single canonical location.
+    tok_cfg_path = output_dir / "tokenizer_config.json"
+    tok_cfg = json.loads(tok_cfg_path.read_text())
     jinja_file = output_dir / "chat_template.jinja"
     if jinja_file.exists():
+        jinja_from_file = jinja_file.read_text()
+        if jinja_from_file.strip():
+            tok_cfg["chat_template"] = jinja_from_file
         jinja_file.unlink()
     # Normalize extra_special_tokens: transformers writes our added audio token
     # as a list, but HF/vLLM loaders expect a dict keyed by semantic name.
-    tok_cfg_path = output_dir / "tokenizer_config.json"
-    tok_cfg = json.loads(tok_cfg_path.read_text())
     tok_cfg["extra_special_tokens"] = {"audio_token": _AUDIO_TOKEN}
     # Some reasoning backbones (e.g. nemotron-nano-v3) ship a chat_template whose
     # default ``enable_thinking`` is ``True``; our SpeechLM fine-tuning renders
