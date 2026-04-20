@@ -198,6 +198,15 @@ def prepare_for_vllm(output_dir: str, model_cfg: dict) -> None:
     # Normalize extra_special_tokens: transformers writes our added audio token
     # as a list, but HF/vLLM loaders expect a dict keyed by semantic name.
     tok_cfg["extra_special_tokens"] = {"audio_token": _AUDIO_TOKEN}
+    # Force a vLLM-compatible tokenizer_class regardless of which wrapper
+    # produced the config. Observed problem cases:
+    #   * NeMo automodel containers wrap Nemotron in a proprietary
+    #     ``TokenizersBackend`` class not in HF's registry.
+    #   * Future wrappers could add similar shims for other backbones.
+    # All we need at serve time is the raw ``tokenizer.json`` content, which
+    # any HF fast tokenizer class can read; ``PreTrainedTokenizerFast`` is
+    # the universal base class and is always registered.
+    tok_cfg["tokenizer_class"] = "PreTrainedTokenizerFast"
     # Some reasoning backbones (e.g. nemotron-nano-v3) ship a chat_template whose
     # default ``enable_thinking`` is ``True``; our SpeechLM fine-tuning renders
     # without thinking, so the exported template must also default to ``False``
