@@ -440,6 +440,41 @@ class _NeMoSpeechLMBase(nn.Module):
                 llm.append((name, tensor))
         return perception, llm
 
+    def _preprocess_llm_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Optional pre-rename pass (e.g. LoRA merge). Default: identity."""
+        return weights
+
+    def _nemo_to_hf_llm_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Map NeMo checkpoint weight names to HuggingFace names.
+
+        Each backbone has its own naming conventions (MoE expert layout,
+        PEFT wrapper prefixes, weight tying). Subclasses must override.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _nemo_to_hf_llm_weights"
+        )
+
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        perception_weights, llm_raw = self._split_perception_llm(weights)
+        loaded_perception = self._load_perception_weights(perception_weights)
+
+        preprocessed = self._preprocess_llm_weights(llm_raw)
+        hf_weights = self._nemo_to_hf_llm_weights(preprocessed)
+        combined = (
+            ("language_model." + n, t) for n, t in hf_weights
+        )
+
+        loader = AutoWeightsLoader(self)
+        loaded_llm = loader.load_weights(combined)
+
+        return loaded_llm | loaded_perception
+
 
 # ── Hybrid (NemotronH / Mamba+MoE) variant ─────────────────────────
 
@@ -539,22 +574,6 @@ class NeMoSpeechLMHybridForConditionalGeneration(
                 yield (hf_name, tensor)
             else:
                 yield (hf_name, tensor)
-
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> set[str]:
-        perception_weights, llm_raw = self._split_perception_llm(weights)
-        loaded_perception = self._load_perception_weights(perception_weights)
-
-        hf_weights = self._nemo_to_hf_llm_weights(llm_raw)
-        combined = (
-            ("language_model." + n, t) for n, t in hf_weights
-        )
-
-        loader = AutoWeightsLoader(self)
-        loaded_llm = loader.load_weights(combined)
-
-        return loaded_llm | loaded_perception
 
 
 # ── Standard transformer variant ────────────────────────────────────
@@ -721,20 +740,9 @@ class NeMoSpeechLMForConditionalGeneration(
                 lm_head_tensor = _pad_to_vocab_size(lm_head_tensor, target_vocab)
             yield ("model.embed_tokens.weight", lm_head_tensor)
 
-    def load_weights(
+    def _preprocess_llm_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> set[str]:
-        perception_weights, llm_raw = self._split_perception_llm(weights)
-        loaded_perception = self._load_perception_weights(perception_weights)
-
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Merge LoRA adapters into base weights before HF renaming."""
         lora_cfg = getattr(self.config, "lora", None)
-        merged = list(self._merge_lora_weights(llm_raw, lora_cfg))
-        hf_weights = self._nemo_to_hf_llm_weights(merged)
-        combined = (
-            ("language_model." + n, t) for n, t in hf_weights
-        )
-
-        loader = AutoWeightsLoader(self)
-        loaded_llm = loader.load_weights(combined)
-
-        return loaded_llm | loaded_perception
+        return list(self._merge_lora_weights(weights, lora_cfg))
