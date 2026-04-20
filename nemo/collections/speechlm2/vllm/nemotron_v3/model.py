@@ -355,6 +355,8 @@ class _NeMoSpeechLMBase(nn.Module):
     def _process_audio(
         self, audio_input: NeMoSpeechLMAudioInputs
     ) -> tuple[torch.Tensor, ...]:
+        # Real device placement happens at init via _mark_tower_model +
+        # get_mm_mapping; this .to() is a no-op guard kept for paranoia.
         device = next(self.perception.parameters()).device
         self.perception = self.perception.to(device)
 
