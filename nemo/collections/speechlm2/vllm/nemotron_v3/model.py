@@ -324,12 +324,13 @@ class _NeMoSpeechLMBase(nn.Module):
     # ── audio processing ──
 
     def _parse_audio_input(
-        self, **kwargs
+        self,
+        audio_signal: torch.Tensor | list[torch.Tensor] | None = None,
+        audio_signal_length: torch.Tensor | None = None,
+        **kwargs,
     ) -> NeMoSpeechLMAudioInputs | None:
-        audio_signal = kwargs.pop("audio_signal", None)
         if audio_signal is None:
             return None
-        audio_signal_length = kwargs.pop("audio_signal_length", None)
         # Must be emitted by _call_hf_processor alongside audio_signal;
         # guessing from shape[-1] would count padding as real audio.
         if not isinstance(audio_signal_length, torch.Tensor):
