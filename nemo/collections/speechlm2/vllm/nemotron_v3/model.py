@@ -330,6 +330,13 @@ class _NeMoSpeechLMBase(nn.Module):
         if audio_signal is None:
             return None
         audio_signal_length = kwargs.pop("audio_signal_length", None)
+        # Must be emitted by _call_hf_processor alongside audio_signal;
+        # guessing from shape[-1] would count padding as real audio.
+        if not isinstance(audio_signal_length, torch.Tensor):
+            raise ValueError(
+                "audio_signal_length must be a torch.Tensor; got "
+                f"{type(audio_signal_length).__name__}."
+            )
 
         if isinstance(audio_signal, list):
             max_len = max(a.shape[-1] for a in audio_signal)
@@ -338,13 +345,6 @@ class _NeMoSpeechLMBase(nn.Module):
                 for a in audio_signal
             ]
             audio_signal = torch.stack(padded, dim=0)
-
-        if audio_signal_length is None:
-            audio_signal_length = torch.tensor(
-                [audio_signal.shape[-1]] * audio_signal.shape[0]
-            )
-        elif not isinstance(audio_signal_length, torch.Tensor):
-            audio_signal_length = torch.tensor(audio_signal_length)
 
         return NeMoSpeechLMAudioInputs(
             audio_signal=audio_signal,
