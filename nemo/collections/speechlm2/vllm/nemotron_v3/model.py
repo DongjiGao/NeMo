@@ -241,24 +241,32 @@ class NeMoSpeechLMMultiModalProcessor(
             parts = re.split(
                 f"({re.escape(_AUDIO_PLACEHOLDER)})", prompt
             )
-            audio_idx = 0
-            for i, part in enumerate(parts):
-                if part == _AUDIO_PLACEHOLDER and audio_idx < len(audios):
-                    audio = audios[audio_idx]
-                    audio_tensor = (
-                        audio
-                        if isinstance(audio, torch.Tensor)
-                        else torch.as_tensor(audio, dtype=torch.float32)
-                    )
-                    if audio_tensor.dim() > 1:
-                        audio_tensor = audio_tensor.squeeze()
-                    n_tokens = self.info._estimate_audio_tokens(
-                        audio_tensor.shape[-1]
-                    )
-                    parts[i] = _AUDIO_PLACEHOLDER * n_tokens
-                    audio_list.append(audio_tensor)
-                    audio_lengths.append(audio_tensor.shape[-1])
-                    audio_idx += 1
+            # One placeholder is overwritten with one audio's encoder output
+            # at forward time (positional pairing); counts must match or the
+            # merge step in get_input_embeddings crashes / silently drops.
+            ph_positions = [
+                i for i, p in enumerate(parts) if p == _AUDIO_PLACEHOLDER
+            ]
+            if len(ph_positions) != len(audios):
+                raise ValueError(
+                    f"Prompt has {len(ph_positions)} "
+                    f"{_AUDIO_PLACEHOLDER!r} placeholders but "
+                    f"{len(audios)} audios were provided; counts must match."
+                )
+            for i, audio in zip(ph_positions, audios):
+                audio_tensor = (
+                    audio
+                    if isinstance(audio, torch.Tensor)
+                    else torch.as_tensor(audio, dtype=torch.float32)
+                )
+                if audio_tensor.dim() > 1:
+                    audio_tensor = audio_tensor.squeeze()
+                n_tokens = self.info._estimate_audio_tokens(
+                    audio_tensor.shape[-1]
+                )
+                parts[i] = _AUDIO_PLACEHOLDER * n_tokens
+                audio_list.append(audio_tensor)
+                audio_lengths.append(audio_tensor.shape[-1])
 
             prompt = "".join(parts)
 
