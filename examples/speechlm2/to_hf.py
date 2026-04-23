@@ -205,12 +205,6 @@ def prepare_for_vllm(output_dir: str, model_cfg: dict) -> None:
     # unknown to HF; the underlying tokenizer.json is standard, so force
     # the universal base class.
     tok_cfg["tokenizer_class"] = "PreTrainedTokenizerFast"
-    # SpeechLM fine-tuning renders without ``<think>``; flip the template's
-    # default so vLLM rendering matches training (nemotron-nano-v3, etc.).
-    tok_cfg["chat_template"] = tok_cfg.get("chat_template", "").replace(
-        "enable_thinking if enable_thinking is defined else True",
-        "enable_thinking if enable_thinking is defined else False",
-    )
     tok_cfg_path.write_text(json.dumps(tok_cfg, indent=2) + "\n")
 
     # 4. Minimal generation_config.json (EOS only; sampling params belong on
