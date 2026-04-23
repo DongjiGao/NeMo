@@ -31,11 +31,7 @@ _spec.loader.exec_module(to_hf)
 
 AUDIO_TOKEN = "<|audio|>"
 CHAT_TEMPLATE_INLINE = "{% for msg in messages %}{{msg.content}}{% endfor %}"
-CHAT_TEMPLATE_LARGE = (
-    "{% for msg in messages %}"
-    + "X" * 4096
-    + "{{msg.content}}{% endfor %}"
-)
+CHAT_TEMPLATE_LARGE = "{% for msg in messages %}" + "X" * 4096 + "{{msg.content}}{% endfor %}"
 
 
 class _FakeTokenizer:
@@ -127,8 +123,9 @@ def test_prepare_for_vllm_missing_audio_locator_tag(tmp_path):
 
 def _run_prepare(tmp_path, fake_tok, arch="NeMoSpeechLMForConditionalGeneration", llm_arch="Qwen2ForCausalLM"):
     output_dir = _seed_output_dir(tmp_path, llm_arch=llm_arch)
-    with patch.object(to_hf, "_detect_vllm_architecture", return_value=arch), patch(
-        "transformers.AutoTokenizer.from_pretrained", return_value=fake_tok
+    with (
+        patch.object(to_hf, "_detect_vllm_architecture", return_value=arch),
+        patch("transformers.AutoTokenizer.from_pretrained", return_value=fake_tok),
     ):
         to_hf.prepare_for_vllm(
             str(output_dir),

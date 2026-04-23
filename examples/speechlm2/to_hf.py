@@ -129,9 +129,7 @@ def _detect_vllm_architecture(model_cfg: dict) -> str:
 
     archs = getattr(llm_cfg, "architectures", [])
     if not archs:
-        raise ValueError(
-            f"HF config for {pretrained_llm!r} has empty 'architectures'."
-        )
+        raise ValueError(f"HF config for {pretrained_llm!r} has empty 'architectures'.")
 
     if set(archs) & _HYBRID_ARCHITECTURES:
         return "NeMoSpeechLMHybridForConditionalGeneration"
@@ -164,9 +162,7 @@ def prepare_for_vllm(output_dir: str, model_cfg: dict) -> None:
     # fail loud rather than default, since a mismatch is silent at inference.
     audio_token = model_cfg.get("audio_locator_tag")
     if not audio_token:
-        raise ValueError(
-            "model config has no 'audio_locator_tag' (set it in the training YAML)."
-        )
+        raise ValueError("model config has no 'audio_locator_tag' (set it in the training YAML).")
 
     # 1. Patch config.json (arch, model_type, audio_locator_tag for vLLM plugin).
     arch = _detect_vllm_architecture(model_cfg)
