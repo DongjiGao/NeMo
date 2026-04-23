@@ -108,7 +108,6 @@ def save_hf_checkpoint(model: torch.nn.Module, state_dict: dict, cfg: HfExportCo
 
 
 _HYBRID_ARCHITECTURES = {"NemotronHForCausalLM", "NemotronHybridForCausalLM"}
-_AUDIO_TOKEN = "<|audio|>"
 
 
 def _detect_vllm_architecture(model_cfg: dict) -> str:
@@ -150,7 +149,7 @@ def prepare_for_vllm(output_dir: str, model_cfg: dict) -> None:
         model_cfg: Model config dict (from experiment YAML).
 
     Raises:
-        ValueError: If ``pretrained_llm`` is missing.
+        ValueError: If ``pretrained_llm`` or ``audio_locator_tag`` is missing.
     """
     from transformers import AutoTokenizer
 
@@ -161,12 +160,21 @@ def prepare_for_vllm(output_dir: str, model_cfg: dict) -> None:
     if not pretrained_llm:
         raise ValueError("model config has no 'pretrained_llm'; cannot load tokenizer for vLLM")
 
-    # 1. Detect architecture and patch config.json
+    # ``model.audio_locator_tag`` is the SoT for the audio placeholder;
+    # fail loud rather than default, since a mismatch is silent at inference.
+    audio_token = model_cfg.get("audio_locator_tag")
+    if not audio_token:
+        raise ValueError(
+            "model config has no 'audio_locator_tag' (set it in the training YAML)."
+        )
+
+    # 1. Patch config.json (arch, model_type, audio_locator_tag for vLLM plugin).
     arch = _detect_vllm_architecture(model_cfg)
     config_path = output_dir / "config.json"
     config = json.loads(config_path.read_text())
     config["model_type"] = "nemo_speechlm"
     config["architectures"] = [arch]
+    config["audio_locator_tag"] = audio_token
     config_path.write_text(json.dumps(config, indent=2) + "\n")
 
     # 2. Save tokenizer (backbone chat_template carries over via save_pretrained)
@@ -178,15 +186,11 @@ def prepare_for_vllm(output_dir: str, model_cfg: dict) -> None:
     if existing:
         LOG.info("Overwriting existing files in %s: %s", output_dir, existing)
     tok = AutoTokenizer.from_pretrained(pretrained_llm, trust_remote_code=True)
-    if _AUDIO_TOKEN not in tok.get_vocab():
-        tok.add_special_tokens({"additional_special_tokens": [_AUDIO_TOKEN]})
+    if audio_token not in tok.get_vocab():
+        tok.add_special_tokens({"additional_special_tokens": [audio_token]})
     tok.save_pretrained(str(output_dir))
-    # Newer transformers writes long chat templates to a separate
-    # ``chat_template.jinja`` file instead of inlining them in
-    # ``tokenizer_config.json`` (Qwen3's 4k-char template triggers this,
-    # Nemotron's shorter one stays inline). Read whichever is populated,
-    # inline it into tokenizer_config.json, and delete the .jinja file so
-    # downstream tooling sees a single canonical location.
+    # Newer transformers splits long chat_template into a separate
+    # ``chat_template.jinja`` file; inline it back and drop the file.
     tok_cfg_path = output_dir / "tokenizer_config.json"
     tok_cfg = json.loads(tok_cfg_path.read_text())
     jinja_file = output_dir / "chat_template.jinja"
@@ -195,31 +199,22 @@ def prepare_for_vllm(output_dir: str, model_cfg: dict) -> None:
         if jinja_from_file.strip():
             tok_cfg["chat_template"] = jinja_from_file
         jinja_file.unlink()
-    # Normalize extra_special_tokens: transformers writes our added audio token
-    # as a list, but HF/vLLM loaders expect a dict keyed by semantic name.
-    tok_cfg["extra_special_tokens"] = {"audio_token": _AUDIO_TOKEN}
-    # Force a vLLM-compatible tokenizer_class regardless of which wrapper
-    # produced the config. Observed problem cases:
-    #   * NeMo automodel containers wrap Nemotron in a proprietary
-    #     ``TokenizersBackend`` class not in HF's registry.
-    #   * Future wrappers could add similar shims for other backbones.
-    # All we need at serve time is the raw ``tokenizer.json`` content, which
-    # any HF fast tokenizer class can read; ``PreTrainedTokenizerFast`` is
-    # the universal base class and is always registered.
+    # Normalize to dict form; transformers writes a list which HF loaders reject.
+    tok_cfg["extra_special_tokens"] = {"audio_token": audio_token}
+    # Some NeMo containers save a proprietary ``TokenizersBackend`` class
+    # unknown to HF; the underlying tokenizer.json is standard, so force
+    # the universal base class.
     tok_cfg["tokenizer_class"] = "PreTrainedTokenizerFast"
-    # Some reasoning backbones (e.g. nemotron-nano-v3) ship a chat_template whose
-    # default ``enable_thinking`` is ``True``; our SpeechLM fine-tuning renders
-    # without thinking, so the exported template must also default to ``False``
-    # to keep vLLM-time rendering identical to training-time rendering.
+    # SpeechLM fine-tuning renders without ``<think>``; flip the template's
+    # default so vLLM rendering matches training (nemotron-nano-v3, etc.).
     tok_cfg["chat_template"] = tok_cfg.get("chat_template", "").replace(
         "enable_thinking if enable_thinking is defined else True",
         "enable_thinking if enable_thinking is defined else False",
     )
     tok_cfg_path.write_text(json.dumps(tok_cfg, indent=2) + "\n")
 
-    # 4. Write generation_config.json (model-specific EOS only; inference
-    #    params like temperature/max_tokens are task-specific and should be
-    #    passed via server args, not baked into the checkpoint)
+    # 4. Minimal generation_config.json (EOS only; sampling params belong on
+    #    the server, not baked into the checkpoint).
     gen_cfg = {"eos_token_id": [tok.eos_token_id]}
     (output_dir / "generation_config.json").write_text(json.dumps(gen_cfg, indent=2) + "\n")
 
@@ -294,10 +289,14 @@ def main(cfg: HfExportConfig) -> None:
 
     strategy_cfg = full_cfg.get("trainer", {}).get("strategy", {})
 
-    if dist.is_available() and not dist.is_initialized():
+    _is_torchrun = "RANK" in os.environ
+    if _is_torchrun and dist.is_available() and not dist.is_initialized():
         dist.init_process_group(backend="nccl")
     is_distributed = (
-        Path(cfg.ckpt_path).is_dir() and _uses_automodel_parallel(strategy_cfg) and dist.get_world_size() > 1
+        _is_torchrun
+        and Path(cfg.ckpt_path).is_dir()
+        and _uses_automodel_parallel(strategy_cfg)
+        and dist.get_world_size() > 1
     )
 
     if is_distributed:
