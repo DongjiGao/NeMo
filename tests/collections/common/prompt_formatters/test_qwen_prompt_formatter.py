@@ -27,9 +27,12 @@ def test_qwen_prompt_formatter_training(bpe_tokenizer):
     assert set(ans) == {"input_ids", "context_ids", "answer_ids", "mask"}
     # fmt: off
     # The test tokenizer inserts an extra space, but it was verified that AutoTokenizer("Qwen/Qwen3-1.7B") doesn't.
-    assert bpe_tokenizer.ids_to_text(ans["input_ids"].tolist()) == '<|im_start|>user\nTEST<|im_end|>\n <|im_start|>assistant\nTEST<|im_end|>\n'
+    # Matches ``Qwen/Qwen3-1.7B`` chat_template with ``enable_thinking=False``
+    # (the SpeechLM reasoning-off mode). ``<think>\n\n</think>\n\n`` is the
+    # empty reasoning block Qwen3's jinja injects.
+    assert bpe_tokenizer.ids_to_text(ans["input_ids"].tolist()) == '<|im_start|>user\nTEST<|im_end|>\n <|im_start|>assistant\n<think>\n\n</think>\n\nTEST<|im_end|>\n'
     assert bpe_tokenizer.ids_to_text(ans["context_ids"].tolist()) == '<|im_start|>user\nTEST<|im_end|>\n'
-    assert bpe_tokenizer.ids_to_text(ans["answer_ids"].tolist()) == '<|im_start|>assistant\nTEST<|im_end|>\n'
+    assert bpe_tokenizer.ids_to_text(ans["answer_ids"].tolist()) == '<|im_start|>assistant\n<think>\n\n</think>\n\nTEST<|im_end|>\n'
     assert torch.is_tensor(ans["mask"])
     # fmt: on
 
@@ -45,5 +48,7 @@ def test_qwen_prompt_formatter_inference(bpe_tokenizer):
     # fmt: off
     # The test tokenizer inserts an extra space, but it was verified that AutoTokenizer("Qwen/Qwen3-1.7B") doesn't.
     assert ans["input_ids"].tolist() == ans["context_ids"].tolist()
-    assert bpe_tokenizer.ids_to_text(ans["input_ids"].tolist()) == '<|im_start|>user\nTEST<|im_end|>\n <|im_start|>assistant\n'
+    # Matches ``Qwen/Qwen3-1.7B`` chat_template with
+    # ``enable_thinking=False, add_generation_prompt=True``.
+    assert bpe_tokenizer.ids_to_text(ans["input_ids"].tolist()) == '<|im_start|>user\nTEST<|im_end|>\n <|im_start|>assistant\n<think>\n\n</think>\n\n'
     # fmt: on
