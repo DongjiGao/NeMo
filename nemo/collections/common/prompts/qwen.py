@@ -24,10 +24,7 @@ QWEN_EOT = "<|im_end|>"
 class QwenPromptFormatter(PromptFormatter):
     NAME = "qwen"
     OUTPUT_ROLE = "assistant"
-    # Qwen3's chat_template injects this when enable_thinking=False; mirror it
-    # here so the SpeechLM fine-tune matches pre-training "reasoning-off" mode.
-    NO_THINK_PREFIX = "<think>\n\n</think>\n\n"
-    INFERENCE_PREFIX = f"{QWEN_BOT}assistant\n{NO_THINK_PREFIX}"
+    INFERENCE_PREFIX = f"{QWEN_BOT}assistant\n"
     TEMPLATE = {
         "user": {
             "template": f"{QWEN_BOT}user\n|message|{QWEN_EOT}\n",
