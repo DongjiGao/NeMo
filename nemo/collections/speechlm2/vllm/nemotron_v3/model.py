@@ -628,7 +628,6 @@ class NeMoSpeechLMForConditionalGeneration(
           PEFT:  q_proj.base_layer.weight      → (q_proj.weight, base)
           Plain: q_proj.weight                 → (q_proj.weight, base)
         """
-        import re
         m = re.match(r"(.+)\.lora_(A|B)(?:\.default)?\.weight$", name)
         if m:
             return m.group(1) + ".weight", "lora_" + m.group(2).lower()

@@ -88,6 +88,10 @@ def _apply_backend_patches():
 
         NHConfigCls.__getattr__ = _patched_getattr
     except Exception:
+        # Best-effort: the patch only matters for NemotronH backbones. If the
+        # NemotronH config class can't be reached (network offline, model not
+        # cached, transformers signature changed), other backbones still load
+        # fine — silently skip and let plugin registration succeed.
         pass
 
 

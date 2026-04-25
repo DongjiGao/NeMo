@@ -18,6 +18,8 @@ Tests plugin registration, config loading, and special token handling
 without requiring GPU or model weights.
 """
 
+import importlib.util
+
 import pytest
 
 try:
@@ -27,12 +29,7 @@ try:
 except (ImportError, RuntimeError):
     _HAS_CONFIG = False
 
-try:
-    import vllm  # noqa: F401
-
-    _HAS_VLLM = True
-except (ImportError, RuntimeError):
-    _HAS_VLLM = False
+_HAS_VLLM = importlib.util.find_spec("vllm") is not None
 
 
 @pytest.mark.skipif(not _HAS_CONFIG, reason="NeMoSpeechLMConfig not available")
@@ -144,7 +141,7 @@ class TestAudioProcessing:
             },
         }
 
-        perception = _load_nemo_perception(perception_cfg, output_dim=256)
+        perception = _load_nemo_perception(perception_cfg)
         perception = perception.to("cuda", dtype=torch.float32)
 
         dummy_audio = torch.randn(1, 16000, device="cuda")
