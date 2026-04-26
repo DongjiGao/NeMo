@@ -67,8 +67,6 @@ def _apply_backend_patches():
     pickle-safe (no closures) since vLLM spawns EngineCore as a
     subprocess.
     """
-    _patch_tokenizer_thread_safety()
-
     try:
         from transformers import AutoConfig as _AC
 
@@ -93,43 +91,3 @@ def _apply_backend_patches():
         # cached, transformers signature changed), other backbones still load
         # fine — silently skip and let plugin registration succeed.
         pass
-
-
-def _thread_safe_batch_encode_plus(self, *args, **kwargs):
-    """Wrapper that serializes _batch_encode_plus calls per instance."""
-    import threading
-
-    if not hasattr(self, "_tokenizer_lock"):
-        self._tokenizer_lock = threading.Lock()
-    with self._tokenizer_lock:
-        return type(self)._orig_batch_encode_plus(self, *args, **kwargs)
-
-
-def _patch_tokenizer_thread_safety():
-    """Make HuggingFace fast tokenizer thread-safe for vLLM.
-
-    ``PreTrainedTokenizerFast._batch_encode_plus`` first mutates the
-    underlying Rust tokenizer (``set_truncation_and_padding`` calls
-    ``enable_truncation`` / ``no_truncation``), then encodes text via
-    ``self._tokenizer.encode_batch``.  When vLLM dispatches tokenizer
-    calls to a thread pool, concurrent threads race on the Rust borrow
-    checker and panic with ``RuntimeError: Already borrowed``.
-
-    This patch wraps the entire ``_batch_encode_plus`` method in a
-    per-instance ``threading.Lock`` so the truncation-setup + encode +
-    cleanup cycle is atomic.
-
-    Uses a module-level function (not a closure) so the patch survives
-    multiprocessing spawn/pickle.
-    """
-    from transformers import PreTrainedTokenizerFast
-
-    if hasattr(PreTrainedTokenizerFast, "_orig_batch_encode_plus"):
-        return  # already patched
-
-    PreTrainedTokenizerFast._orig_batch_encode_plus = (
-        PreTrainedTokenizerFast._batch_encode_plus
-    )
-    PreTrainedTokenizerFast._batch_encode_plus = (
-        _thread_safe_batch_encode_plus
-    )

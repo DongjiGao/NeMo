@@ -28,6 +28,14 @@ _HYBRID_ARCHITECTURES = frozenset({
     "NemotronHybridForCausalLM",
 })
 
+# The audio locator tag this plugin supports. Hardcoded because vLLM's
+# class-level ``get_placeholder_str`` interface (used during chat-template
+# prompt assembly) cannot read per-checkpoint config. ``audio_locator_tag``
+# from ``config.json`` is validated against this constant at load time so
+# any incompatible checkpoint fails fast with a clear error instead of
+# silently rendering the wrong placeholder at request time.
+_AUDIO_PLACEHOLDER = "<|audio|>"
+
 # Number of extra embedding rows the SpeechLM adds on top of the backbone's
 # native vocab during training: ``<|audio|>`` locator plus headroom for other
 # special tokens and TensorCore-friendly alignment. Must match the actual
@@ -55,13 +63,26 @@ class NeMoSpeechLMConfig(PretrainedConfig):
         perception: dict | None = None,
         pretrained_llm: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
         pretrained_asr: str = "nvidia/canary-1b-v2",
-        audio_locator_tag: str = "<|audio|>",
+        audio_locator_tag: str = _AUDIO_PLACEHOLDER,
         prompt_format: str = "nemotron-nano-v3",
         pretrained_weights: bool = True,
         lora: dict | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        # The plugin's runtime path uses the hardcoded ``_AUDIO_PLACEHOLDER``
+        # constant everywhere (vLLM's class-level ``get_placeholder_str`` can't
+        # read per-checkpoint config). Reject mismatched checkpoints at load
+        # time rather than silently rendering with the wrong token at request.
+        if audio_locator_tag != _AUDIO_PLACEHOLDER:
+            raise ValueError(
+                f"vLLM SpeechLM plugin currently supports only "
+                f"audio_locator_tag={_AUDIO_PLACEHOLDER!r}, but checkpoint "
+                f"config declares {audio_locator_tag!r}. To serve checkpoints "
+                f"with a different audio token, both _AUDIO_PLACEHOLDER and "
+                f"the model class's get_placeholder_str (vLLM-mandated "
+                f"class-level metadata) need to be updated together."
+            )
         self.perception = perception or {}
         self.pretrained_llm = pretrained_llm
         self.pretrained_asr = pretrained_asr

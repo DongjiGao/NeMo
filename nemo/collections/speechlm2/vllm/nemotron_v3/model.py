@@ -53,8 +53,13 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+
+try:
+    from vllm.inputs import MultiModalDataDict
+except ImportError:
+    from vllm.multimodal.inputs import MultiModalDataDict
+
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
@@ -74,9 +79,10 @@ from vllm.multimodal.processing.dummy_inputs import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
+from nemo.collections.speechlm2.vllm.nemotron_v3.config import _AUDIO_PLACEHOLDER
+
 logger = init_logger(__name__)
 
-_AUDIO_PLACEHOLDER = "<|audio|>"
 _SAMPLING_RATE = 16000
 _MAX_AUDIO_DURATION_S = 40.0
 

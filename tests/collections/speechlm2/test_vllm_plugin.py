@@ -52,9 +52,14 @@ class TestNeMoSpeechLMConfig:
         assert cfg.pretrained_llm == "Qwen/Qwen3-1.7B"
         assert cfg.text_config is not None
 
-    def test_audio_locator_tag_configurable(self):
-        cfg = NeMoSpeechLMConfig(audio_locator_tag="<|custom_audio|>")
-        assert cfg.audio_locator_tag == "<|custom_audio|>"
+    def test_audio_locator_tag_default_accepted(self):
+        cfg = NeMoSpeechLMConfig(audio_locator_tag="<|audio|>")
+        assert cfg.audio_locator_tag == "<|audio|>"
+
+    def test_audio_locator_tag_custom_rejected(self):
+        """Plugin only supports ``<|audio|>``; mismatched checkpoints fail at load time."""
+        with pytest.raises(ValueError, match="audio_locator_tag"):
+            NeMoSpeechLMConfig(audio_locator_tag="<|custom_audio|>")
 
     def test_unknown_attr_raises(self):
         cfg = NeMoSpeechLMConfig()
