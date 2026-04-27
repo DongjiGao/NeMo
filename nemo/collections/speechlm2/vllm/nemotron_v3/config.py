@@ -116,11 +116,7 @@ class NeMoSpeechLMConfig(PretrainedConfig):
         self.is_hybrid = _is_hybrid_backend(raw_archs)
 
         if self.is_hybrid:
-            # Some checkpoints list the hybrid class under different aliases
-            # (``NemotronHybridForCausalLM`` vs ``NemotronHForCausalLM``);
-            # vLLM's registry only resolves the latter. Normalize here so any
-            # downstream ``init_vllm_registered_model(architectures=...)`` call
-            # that threads this text_config through resolves correctly.
+            # Normalize to vLLM's official NemotronH architecture name.
             self.text_config.architectures = ["NemotronHForCausalLM"]
             if not hasattr(self.text_config, "total_num_kv_heads") or self.text_config.total_num_kv_heads is None:
                 self.text_config.total_num_kv_heads = getattr(self.text_config, "num_key_value_heads", 2)
