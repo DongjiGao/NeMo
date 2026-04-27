@@ -71,7 +71,6 @@ class NeMoSpeechLMConfig(PretrainedConfig):
         lora: dict | None = None,
         **kwargs,
     ):
-        super().__init__(**kwargs)
         required_fields = {
             "pretrained_llm": pretrained_llm,
             "pretrained_asr": pretrained_asr,
@@ -79,6 +78,30 @@ class NeMoSpeechLMConfig(PretrainedConfig):
             "prompt_format": prompt_format,
             "pretrained_weights": pretrained_weights,
         }
+        is_default_init = (
+            perception is None
+            and lora is None
+            and not kwargs
+            and all(value is None for value in required_fields.values())
+        )
+
+        super().__init__(**kwargs)
+
+        if is_default_init:
+            # HuggingFace may instantiate config classes with no arguments when
+            # building a default config for serialization/comparison. Keep that
+            # path inert; real checkpoint loads continue through validation below.
+            self.perception = {}
+            self.pretrained_llm = None
+            self.pretrained_asr = None
+            self.audio_locator_tag = None
+            self.prompt_format = None
+            self.pretrained_weights = None
+            self.lora = None
+            self.text_config = PretrainedConfig()
+            self.is_hybrid = False
+            return
+
         for name, value in required_fields.items():
             if value is None or value == "":
                 raise ValueError(f"NeMo SpeechLM config must declare {name}.")
@@ -135,7 +158,7 @@ class NeMoSpeechLMConfig(PretrainedConfig):
     @property
     def llm_architectures(self) -> list[str]:
         """Return the LLM backbone architectures list."""
-        return getattr(self.text_config, "architectures", [])
+        return getattr(self.text_config, "architectures", None) or []
 
     def get_text_config(self, decoder=False) -> PretrainedConfig:
         return self.text_config

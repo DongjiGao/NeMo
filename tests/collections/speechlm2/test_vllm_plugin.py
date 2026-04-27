@@ -69,6 +69,16 @@ class TestNeMoSpeechLMConfig:
     def test_model_type(self):
         assert NeMoSpeechLMConfig.model_type == "nemo_speechlm"
 
+    def test_default_construction_for_hf_serialization(self):
+        """HF internally constructs a no-arg config when serializing configs."""
+        cfg = NeMoSpeechLMConfig()
+        assert cfg.pretrained_llm is None
+        assert cfg.pretrained_asr is None
+        assert cfg.audio_locator_tag is None
+        assert cfg.prompt_format is None
+        assert cfg.pretrained_weights is None
+        assert cfg.llm_architectures == []
+
     def test_loads_text_config(self):
         """Config should load a text_config from the pretrained LLM."""
         cfg = NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
