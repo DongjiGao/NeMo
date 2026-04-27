@@ -119,9 +119,16 @@ class NeMoSpeechLMConfig(PretrainedConfig):
             # Normalize to vLLM's official NemotronH architecture name.
             self.text_config.architectures = ["NemotronHForCausalLM"]
             if not hasattr(self.text_config, "total_num_kv_heads") or self.text_config.total_num_kv_heads is None:
-                self.text_config.total_num_kv_heads = getattr(self.text_config, "num_key_value_heads", 2)
+                if (
+                    not hasattr(self.text_config, "num_key_value_heads")
+                    or self.text_config.num_key_value_heads is None
+                ):
+                    raise ValueError("NemotronH config must define num_key_value_heads.")
+                self.text_config.total_num_kv_heads = self.text_config.num_key_value_heads
             if not hasattr(self.text_config, "rms_norm_eps"):
-                self.text_config.rms_norm_eps = getattr(self.text_config, "layer_norm_epsilon", 1e-5)
+                if not hasattr(self.text_config, "layer_norm_epsilon"):
+                    raise ValueError("NemotronH config must define layer_norm_epsilon.")
+                self.text_config.rms_norm_eps = self.text_config.layer_norm_epsilon
 
         self.text_config.vocab_size += _SPEECHLM_EMBED_EXTRA_ROWS
 

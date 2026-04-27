@@ -30,6 +30,8 @@ forces an update to the estimator.
 import pytest
 import torch
 
+pytest.importorskip("vllm")
+
 from nemo.collections.asr.parts.submodules.subsampling import calc_length
 from nemo.collections.speechlm2.vllm.nemotron_v3.model import (
     NeMoSpeechLMProcessingInfo,
@@ -56,15 +58,15 @@ def _reference(audio_length_samples: int) -> int:
 @pytest.mark.parametrize(
     "samples",
     [
-        1_600,       # 0.1 s
-        16_000,      # 1 s
-        80_000,      # 5 s
-        160_000,     # 10 s
-        320_000,     # 20 s
-        640_000,     # 40 s, the typical max
-        12_345,      # arbitrary small
-        54_321,      # arbitrary mid
-        100_001,     # arbitrary (odd)
+        1_600,  # 0.1 s
+        16_000,  # 1 s
+        80_000,  # 5 s
+        160_000,  # 10 s
+        320_000,  # 20 s
+        640_000,  # 40 s, the typical max
+        12_345,  # arbitrary small
+        54_321,  # arbitrary mid
+        100_001,  # arbitrary (odd)
     ],
 )
 def test_estimator_matches_calc_length(samples: int) -> None:

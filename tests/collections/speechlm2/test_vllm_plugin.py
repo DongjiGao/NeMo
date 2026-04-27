@@ -19,11 +19,14 @@ without requiring GPU or model weights.
 """
 
 import importlib.util
+from types import SimpleNamespace
 
 import pytest
 
 try:
-    from nemo.collections.speechlm2.vllm.nemotron_v3.config import NeMoSpeechLMConfig
+    from nemo.collections.speechlm2.vllm.nemotron_v3 import config as _config_module
+
+    NeMoSpeechLMConfig = _config_module.NeMoSpeechLMConfig
 
     _HAS_CONFIG = True
 except (ImportError, RuntimeError):
@@ -43,6 +46,26 @@ _DEFAULT_CONFIG_KWARGS = {
 class TestNeMoSpeechLMConfig:
     """Tests for NeMoSpeechLMConfig."""
 
+    @pytest.fixture(autouse=True)
+    def mock_backbone_config(self, monkeypatch):
+        def from_pretrained(model_name: str, trust_remote_code: bool = True):
+            if "Nemotron" in model_name:
+                return SimpleNamespace(
+                    architectures=["NemotronHybridForCausalLM"],
+                    hidden_size=2048,
+                    vocab_size=131072,
+                    num_key_value_heads=2,
+                    layer_norm_epsilon=1e-5,
+                )
+            return SimpleNamespace(
+                architectures=["Qwen3ForCausalLM"],
+                hidden_size=2048,
+                vocab_size=151936,
+                rms_norm_eps=1e-6,
+            )
+
+        monkeypatch.setattr(_config_module.AutoConfig, "from_pretrained", from_pretrained)
+
     def test_model_type(self):
         assert NeMoSpeechLMConfig.model_type == "nemo_speechlm"
 
@@ -52,6 +75,12 @@ class TestNeMoSpeechLMConfig:
         assert cfg.text_config is not None
         assert hasattr(cfg.text_config, "hidden_size")
         assert cfg.get_text_config() is cfg.text_config
+
+    def test_hybrid_backbone_aliases_for_vllm(self):
+        cfg = NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
+        assert cfg.llm_architectures == ["NemotronHForCausalLM"]
+        assert cfg.text_config.total_num_kv_heads == cfg.text_config.num_key_value_heads
+        assert cfg.text_config.rms_norm_eps == cfg.text_config.layer_norm_epsilon
 
     def test_custom_pretrained_llm(self):
         """Config should accept different LLM backbones."""
@@ -124,17 +153,62 @@ class TestSpecialTokens:
         _ensure_special_tokens(tokenizer)
         tokenizer.add_special_tokens.assert_not_called()
 
+    def test_placeholder_str(self):
+        from nemo.collections.speechlm2.vllm.nemotron_v3.model import NeMoSpeechLMForConditionalGeneration
+
+        assert NeMoSpeechLMForConditionalGeneration.get_placeholder_str("audio", 0) == "<|audio|>"
+        assert NeMoSpeechLMForConditionalGeneration.get_placeholder_str("image", 0) is None
+
 
 @pytest.mark.skipif(not _HAS_VLLM, reason="vLLM not installed")
 class TestAudioProcessing:
     """Tests for audio encoding with a tiny perception module."""
 
+    def test_call_hf_processor_requires_matching_placeholder_count(self):
+        from nemo.collections.speechlm2.vllm.nemotron_v3.model import NeMoSpeechLMMultiModalProcessor
+
+        processor = object.__new__(NeMoSpeechLMMultiModalProcessor)
+        processor.info = SimpleNamespace(
+            get_tokenizer=lambda: _FakeTokenizer(),
+            _estimate_audio_tokens=lambda samples: 2,
+        )
+
+        with pytest.raises(ValueError, match="placeholders"):
+            processor._call_hf_processor(
+                prompt="Transcribe this audio",
+                mm_data={"audios": [[0.0] * 16000]},
+                mm_kwargs={},
+                tok_kwargs={},
+            )
+
+    def test_call_hf_processor_emits_true_audio_lengths(self):
+        import torch
+
+        from nemo.collections.speechlm2.vllm.nemotron_v3.model import NeMoSpeechLMMultiModalProcessor
+
+        processor = object.__new__(NeMoSpeechLMMultiModalProcessor)
+        processor.info = SimpleNamespace(
+            get_tokenizer=lambda: _FakeTokenizer(),
+            _estimate_audio_tokens=lambda samples: 2,
+        )
+
+        result = processor._call_hf_processor(
+            prompt="Transcribe: <|audio|>",
+            mm_data={"audios": [[0.0] * 12345]},
+            mm_kwargs={},
+            tok_kwargs={},
+        )
+
+        assert len(result["audio_signal"]) == 1
+        assert result["audio_signal"][0].shape[-1] == 12345
+        assert torch.equal(result["audio_signal_length"], torch.tensor([12345]))
+
     def test_perception_forward(self):
+        """A small NeMo perception module should encode dummy audio to embeddings."""
         import torch
 
         if not torch.cuda.is_available():
             pytest.skip("CUDA required")
-        """A small NeMo perception module should encode dummy audio to embeddings."""
         from nemo.collections.speechlm2.vllm.nemotron_v3.model import _load_nemo_perception
 
         perception_cfg = {
@@ -198,9 +272,15 @@ class TestAudioProcessing:
 class TestPluginRegistration:
     """Tests for plugin registration with vLLM."""
 
-    def test_register_config(self):
+    def test_register_config(self, monkeypatch):
         """register() should add nemo_speechlm to vLLM's config registry."""
+        from transformers import AutoConfig
+
         from nemo.collections.speechlm2.vllm.nemotron_v3 import register
+
+        monkeypatch.setattr(
+            AutoConfig, "from_pretrained", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError())
+        )
 
         register()
 
@@ -208,12 +288,49 @@ class TestPluginRegistration:
 
         assert "nemo_speechlm" in _CONFIG_REGISTRY
 
-    def test_register_model(self):
+    def test_register_model(self, monkeypatch):
         """register() should make NeMoSpeechLMForConditionalGeneration importable."""
+        from transformers import AutoConfig
+
         from nemo.collections.speechlm2.vllm.nemotron_v3 import register
+
+        monkeypatch.setattr(
+            AutoConfig, "from_pretrained", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError())
+        )
 
         register()
 
+        from vllm.model_executor.models.registry import ModelRegistry
+
         from nemo.collections.speechlm2.vllm.nemotron_v3.model import NeMoSpeechLMForConditionalGeneration
 
+        assert "NeMoSpeechLMForConditionalGeneration" in ModelRegistry.get_supported_archs()
+        assert "NeMoSpeechLMHybridForConditionalGeneration" in ModelRegistry.get_supported_archs()
         assert NeMoSpeechLMForConditionalGeneration is not None
+
+    def test_register_does_not_patch_fast_tokenizer(self, monkeypatch):
+        from transformers import AutoConfig, PreTrainedTokenizerFast
+
+        from nemo.collections.speechlm2.vllm.nemotron_v3 import register
+
+        monkeypatch.setattr(
+            AutoConfig, "from_pretrained", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError())
+        )
+
+        assert "_orig_batch_encode_plus" not in PreTrainedTokenizerFast.__dict__
+        register()
+        assert "_orig_batch_encode_plus" not in PreTrainedTokenizerFast.__dict__
+
+
+class _FakeTokenizer:
+    def __init__(self):
+        self.added_special_tokens = None
+
+    def get_vocab(self):
+        return {}
+
+    def add_special_tokens(self, tokens):
+        self.added_special_tokens = tokens
+
+    def encode(self, prompt, add_special_tokens=True):
+        return list(range(max(1, len(prompt.split()))))
