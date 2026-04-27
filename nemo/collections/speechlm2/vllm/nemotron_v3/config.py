@@ -23,10 +23,12 @@ vs standard transformer backends are auto-detected.
 
 from transformers import AutoConfig, PretrainedConfig
 
-_HYBRID_ARCHITECTURES = frozenset({
-    "NemotronHForCausalLM",
-    "NemotronHybridForCausalLM",
-})
+_HYBRID_ARCHITECTURES = frozenset(
+    {
+        "NemotronHForCausalLM",
+        "NemotronHybridForCausalLM",
+    }
+)
 
 # The audio locator tag this plugin supports. Hardcoded because vLLM's
 # class-level ``get_placeholder_str`` interface (used during chat-template
@@ -61,15 +63,25 @@ class NeMoSpeechLMConfig(PretrainedConfig):
     def __init__(
         self,
         perception: dict | None = None,
-        pretrained_llm: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-        pretrained_asr: str = "nvidia/canary-1b-v2",
-        audio_locator_tag: str = _AUDIO_PLACEHOLDER,
-        prompt_format: str = "nemotron-nano-v3",
-        pretrained_weights: bool = True,
+        pretrained_llm: str | None = None,
+        pretrained_asr: str | None = None,
+        audio_locator_tag: str | None = None,
+        prompt_format: str | None = None,
+        pretrained_weights: bool | None = None,
         lora: dict | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        required_fields = {
+            "pretrained_llm": pretrained_llm,
+            "pretrained_asr": pretrained_asr,
+            "audio_locator_tag": audio_locator_tag,
+            "prompt_format": prompt_format,
+            "pretrained_weights": pretrained_weights,
+        }
+        for name, value in required_fields.items():
+            if value is None or value == "":
+                raise ValueError(f"NeMo SpeechLM config must declare {name}.")
         # The plugin's runtime path uses the hardcoded ``_AUDIO_PLACEHOLDER``
         # constant everywhere (vLLM's class-level ``get_placeholder_str`` can't
         # read per-checkpoint config). Reject mismatched checkpoints at load
@@ -91,9 +103,7 @@ class NeMoSpeechLMConfig(PretrainedConfig):
         self.pretrained_weights = pretrained_weights
         self.lora = lora
 
-        self.text_config = AutoConfig.from_pretrained(
-            pretrained_llm, trust_remote_code=True
-        )
+        self.text_config = AutoConfig.from_pretrained(pretrained_llm, trust_remote_code=True)
 
         raw_archs = getattr(self.text_config, "architectures", [])
         if len(raw_archs) != 1:
@@ -112,17 +122,10 @@ class NeMoSpeechLMConfig(PretrainedConfig):
             # downstream ``init_vllm_registered_model(architectures=...)`` call
             # that threads this text_config through resolves correctly.
             self.text_config.architectures = ["NemotronHForCausalLM"]
-            if (
-                not hasattr(self.text_config, "total_num_kv_heads")
-                or self.text_config.total_num_kv_heads is None
-            ):
-                self.text_config.total_num_kv_heads = getattr(
-                    self.text_config, "num_key_value_heads", 2
-                )
+            if not hasattr(self.text_config, "total_num_kv_heads") or self.text_config.total_num_kv_heads is None:
+                self.text_config.total_num_kv_heads = getattr(self.text_config, "num_key_value_heads", 2)
             if not hasattr(self.text_config, "rms_norm_eps"):
-                self.text_config.rms_norm_eps = getattr(
-                    self.text_config, "layer_norm_epsilon", 1e-5
-                )
+                self.text_config.rms_norm_eps = getattr(self.text_config, "layer_norm_epsilon", 1e-5)
 
         self.text_config.vocab_size += _SPEECHLM_EMBED_EXTRA_ROWS
 
@@ -177,6 +180,4 @@ class NeMoSpeechLMConfig(PretrainedConfig):
                     return getattr(self.text_config, name)
                 except AttributeError:
                     pass
-            raise AttributeError(
-                f"'{type(self).__name__}' has no attribute '{name}'"
-            )
+            raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")

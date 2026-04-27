@@ -30,6 +30,13 @@ except (ImportError, RuntimeError):
     _HAS_CONFIG = False
 
 _HAS_VLLM = importlib.util.find_spec("vllm") is not None
+_DEFAULT_CONFIG_KWARGS = {
+    "pretrained_llm": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    "pretrained_asr": "nvidia/canary-1b-v2",
+    "audio_locator_tag": "<|audio|>",
+    "prompt_format": "nemotron-nano-v3",
+    "pretrained_weights": True,
+}
 
 
 @pytest.mark.skipif(not _HAS_CONFIG, reason="NeMoSpeechLMConfig not available")
@@ -41,28 +48,54 @@ class TestNeMoSpeechLMConfig:
 
     def test_loads_text_config(self):
         """Config should load a text_config from the pretrained LLM."""
-        cfg = NeMoSpeechLMConfig()
+        cfg = NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
         assert cfg.text_config is not None
         assert hasattr(cfg.text_config, "hidden_size")
         assert cfg.get_text_config() is cfg.text_config
 
     def test_custom_pretrained_llm(self):
         """Config should accept different LLM backbones."""
-        cfg = NeMoSpeechLMConfig(pretrained_llm="Qwen/Qwen3-1.7B")
+        cfg = NeMoSpeechLMConfig(
+            **{
+                **_DEFAULT_CONFIG_KWARGS,
+                "pretrained_llm": "Qwen/Qwen3-1.7B",
+            }
+        )
         assert cfg.pretrained_llm == "Qwen/Qwen3-1.7B"
         assert cfg.text_config is not None
 
     def test_audio_locator_tag_default_accepted(self):
-        cfg = NeMoSpeechLMConfig(audio_locator_tag="<|audio|>")
+        cfg = NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
         assert cfg.audio_locator_tag == "<|audio|>"
 
     def test_audio_locator_tag_custom_rejected(self):
         """Plugin only supports ``<|audio|>``; mismatched checkpoints fail at load time."""
         with pytest.raises(ValueError, match="audio_locator_tag"):
-            NeMoSpeechLMConfig(audio_locator_tag="<|custom_audio|>")
+            NeMoSpeechLMConfig(
+                **{
+                    **_DEFAULT_CONFIG_KWARGS,
+                    "audio_locator_tag": "<|custom_audio|>",
+                }
+            )
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "pretrained_llm",
+            "pretrained_asr",
+            "audio_locator_tag",
+            "prompt_format",
+            "pretrained_weights",
+        ],
+    )
+    def test_required_exported_fields(self, field):
+        kwargs = dict(_DEFAULT_CONFIG_KWARGS)
+        kwargs.pop(field)
+        with pytest.raises(ValueError, match=field):
+            NeMoSpeechLMConfig(**kwargs)
 
     def test_unknown_attr_raises(self):
-        cfg = NeMoSpeechLMConfig()
+        cfg = NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
         with pytest.raises(AttributeError):
             _ = cfg.nonexistent_attribute_xyz
 
