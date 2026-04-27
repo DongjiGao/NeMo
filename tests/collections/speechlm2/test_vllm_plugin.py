@@ -179,7 +179,7 @@ class TestAudioProcessing:
 
         processor = object.__new__(NeMoSpeechLMMultiModalProcessor)
         processor.info = SimpleNamespace(
-            get_tokenizer=lambda: _FakeTokenizer(),
+            get_tokenizer=_FakeTokenizer,
             _estimate_audio_tokens=lambda samples: 2,
         )
 
@@ -198,7 +198,7 @@ class TestAudioProcessing:
 
         processor = object.__new__(NeMoSpeechLMMultiModalProcessor)
         processor.info = SimpleNamespace(
-            get_tokenizer=lambda: _FakeTokenizer(),
+            get_tokenizer=_FakeTokenizer,
             _estimate_audio_tokens=lambda samples: 2,
         )
 
