@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the vLLM NeMo Speech LM plugin.
+"""Unit tests for the vLLM NeMo Speech LM (SALM) plugin.
 
-Tests plugin registration, config loading, and special token handling
-without requiring GPU or model weights.
+Covers plugin registration, config loading + escape-hatch wiring, special
+token handling, and backend selection -- without requiring GPU or model
+weights.
 """
 
 import importlib.util
@@ -24,7 +25,7 @@ from types import SimpleNamespace
 import pytest
 
 try:
-    from nemo.collections.speechlm2.vllm.nemotron_v3 import config as _config_module
+    from nemo.collections.speechlm2.vllm.salm import config as _config_module
 
     NeMoSpeechLMConfig = _config_module.NeMoSpeechLMConfig
 
@@ -54,6 +55,7 @@ class TestNeMoSpeechLMConfig:
                     architectures=["NemotronHybridForCausalLM"],
                     hidden_size=2048,
                     vocab_size=131072,
+                    num_hidden_layers=4,
                     num_key_value_heads=2,
                     layer_norm_epsilon=1e-5,
                 )
@@ -61,6 +63,7 @@ class TestNeMoSpeechLMConfig:
                 architectures=["Qwen3ForCausalLM"],
                 hidden_size=2048,
                 vocab_size=151936,
+                num_hidden_layers=4,
                 rms_norm_eps=1e-6,
             )
 
@@ -88,9 +91,75 @@ class TestNeMoSpeechLMConfig:
 
     def test_hybrid_backbone_aliases_for_vllm(self):
         cfg = NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
+        assert cfg.is_hybrid is True
         assert cfg.llm_architectures == ["NemotronHForCausalLM"]
         assert cfg.text_config.total_num_kv_heads == cfg.text_config.num_key_value_heads
         assert cfg.text_config.rms_norm_eps == cfg.text_config.layer_norm_epsilon
+
+    @pytest.mark.parametrize(
+        "architectures, expected_is_hybrid",
+        [
+            (["NemotronHForCausalLM"], True),
+            (["NemotronHybridForCausalLM"], True),
+            (["Qwen3ForCausalLM"], False),
+            (["LlamaForCausalLM"], False),
+            (["Qwen2ForCausalLM"], False),
+        ],
+    )
+    def test_is_hybrid_backend_helper(self, architectures, expected_is_hybrid):
+        """``_is_hybrid_backend`` should match the documented hybrid allow-list."""
+        from nemo.collections.speechlm2.vllm.salm.config import _is_hybrid_backend
+
+        assert _is_hybrid_backend(architectures) is expected_is_hybrid
+
+    @pytest.mark.parametrize(
+        "backbone_archs, expected_is_hybrid",
+        [
+            (["NemotronHForCausalLM"], True),
+            (["NemotronHybridForCausalLM"], True),
+            (["Qwen3ForCausalLM"], False),
+        ],
+    )
+    def test_is_hybrid_set_from_backbone_architectures(self, monkeypatch, backbone_archs, expected_is_hybrid):
+        """``cfg.is_hybrid`` is driven by the backbone HF config's ``architectures``."""
+
+        def from_pretrained(model_name: str, trust_remote_code: bool = True):
+            kwargs = dict(
+                architectures=backbone_archs,
+                hidden_size=2048,
+                vocab_size=131072,
+                num_hidden_layers=4,
+            )
+            if expected_is_hybrid:
+                kwargs.update(num_key_value_heads=2, layer_norm_epsilon=1e-5)
+            else:
+                kwargs.update(rms_norm_eps=1e-6)
+            return SimpleNamespace(**kwargs)
+
+        monkeypatch.setattr(_config_module.AutoConfig, "from_pretrained", from_pretrained)
+
+        cfg = NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
+        assert cfg.is_hybrid is expected_is_hybrid
+
+    def test_hybrid_backbone_does_not_set_layer_types_shim(self):
+        """Hybrid backbones must NOT have layer_types overridden -- the runtime
+        is_hybrid escape hatch only fires when every layer is 'attention'."""
+        cfg = NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
+        assert cfg.is_hybrid is True
+        assert getattr(cfg.text_config, "layer_types", None) is None
+
+    def test_transformer_backbone_engages_layer_types_shim(self):
+        """Non-hybrid backbones get layer_types=['attention']*N so vLLM's
+        ModelConfig.is_hybrid property returns False at runtime even though
+        the model class declares IsHybrid (needed for NemotronH path)."""
+        cfg = NeMoSpeechLMConfig(
+            **{
+                **_DEFAULT_CONFIG_KWARGS,
+                "pretrained_llm": "Qwen/Qwen3-1.7B",
+            }
+        )
+        assert cfg.is_hybrid is False
+        assert cfg.text_config.layer_types == ["attention"] * 4
 
     def test_custom_pretrained_llm(self):
         """Config should accept different LLM backbones."""
@@ -102,6 +171,7 @@ class TestNeMoSpeechLMConfig:
         )
         assert cfg.pretrained_llm == "Qwen/Qwen3-1.7B"
         assert cfg.text_config is not None
+        assert cfg.llm_architectures == ["Qwen3ForCausalLM"]
 
     def test_audio_locator_tag_default_accepted(self):
         cfg = NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
@@ -139,6 +209,54 @@ class TestNeMoSpeechLMConfig:
             _ = cfg.nonexistent_attribute_xyz
 
 
+@pytest.mark.skipif(not _HAS_CONFIG, reason="NeMoSpeechLMConfig not available")
+class TestBackendSelection:
+    """Tests for ``backends.make_backend`` dispatch on hybrid/transformer configs."""
+
+    @pytest.fixture(autouse=True)
+    def mock_backbone_config(self, monkeypatch):
+        def from_pretrained(model_name: str, trust_remote_code: bool = True):
+            if "Nemotron" in model_name:
+                return SimpleNamespace(
+                    architectures=["NemotronHybridForCausalLM"],
+                    hidden_size=2048,
+                    vocab_size=131072,
+                    num_hidden_layers=4,
+                    num_key_value_heads=2,
+                    layer_norm_epsilon=1e-5,
+                )
+            return SimpleNamespace(
+                architectures=["Qwen3ForCausalLM"],
+                hidden_size=2048,
+                vocab_size=151936,
+                num_hidden_layers=4,
+                rms_norm_eps=1e-6,
+            )
+
+        monkeypatch.setattr(_config_module.AutoConfig, "from_pretrained", from_pretrained)
+
+    def test_hybrid_config_picks_hybrid_backend(self):
+        from nemo.collections.speechlm2.vllm.salm.backends import HybridBackend, make_backend
+
+        cfg = NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
+        backend = make_backend(cfg)
+        assert isinstance(backend, HybridBackend)
+        assert backend.architectures() == ["NemotronHForCausalLM"]
+
+    def test_transformer_config_picks_transformer_backend(self):
+        from nemo.collections.speechlm2.vllm.salm.backends import TransformerBackend, make_backend
+
+        cfg = NeMoSpeechLMConfig(
+            **{
+                **_DEFAULT_CONFIG_KWARGS,
+                "pretrained_llm": "Qwen/Qwen3-1.7B",
+            }
+        )
+        backend = make_backend(cfg)
+        assert isinstance(backend, TransformerBackend)
+        assert backend.architectures() == ["Qwen3ForCausalLM"]
+
+
 @pytest.mark.skipif(not _HAS_VLLM, reason="vLLM not installed")
 class TestSpecialTokens:
     """Tests for special token handling."""
@@ -146,7 +264,7 @@ class TestSpecialTokens:
     def test_adds_missing_token(self):
         from unittest.mock import MagicMock
 
-        from nemo.collections.speechlm2.vllm.nemotron_v3.model import _ensure_special_tokens
+        from nemo.collections.speechlm2.vllm.salm.audio import _ensure_special_tokens
 
         tokenizer = MagicMock()
         tokenizer.get_vocab.return_value = {}
@@ -156,7 +274,7 @@ class TestSpecialTokens:
     def test_skips_existing_token(self):
         from unittest.mock import MagicMock
 
-        from nemo.collections.speechlm2.vllm.nemotron_v3.model import _ensure_special_tokens
+        from nemo.collections.speechlm2.vllm.salm.audio import _ensure_special_tokens
 
         tokenizer = MagicMock()
         tokenizer.get_vocab.return_value = {"<|audio|>": 99}
@@ -164,7 +282,7 @@ class TestSpecialTokens:
         tokenizer.add_special_tokens.assert_not_called()
 
     def test_placeholder_str(self):
-        from nemo.collections.speechlm2.vllm.nemotron_v3.model import NeMoSpeechLMForConditionalGeneration
+        from nemo.collections.speechlm2.vllm.salm.model import NeMoSpeechLMForConditionalGeneration
 
         assert NeMoSpeechLMForConditionalGeneration.get_placeholder_str("audio", 0) == "<|audio|>"
         assert NeMoSpeechLMForConditionalGeneration.get_placeholder_str("image", 0) is None
@@ -175,7 +293,7 @@ class TestAudioProcessing:
     """Tests for audio encoding with a tiny perception module."""
 
     def test_call_hf_processor_requires_matching_placeholder_count(self):
-        from nemo.collections.speechlm2.vllm.nemotron_v3.model import NeMoSpeechLMMultiModalProcessor
+        from nemo.collections.speechlm2.vllm.salm.audio import NeMoSpeechLMMultiModalProcessor
 
         processor = object.__new__(NeMoSpeechLMMultiModalProcessor)
         processor.info = SimpleNamespace(
@@ -194,7 +312,7 @@ class TestAudioProcessing:
     def test_call_hf_processor_emits_true_audio_lengths(self):
         import torch
 
-        from nemo.collections.speechlm2.vllm.nemotron_v3.model import NeMoSpeechLMMultiModalProcessor
+        from nemo.collections.speechlm2.vllm.salm.audio import NeMoSpeechLMMultiModalProcessor
 
         processor = object.__new__(NeMoSpeechLMMultiModalProcessor)
         processor.info = SimpleNamespace(
@@ -219,7 +337,7 @@ class TestAudioProcessing:
 
         if not torch.cuda.is_available():
             pytest.skip("CUDA required")
-        from nemo.collections.speechlm2.vllm.nemotron_v3.model import _load_nemo_perception
+        from nemo.collections.speechlm2.vllm.salm.audio import _load_nemo_perception
 
         perception_cfg = {
             "output_dim": 256,
@@ -286,7 +404,7 @@ class TestPluginRegistration:
         """register() should add nemo_speechlm to vLLM's config registry."""
         from transformers import AutoConfig
 
-        from nemo.collections.speechlm2.vllm.nemotron_v3 import register
+        from nemo.collections.speechlm2.vllm.salm import register
 
         monkeypatch.setattr(
             AutoConfig, "from_pretrained", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError())
@@ -299,10 +417,14 @@ class TestPluginRegistration:
         assert "nemo_speechlm" in _CONFIG_REGISTRY
 
     def test_register_model(self, monkeypatch):
-        """register() should make NeMoSpeechLMForConditionalGeneration importable."""
+        """register() should make NeMoSpeechLMForConditionalGeneration importable.
+
+        The plugin now registers a single architecture name; the obsolete
+        ``NeMoSpeechLMHybridForConditionalGeneration`` no longer appears.
+        """
         from transformers import AutoConfig
 
-        from nemo.collections.speechlm2.vllm.nemotron_v3 import register
+        from nemo.collections.speechlm2.vllm.salm import register
 
         monkeypatch.setattr(
             AutoConfig, "from_pretrained", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError())
@@ -312,16 +434,15 @@ class TestPluginRegistration:
 
         from vllm.model_executor.models.registry import ModelRegistry
 
-        from nemo.collections.speechlm2.vllm.nemotron_v3.model import NeMoSpeechLMForConditionalGeneration
+        from nemo.collections.speechlm2.vllm.salm.model import NeMoSpeechLMForConditionalGeneration
 
         assert "NeMoSpeechLMForConditionalGeneration" in ModelRegistry.get_supported_archs()
-        assert "NeMoSpeechLMHybridForConditionalGeneration" in ModelRegistry.get_supported_archs()
         assert NeMoSpeechLMForConditionalGeneration is not None
 
     def test_register_does_not_patch_fast_tokenizer(self, monkeypatch):
         from transformers import AutoConfig, PreTrainedTokenizerFast
 
-        from nemo.collections.speechlm2.vllm.nemotron_v3 import register
+        from nemo.collections.speechlm2.vllm.salm import register
 
         monkeypatch.setattr(
             AutoConfig, "from_pretrained", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError())

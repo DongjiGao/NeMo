@@ -33,7 +33,7 @@ import torch
 pytest.importorskip("vllm")
 
 from nemo.collections.asr.parts.submodules.subsampling import calc_length
-from nemo.collections.speechlm2.vllm.nemotron_v3.model import NeMoSpeechLMProcessingInfo
+from nemo.collections.speechlm2.vllm.salm.audio import NeMoSpeechLMProcessingInfo
 
 
 def _reference(audio_length_samples: int) -> int:

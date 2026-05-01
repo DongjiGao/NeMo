@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration for NeMo Speech LM models in vLLM.
+"""Configuration for NeMo Speech LM (SALM) models in vLLM.
 
 Provides ``NeMoSpeechLMConfig``, a HuggingFace-compatible config class
 that wraps the LLM backbone's text config with NeMo-specific fields
 (perception, audio_locator_tag, etc.).  The checkpoint's ``config.json``
 determines which LLM backbone and encoder are used; hybrid (Mamba+MoE)
-vs standard transformer backends are auto-detected.
+vs standard transformer backends are auto-detected from the backbone's
+own ``architectures`` field.
 """
 
 from transformers import AutoConfig, PretrainedConfig
@@ -56,6 +57,14 @@ class NeMoSpeechLMConfig(PretrainedConfig):
     Wraps a pretrained LLM config (e.g. NemotronH, Qwen3) with
     additional fields for the speech perception module.  Hybrid vs
     standard transformer is auto-detected from ``pretrained_llm``.
+
+    A single ``NeMoSpeechLMForConditionalGeneration`` model class handles
+    both backbone families via composition (see ``backends.py``). vLLM's
+    runtime ``model_config.is_hybrid`` property gates the hybrid KV cache
+    path on ``text_config.layer_types``: for non-hybrid backbones we
+    populate it with ``["attention"] * num_hidden_layers`` so vLLM treats
+    the model as attention-only at runtime even though the model class
+    declares ``IsHybrid`` (needed for the NemotronH path).
     """
 
     model_type = "nemo_speechlm"
@@ -152,6 +161,16 @@ class NeMoSpeechLMConfig(PretrainedConfig):
                 if not hasattr(self.text_config, "layer_norm_epsilon"):
                     raise ValueError("NemotronH config must define layer_norm_epsilon.")
                 self.text_config.rms_norm_eps = self.text_config.layer_norm_epsilon
+        else:
+            # vLLM's runtime ``ModelConfig.is_hybrid`` property returns False if
+            # ``text_config.layer_types`` is non-empty and every layer is
+            # ``"attention"`` (the granite-4.0-micro escape hatch). This lets
+            # the single ``NeMoSpeechLMForConditionalGeneration`` class declare
+            # ``IsHybrid`` for the NemotronH path without forcing the hybrid
+            # KV-cache allocator on transformer backbones.
+            num_layers = getattr(self.text_config, "num_hidden_layers", 0) or 0
+            if num_layers > 0:
+                self.text_config.layer_types = ["attention"] * num_layers
 
         self.text_config.vocab_size += _SPEECHLM_EMBED_EXTRA_ROWS
 

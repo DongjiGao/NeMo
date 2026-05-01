@@ -12,31 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""vLLM plugin registration for NeMo Speech LM models.
+"""vLLM plugin registration for NeMo Speech LM (SALM) models.
 
-Registers NeMoSpeechLMConfig and both model classes into vLLM's
-model and config registries via the ``vllm.general_plugins``
-entry point.
+Registers ``NeMoSpeechLMConfig`` and the single
+``NeMoSpeechLMForConditionalGeneration`` model class with vLLM via the
+``vllm.general_plugins`` entry point.
 
-Model classes:
-  - NeMoSpeechLMForConditionalGeneration       — standard transformer (e.g. Qwen3, Parakeet-TDT)
-  - NeMoSpeechLMHybridForConditionalGeneration — hybrid Mamba+MoE (e.g. NemotronH)
-
-Note on the ``nemotron_v3`` package name: this plugin is backbone-agnostic
-and covers every SpeechLM variant we export today (Qwen3-based canary-qwen,
-NemotronH, etc.). The folder name is historical — the plugin started as a
-NemotronH-only experiment and later grew a standard-transformer variant in
-the same package rather than moving.
+A single model class covers every supported backbone family (standard
+transformer like Qwen3 / Parakeet-TDT, hybrid Mamba+MoE like NemotronH).
+Backbone-specific behavior is selected at instantiation time by
+``backends.make_backend(config)``; vLLM's runtime ``ModelConfig.is_hybrid``
+property gates the hybrid KV-cache path on ``text_config.layer_types``,
+which ``config.py`` populates appropriately for transformer backbones.
 """
 
-_PKG = "nemo.collections.speechlm2.vllm.nemotron_v3"
+_PKG = "nemo.collections.speechlm2.vllm.salm"
 
 
 def register():
-    """Register the NeMo Speech LM models and config with vLLM."""
+    """Register the NeMo Speech LM model and config with vLLM."""
     from transformers import AutoConfig
 
-    from nemo.collections.speechlm2.vllm.nemotron_v3.config import NeMoSpeechLMConfig
+    from nemo.collections.speechlm2.vllm.salm.config import NeMoSpeechLMConfig
 
     AutoConfig.register("nemo_speechlm", NeMoSpeechLMConfig)
 
@@ -46,15 +43,9 @@ def register():
 
     from vllm.model_executor.models.registry import ModelRegistry
 
-    # Standard transformer variant takes the unqualified base name.
     ModelRegistry.register_model(
         "NeMoSpeechLMForConditionalGeneration",
         f"{_PKG}.model:NeMoSpeechLMForConditionalGeneration",
-    )
-    # Hybrid (Mamba+MoE) variant uses the qualified name.
-    ModelRegistry.register_model(
-        "NeMoSpeechLMHybridForConditionalGeneration",
-        f"{_PKG}.model:NeMoSpeechLMHybridForConditionalGeneration",
     )
 
     _apply_backend_patches()
@@ -89,5 +80,5 @@ def _apply_backend_patches():
         # Best-effort: the patch only matters for NemotronH backbones. If the
         # NemotronH config class can't be reached (network offline, model not
         # cached, transformers signature changed), other backbones still load
-        # fine — silently skip and let plugin registration succeed.
+        # fine -- silently skip and let plugin registration succeed.
         pass
