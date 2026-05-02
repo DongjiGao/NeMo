@@ -20,10 +20,7 @@ Registers ``NeMoSpeechLMConfig`` and the single
 
 A single model class covers every supported backbone family (standard
 transformer like Qwen3 / Parakeet-TDT, hybrid Mamba+MoE like NemotronH).
-Backbone-specific behavior is selected at instantiation time by
-``backends.make_backend(config)``; vLLM's runtime ``ModelConfig.is_hybrid``
-property gates the hybrid KV-cache path on ``text_config.layer_types``,
-which ``config.py`` populates appropriately for transformer backbones.
+Backbone-specific behavior is selected at instantiation time.
 """
 
 _PKG = "nemo.collections.speechlm2.vllm.salm"
@@ -47,38 +44,3 @@ def register():
         "NeMoSpeechLMForConditionalGeneration",
         f"{_PKG}.model:NeMoSpeechLMForConditionalGeneration",
     )
-
-    _apply_backend_patches()
-
-
-def _apply_backend_patches():
-    """Apply runtime patches needed for vLLM compatibility.
-
-    Called at plugin registration time. All patches here must be
-    pickle-safe (no closures) since vLLM spawns EngineCore as a
-    subprocess.
-    """
-    try:
-        from transformers import AutoConfig as _AC
-
-        _nhc = _AC.from_pretrained(
-            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-            trust_remote_code=True,
-        )
-        NHConfigCls = type(_nhc)
-        _orig_getattr = getattr(NHConfigCls, "__getattr__", None)
-
-        def _patched_getattr(self, name):
-            if name == "rms_norm_eps":
-                return getattr(self, "layer_norm_epsilon", 1e-5)
-            if _orig_getattr:
-                return _orig_getattr(self, name)
-            raise AttributeError(name)
-
-        NHConfigCls.__getattr__ = _patched_getattr
-    except Exception:
-        # Best-effort: the patch only matters for NemotronH backbones. If the
-        # NemotronH config class can't be reached (network offline, model not
-        # cached, transformers signature changed), other backbones still load
-        # fine -- silently skip and let plugin registration succeed.
-        pass

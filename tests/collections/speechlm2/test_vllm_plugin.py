@@ -452,6 +452,20 @@ class TestPluginRegistration:
         register()
         assert "_orig_batch_encode_plus" not in PreTrainedTokenizerFast.__dict__
 
+    def test_register_does_not_load_backbone_config(self, monkeypatch):
+        from unittest.mock import Mock
+
+        from transformers import AutoConfig
+
+        from nemo.collections.speechlm2.vllm.salm import register
+
+        from_pretrained = Mock(side_effect=AssertionError("register() must not load remote backbone configs"))
+        monkeypatch.setattr(AutoConfig, "from_pretrained", from_pretrained)
+
+        register()
+
+        from_pretrained.assert_not_called()
+
 
 class _FakeTokenizer:
     def __init__(self):
