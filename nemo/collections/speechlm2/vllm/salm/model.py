@@ -112,8 +112,7 @@ class NeMoSpeechLMForConditionalGeneration(
     ) -> NeMoSpeechLMAudioInputs | None:
         if audio_signal is None:
             return None
-        # Must be emitted by _call_hf_processor alongside audio_signal;
-        # guessing from shape[-1] would count padding as real audio.
+
         if not isinstance(audio_signal_length, torch.Tensor):
             raise ValueError(
                 "audio_signal_length must be a torch.Tensor; got " f"{type(audio_signal_length).__name__}."
