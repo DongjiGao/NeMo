@@ -41,9 +41,7 @@ _AUDIO_PLACEHOLDER = "<|audio|>"
 
 # Number of extra embedding rows the SpeechLM adds on top of the backbone's
 # native vocab during training: ``<|audio|>`` locator plus headroom for other
-# special tokens and TensorCore-friendly alignment. Must match the actual
-# number of rows added at training time so ``model.safetensors`` loads
-# without a shape mismatch on the embedding matrix.
+# special tokens and TensorCore-friendly alignment.
 _SPEECHLM_EMBED_EXTRA_ROWS = 10
 
 
@@ -162,12 +160,9 @@ class NeMoSpeechLMConfig(PretrainedConfig):
                     raise ValueError("NemotronH config must define layer_norm_epsilon.")
                 self.text_config.rms_norm_eps = self.text_config.layer_norm_epsilon
         else:
-            # vLLM's runtime ``ModelConfig.is_hybrid`` property returns False if
-            # ``text_config.layer_types`` is non-empty and every layer is
-            # ``"attention"`` (the granite-4.0-micro escape hatch). This lets
-            # the single ``NeMoSpeechLMForConditionalGeneration`` class declare
-            # ``IsHybrid`` for the NemotronH path without forcing the hybrid
-            # KV-cache allocator on transformer backbones.
+            # All-attention ``layer_types`` makes vLLM's runtime
+            # ``ModelConfig.is_hybrid`` property return False for transformer
+            # backbones.
             num_layers = getattr(self.text_config, "num_hidden_layers", 0) or 0
             if num_layers > 0:
                 self.text_config.layer_types = ["attention"] * num_layers
