@@ -63,6 +63,7 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from nemo.collections.speechlm2.vllm.salm.config import _AUDIO_PLACEHOLDER
 
 _SAMPLING_RATE = 16000
+_AUDIO_CHANNELS = 1
 _MAX_AUDIO_DURATION_S = 40.0
 
 
@@ -118,6 +119,7 @@ class NeMoSpeechLMProcessingInfo(BaseProcessingInfo):
     def get_data_parser(self) -> MultiModalDataParser:
         return MultiModalDataParser(
             target_sr=_SAMPLING_RATE,
+            target_channels=_AUDIO_CHANNELS,
             expected_hidden_size=self._get_expected_hidden_size(),
         )
 

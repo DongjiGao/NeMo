@@ -292,6 +292,17 @@ class TestSpecialTokens:
 class TestAudioProcessing:
     """Tests for audio encoding with a tiny perception module."""
 
+    def test_data_parser_normalizes_audio(self, monkeypatch):
+        from nemo.collections.speechlm2.vllm.salm.audio import NeMoSpeechLMProcessingInfo
+
+        info = object.__new__(NeMoSpeechLMProcessingInfo)
+        monkeypatch.setattr(info, "_get_expected_hidden_size", lambda: 2048)
+
+        parser = info.get_data_parser()
+
+        assert parser.audio_resampler.target_sr == 16000
+        assert parser.target_channels == 1
+
     def test_call_hf_processor_requires_matching_placeholder_count(self):
         from nemo.collections.speechlm2.vllm.salm.audio import NeMoSpeechLMMultiModalProcessor
 
