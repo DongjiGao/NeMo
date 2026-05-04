@@ -41,7 +41,6 @@ import torch
 from torch import nn
 from transformers import BatchFeature, PreTrainedTokenizerBase
 from vllm.config.multimodal import BaseDummyOptions
-from vllm.model_executor.models.interfaces import MultiModalEmbeddings  # noqa: F401  (re-export typing)
 
 try:
     from vllm.inputs import MultiModalDataDict
