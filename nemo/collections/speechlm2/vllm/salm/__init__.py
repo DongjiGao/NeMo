@@ -19,7 +19,7 @@ Registers ``NeMoSpeechLMConfig`` and the single
 ``vllm.general_plugins`` entry point.
 
 A single model class covers every supported backbone family (standard
-transformer like Qwen3 / Parakeet-TDT, hybrid Mamba+MoE like NemotronH).
+decoder-only LLMs like Qwen3, hybrid Mamba+MoE like NemotronH).
 Backbone-specific behavior is selected at instantiation time.
 """
 

@@ -76,7 +76,7 @@ class _BaseBackend:
         raise NotImplementedError(f"{type(self).__name__} must implement nemo_to_hf_llm_weights")
 
 
-# ── Transformer backend (Qwen3, Parakeet-TDT, ...) ──────────────────
+# ── Transformer backend (Qwen3, etc.) ────────────────────────────────
 
 
 def _normalize_lora_name(name: str) -> tuple[str, str]:
@@ -147,7 +147,7 @@ def _merge_lora_weights(
 
 
 class TransformerBackend(_BaseBackend):
-    """Standard transformer backbones (e.g. Qwen3, Parakeet-TDT).
+    """Standard decoder-only LLM backbones (e.g. Qwen3).
 
     Includes inline LoRA merging for PEFT checkpoints; both PEFT-wrapped
     (``llm.base_model.model.model.``) and plain NeMo (``llm.model.``) name
