@@ -63,7 +63,7 @@ from nemo.collections.speechlm2.vllm.salm.config import _AUDIO_PLACEHOLDER
 
 _SAMPLING_RATE = 16000
 _AUDIO_CHANNELS = 1
-_MAX_AUDIO_DURATION_S = 40.0
+_DUMMY_AUDIO_DURATION_S = 40.0
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -124,12 +124,6 @@ class NeMoSpeechLMProcessingInfo(BaseProcessingInfo):
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": 1}
-
-    def get_max_audio_tokens(self) -> int:
-        return self._estimate_audio_tokens(self.get_max_audio_len())
-
-    def get_max_audio_len(self) -> int:
-        return int(_MAX_AUDIO_DURATION_S * _SAMPLING_RATE)
 
     @staticmethod
     def _estimate_audio_tokens(audio_length_samples: int) -> int:
@@ -262,9 +256,10 @@ class NeMoSpeechLMDummyInputsBuilder(
         mm_options: Mapping[str, BaseDummyOptions],
     ) -> MultiModalDataDict:
         num_audios = mm_counts.get("audio", 0)
+        dummy_audio_len = int(_DUMMY_AUDIO_DURATION_S * _SAMPLING_RATE)
         return {
             "audio": self._get_dummy_audios(
-                length=self.info.get_max_audio_len(),
+                length=dummy_audio_len,
                 num_audios=num_audios,
             )
         }

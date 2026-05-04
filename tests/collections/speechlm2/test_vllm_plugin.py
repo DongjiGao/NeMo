@@ -303,6 +303,28 @@ class TestAudioProcessing:
         assert parser.audio_resampler.target_sr == 16000
         assert parser.target_channels == 1
 
+    def test_processing_info_has_no_audio_duration_limit(self):
+        from nemo.collections.speechlm2.vllm.salm.audio import NeMoSpeechLMProcessingInfo
+
+        info = object.__new__(NeMoSpeechLMProcessingInfo)
+
+        assert not hasattr(info, "get_max_audio_len")
+        assert not hasattr(info, "get_max_audio_tokens")
+
+    def test_dummy_inputs_use_profiling_audio_length(self):
+        from nemo.collections.speechlm2.vllm.salm.audio import (
+            NeMoSpeechLMDummyInputsBuilder,
+            NeMoSpeechLMProcessingInfo,
+        )
+
+        info = object.__new__(NeMoSpeechLMProcessingInfo)
+        builder = object.__new__(NeMoSpeechLMDummyInputsBuilder)
+        builder.info = info
+
+        result = builder.get_dummy_mm_data(seq_len=0, mm_counts={"audio": 1}, mm_options={})
+
+        assert result["audio"][0].shape[-1] == 40 * 16000
+
     def test_call_hf_processor_requires_matching_placeholder_count(self):
         from nemo.collections.speechlm2.vllm.salm.audio import NeMoSpeechLMMultiModalProcessor
 
