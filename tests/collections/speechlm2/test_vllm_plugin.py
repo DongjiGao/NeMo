@@ -210,7 +210,7 @@ class TestNeMoSpeechLMConfig:
             _ = cfg.nonexistent_attribute_xyz
 
 
-@pytest.mark.skipif(not _HAS_CONFIG, reason="NeMoSpeechLMConfig not available")
+@pytest.mark.skipif(not (_HAS_CONFIG and _HAS_VLLM), reason="NeMoSpeechLMConfig or vLLM not available")
 class TestBackendSelection:
     """Tests for ``backends.make_backend`` dispatch on hybrid/transformer configs."""
 
