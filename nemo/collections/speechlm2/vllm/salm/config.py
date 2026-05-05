@@ -92,6 +92,13 @@ class NeMoSpeechLMConfig(PretrainedConfig):
             and all(value is None for value in required_fields.values())
         )
 
+        # Newer Transformers validates token ids in PretrainedConfig.__init__
+        # and may call get_text_config() before this subclass finishes
+        # initialization. Seed an inert text_config for that early base-class
+        # path; real checkpoint loads replace it below after field validation.
+        self.text_config = PretrainedConfig()
+        self.is_hybrid = False
+
         super().__init__(**kwargs)
 
         if is_default_init:
@@ -105,8 +112,6 @@ class NeMoSpeechLMConfig(PretrainedConfig):
             self.prompt_format = None
             self.pretrained_weights = None
             self.lora = None
-            self.text_config = PretrainedConfig()
-            self.is_hybrid = False
             return
 
         for name, value in required_fields.items():

@@ -81,6 +81,7 @@ class TestNeMoSpeechLMConfig:
         assert cfg.prompt_format is None
         assert cfg.pretrained_weights is None
         assert cfg.llm_architectures == []
+        assert cfg.get_text_config() is cfg.text_config
 
     def test_loads_text_config(self):
         """Config should load a text_config from the pretrained LLM."""
