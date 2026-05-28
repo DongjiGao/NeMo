@@ -55,6 +55,7 @@ from nemo.collections.speechlm2.vllm.salm.audio import (
     _SAMPLING_RATE,
     NeMoSpeechLMAudioInputs,
     NeMoSpeechLMDummyInputsBuilder,
+    NeMoSpeechLMEmbeddingInputs,
     NeMoSpeechLMMultiModalProcessor,
     NeMoSpeechLMProcessingInfo,
     _load_nemo_perception,
@@ -118,8 +119,13 @@ class NeMoSpeechLMForConditionalGeneration(
         self,
         audio_signal: torch.Tensor | list[torch.Tensor] | None = None,
         audio_signal_length: torch.Tensor | None = None,
+        audio_embeds: torch.Tensor | list[torch.Tensor] | None = None,
         **kwargs,
-    ) -> NeMoSpeechLMAudioInputs | None:
+    ) -> NeMoSpeechLMAudioInputs | NeMoSpeechLMEmbeddingInputs | None:
+        # Precomputed-embeddings path (streaming/per-chunk): skip the encoder.
+        if audio_embeds is not None:
+            return NeMoSpeechLMEmbeddingInputs(type="audio_embeds", audio_embeds=audio_embeds)
+
         if audio_signal is None:
             return None
 
@@ -138,7 +144,12 @@ class NeMoSpeechLMForConditionalGeneration(
             audio_signal_length=audio_signal_length,
         )
 
-    def _process_audio(self, audio_input: NeMoSpeechLMAudioInputs) -> tuple[torch.Tensor, ...]:
+    def _process_audio(self, audio_input) -> tuple[torch.Tensor, ...]:
+        # Precomputed embeddings (streaming/per-chunk): already encoder+proj
+        # output, return as-is so vLLM merges them at the audio placeholders.
+        if isinstance(audio_input, NeMoSpeechLMEmbeddingInputs):
+            return tuple(emb.to(_PERCEPTION_DTYPE) for emb in audio_input.audio_embeds)
+
         # Real device placement happens at init via _mark_tower_model +
         # get_mm_mapping; this .to() is a no-op guard kept for paranoia.
         device = next(self.perception.parameters()).device

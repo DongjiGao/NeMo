@@ -172,6 +172,23 @@ class NeMoSpeechLMAudioInputs(TensorSchema):
     audio_signal_length: Annotated[torch.Tensor, TensorShape("b")]
 
 
+class NeMoSpeechLMEmbeddingInputs(TensorSchema):
+    """Precomputed audio embeddings that bypass the perception encoder.
+
+    Used by the streaming/per-chunk path: the caller runs the perception
+    encoder once over the full utterance (training-identical single forward)
+    and feeds the already-projected per-chunk embeddings, so vLLM never
+    re-encodes raw audio per chunk. Each item is a 2D ``(num_frames, hidden)``
+    tensor whose hidden size must equal the LLM hidden size.
+    """
+
+    type: Literal["audio_embeds"] = "audio_embeds"
+    audio_embeds: Annotated[
+        list[torch.Tensor],
+        TensorShape("bn", "naf", "hs", dynamic_dims={"naf"}),
+    ]
+
+
 class NeMoSpeechLMProcessingInfo(BaseProcessingInfo):
 
     def get_data_parser(self) -> MultiModalDataParser:
@@ -182,6 +199,8 @@ class NeMoSpeechLMProcessingInfo(BaseProcessingInfo):
         )
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        # None = unbounded: the streaming/per-chunk path supplies one audio item
+        # per chunk turn, so a single prompt may carry many audio items.
         return {"audio": None}
 
     def _get_encoder_chunk_size_seconds(self) -> float | None:
@@ -296,6 +315,7 @@ class NeMoSpeechLMMultiModalProcessor(
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
         return dict(
+            audio_embeds=MultiModalFieldConfig.batched("audio"),
             audio_signal=MultiModalFieldConfig.batched("audio"),
             audio_signal_length=MultiModalFieldConfig.batched("audio"),
         )
@@ -315,12 +335,18 @@ class NeMoSpeechLMMultiModalProcessor(
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> list[PromptUpdate]:
-        audios = mm_items.get_items("audio", AudioProcessorItems)
+        out_mm_data = out_mm_kwargs.get_data()
+        audio_embeds = out_mm_data.get("audio_embeds")
         chunk_size_seconds = self.info._get_encoder_chunk_size_seconds()
 
         def get_replacement(item_idx: int):
-            audio = audios.get(item_idx)
-            n_tokens = self.info._estimate_audio_tokens(audio.shape[-1], chunk_size_seconds)
+            if audio_embeds is not None:
+                # Precomputed embeddings: one placeholder per embedding frame.
+                n_tokens = audio_embeds[item_idx].shape[0]
+            else:
+                audios = mm_items.get_items("audio", AudioProcessorItems)
+                audio = audios.get(item_idx)
+                n_tokens = self.info._estimate_audio_tokens(audio.shape[-1], chunk_size_seconds)
             repl_full = _AUDIO_PLACEHOLDER * n_tokens
             return PromptUpdateDetails.select_text(repl_full, _AUDIO_PLACEHOLDER)
 
