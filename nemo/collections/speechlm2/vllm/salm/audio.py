@@ -81,11 +81,19 @@ _MIN_CHUNK_SIZE_SAMPLES = 320
 
 
 def _ensure_special_tokens(tokenizer: PreTrainedTokenizerBase) -> None:
+    # Memoize: ``get_vocab()`` materializes the full (~150K-entry) vocab dict,
+    # which costs ~3ms. The multimodal processor calls this on EVERY streaming
+    # chunk, so without this guard it dominates the frontend (profiled at
+    # 380ms / 119 chunks -- larger than the GPU compute). The placeholder only
+    # needs to be registered once per tokenizer instance.
+    if getattr(tokenizer, "_salm_special_tokens_ensured", False):
+        return
     special = [_AUDIO_PLACEHOLDER]
     existing = set(tokenizer.get_vocab().keys())
     to_add = [t for t in special if t not in existing]
     if to_add:
         tokenizer.add_special_tokens({"additional_special_tokens": to_add})
+    tokenizer._salm_special_tokens_ensured = True
 
 
 def _load_nemo_perception(perception_cfg: dict) -> nn.Module:
