@@ -21,6 +21,11 @@ Registers ``NeMoSpeechLMConfig`` and the single
 A single model class covers every supported backbone family (standard
 decoder-only LLMs like Qwen3, hybrid Mamba+MoE like NemotronH).
 Backbone-specific behavior is selected at instantiation time.
+
+``register()`` additionally installs the StreamingSTT session-retention
+scheduler patch (see ``streaming_scheduler``); because ``register()`` is the
+``vllm.general_plugins`` entry point it runs in every vLLM process, including
+the EngineCore process that owns the scheduler.
 """
 
 _PKG = "nemo.collections.speechlm2.vllm.salm"
@@ -44,3 +49,11 @@ def register():
         "NeMoSpeechLMForConditionalGeneration",
         f"{_PKG}.model:NeMoSpeechLMForConditionalGeneration",
     )
+
+    # Install the StreamingSTT session-retention scheduler patch. Runs in every
+    # vLLM process (including EngineCore) because ``register()`` is the
+    # ``vllm.general_plugins`` entry point. Idempotent, version-guarded, and a
+    # no-op for requests that do not opt in via ``extra_args``.
+    from nemo.collections.speechlm2.vllm.salm.streaming_scheduler import install_streaming_session_patch
+
+    install_streaming_session_patch()
