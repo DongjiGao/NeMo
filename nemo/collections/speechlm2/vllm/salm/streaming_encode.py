@@ -46,12 +46,32 @@ from nemo.utils import logging
 DEFAULT_FRAME_LENGTH_S = 0.08
 DEFAULT_SAMPLE_RATE = 16000
 
+# FastConformer keeps its relative-position attention biases as plain tensor
+# attributes (not nn.Parameter / registered buffers), so ``Module.to(device)``
+# skips them. They are listed here so the encoder can be relocated faithfully;
+# extend this if a different encoder holds other plain device-resident tensors.
+_PLAIN_DEVICE_TENSOR_ATTRS = ("pos_bias_u", "pos_bias_v")
+
 
 def _move_perception_plain_tensors(perception: nn.Module, device: torch.device) -> None:
-    """Move non-Parameter tensors (e.g. relative-position biases) onto ``device``."""
+    """Relocate the encoder's plain (non-Parameter) tensors onto ``device``.
+
+    ``nn.Module.to(device)`` only moves registered Parameters and buffers, but
+    FastConformer keeps its relative-position attention biases
+    (:data:`_PLAIN_DEVICE_TENSOR_ATTRS`) as plain tensor attributes. Those are
+    silently left on their original device and later trigger a device mismatch
+    inside attention. This walks every submodule and moves any such attribute to
+    ``device``, matching the module's floating dtype when the tensor is floating
+    point (integer tensors keep their dtype).
+
+    Args:
+        perception: The ``AudioPerceptionModule`` to fix up, already moved to
+            ``device`` via ``.to(device)`` (which handles its Parameters/buffers).
+        device: Target device for the plain tensors.
+    """
     dtype = next(perception.parameters()).dtype
     for module in perception.modules():
-        for name in ("pos_bias_u", "pos_bias_v"):
+        for name in _PLAIN_DEVICE_TENSOR_ATTRS:
             value = getattr(module, name, None)
             if isinstance(value, torch.Tensor) and not isinstance(value, nn.Parameter):
                 kwargs: dict = {"device": device}
@@ -90,7 +110,7 @@ def load_streaming_perception(
 
     with open(os.path.join(model_dir, "config.json")) as f:
         perception_cfg = json.load(f)["perception"]
-    perception = AudioPerceptionModule(DictConfig(dict(perception_cfg))).to(dtype)
+    perception = AudioPerceptionModule(DictConfig(perception_cfg)).to(dtype)
 
     weights: dict[str, torch.Tensor] = {}
     with safe_open(os.path.join(model_dir, "model.safetensors"), "pt", device="cpu") as f:
@@ -108,8 +128,12 @@ def _resolve_pre_encode_cache_size(perception: nn.Module) -> int:
     """Return the encoder's pre-encode cache size (scalar), handling list configs."""
     pre_cache = perception.encoder.streaming_cfg.pre_encode_cache_size
     if isinstance(pre_cache, (list, tuple)):
-        # Cache-aware configs express [left, right]; the right (current-chunk)
-        # context sizes the feature buffer.
+        # NeMo may store two pre-encode cache sizes (first-chunk padding
+        # variants of the same left cache, NOT left/right attention context).
+        # Index [1] is the steady-state size used for every chunk after the
+        # first; NeMo's own cache-aware CTC/RNNT pipelines also size the feature
+        # buffer with [1]. ([0] is only the first chunk when
+        # pad_and_drop_preencoded is False.)
         pre_cache = pre_cache[1]
     return int(pre_cache)
 
@@ -161,9 +185,9 @@ def stream_encode(
         return []
 
     chunk_samples = math.ceil(chunk_size * frame_length_s * sample_rate)
-    prep_cfg = DictConfig(dict(preprocessor_cfg))
+    preprocessor_cfg = DictConfig(preprocessor_cfg)
     pre_cache = _resolve_pre_encode_cache_size(perception)
-    buf_secs = pre_cache * float(prep_cfg.window_stride) + chunk_size * frame_length_s
+    buf_secs = pre_cache * float(preprocessor_cfg.window_stride) + chunk_size * frame_length_s
     emb_dtype = next(perception.parameters()).dtype
 
     # Build the feature bufferer once and reuse across batches via reset_slots:
@@ -175,18 +199,23 @@ def stream_encode(
         sample_rate=sample_rate,
         buffer_size_in_secs=buf_secs,
         chunk_size_in_secs=buf_secs,
-        preprocessor_cfg=prep_cfg,
+        preprocessor_cfg=preprocessor_cfg,
         device=device,
     )
 
     def _encode_batch(batch: list[torch.Tensor]) -> list[list[torch.Tensor]]:
         batch_size = len(batch)
         sample_lens = [int(w.shape[-1]) for w in batch]
-        max_len = max(sample_lens)
-        # Transfer raw audio to GPU then pad+stack on GPU; CPU pad+stack is the
-        # encode bottleneck, not the streaming algorithm itself.
-        audios = torch.stack([F.pad(w.to(device, non_blocking=True), (0, max_len - w.shape[-1])) for w in batch])
         num_chunks = [max(1, math.ceil(n / chunk_samples)) for n in sample_lens]
+        max_num_chunks = max(num_chunks)
+        # Pad each waveform up to a whole number of chunks, so every per-chunk slice
+        # is exactly chunk_samples wide -- the trailing zero-pad is what the last
+        # partial chunk (and any chunk past an utterance's end) needs anyway. Pad +
+        # stack on GPU; CPU pad+stack is the encode bottleneck, not the algorithm.
+        audios = torch.stack(
+            [F.pad(w.to(device, non_blocking=True), (0, max_num_chunks * chunk_samples - w.shape[-1])) for w in batch]
+        )
+        sample_lens_t = torch.tensor(sample_lens, device=device)
 
         feature_bufferer.reset_slots(list(range(batch_size)))  # fresh per-slot buffer state
         cache_last_channel, cache_last_time, cache_last_channel_len = perception.encoder.get_initial_cache_state(
@@ -194,22 +223,13 @@ def stream_encode(
         )
 
         chunk_stack = []  # per chunk index: (batch, chunk_size, hidden) on GPU
-        for chunk_idx in range(max(num_chunks)):
-            frame_samples, frame_valid_lens = [], []
-            for b in range(batch_size):
-                start = chunk_idx * chunk_samples
-                end = min(start + chunk_samples, sample_lens[b])
-                if start >= sample_lens[b]:
-                    frame_samples.append(torch.zeros(chunk_samples, device=device, dtype=audios.dtype))
-                    frame_valid_lens.append(0)
-                else:
-                    w = audios[b, start:end]
-                    if w.shape[0] < chunk_samples:
-                        w = F.pad(w, (0, chunk_samples - w.shape[0]))
-                    frame_samples.append(w)
-                    frame_valid_lens.append(end - start)
-            stacked = torch.stack(frame_samples)
-            frames = [Frame(samples=stacked[b], length=frame_valid_lens[b], stream_id=b) for b in range(batch_size)]
+        for chunk_idx in range(max_num_chunks):
+            start = chunk_idx * chunk_samples
+            # Whole-chunk slice for the entire batch at once; valid_lens marks how many
+            # of those samples are real (the rest is the trailing zero-pad).
+            stacked = audios[:, start : start + chunk_samples]
+            valid_lens = (sample_lens_t - start).clamp(0, chunk_samples)
+            frames = [Frame(samples=stacked[b], length=int(valid_lens[b]), stream_id=b) for b in range(batch_size)]
 
             feats, right_paddings = feature_bufferer.update(frames)
             processed_signal = torch.stack(feats).to(emb_dtype)
