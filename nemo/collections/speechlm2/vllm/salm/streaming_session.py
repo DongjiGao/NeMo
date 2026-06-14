@@ -81,6 +81,21 @@ class StreamingMarkers:
             has_blank=bool(data.get("has_blank", True)),
         )
 
+    @classmethod
+    def from_config(cls, hf_config: Any) -> "StreamingMarkers":
+        """Build markers from a model's HF config ``streaming_markers`` field.
+
+        Lets a checkpoint be self-describing (no external markers file). Raises if
+        the config does not carry ``streaming_markers``.
+        """
+        data = getattr(hf_config, "streaming_markers", None)
+        if not data:
+            raise ValueError(
+                "Model config has no 'streaming_markers'; export the checkpoint with "
+                "streaming markers or pass an explicit markers dict via from_dict()."
+            )
+        return cls.from_dict(data)
+
 
 class StreamingSTTSession:
     """Decode StreamingSTT utterances over vLLM resumable streaming sessions.
@@ -131,9 +146,7 @@ class StreamingSTTSession:
             output_kind=RequestOutputKind.DELTA,
             extra_args=extra_args,
         )
-        self._base_sp = SamplingParams(
-            temperature=0.0, max_tokens=max_tokens, output_kind=RequestOutputKind.DELTA
-        )
+        self._base_sp = SamplingParams(temperature=0.0, max_tokens=max_tokens, output_kind=RequestOutputKind.DELTA)
 
     def _chunk_wrapper(self, chunk_index: int) -> list[int]:
         """Per-chunk turn token IDs: (system on chunk 0) + user header + audio + asst header."""

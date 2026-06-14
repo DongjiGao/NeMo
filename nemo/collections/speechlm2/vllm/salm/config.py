@@ -77,6 +77,7 @@ class NeMoSpeechLMConfig(PretrainedConfig):
         pretrained_weights: bool | None = None,
         lora: dict | None = None,
         encoder_chunk_size_seconds: float | None = None,
+        streaming_markers: dict | None = None,
         **kwargs,
     ):
         required_fields = {
@@ -90,6 +91,7 @@ class NeMoSpeechLMConfig(PretrainedConfig):
             perception is None
             and lora is None
             and encoder_chunk_size_seconds is None
+            and streaming_markers is None
             and not kwargs
             and all(value is None for value in required_fields.values())
         )
@@ -115,6 +117,7 @@ class NeMoSpeechLMConfig(PretrainedConfig):
             self.pretrained_weights = None
             self.lora = None
             self.encoder_chunk_size_seconds = None
+            self.streaming_markers = None
             return
 
         for name, value in required_fields.items():
@@ -141,6 +144,10 @@ class NeMoSpeechLMConfig(PretrainedConfig):
         self.pretrained_weights = pretrained_weights
         self.lora = lora
         self.encoder_chunk_size_seconds = encoder_chunk_size_seconds
+        # Optional StreamingSTT turn-template / stop-token markers so the streaming
+        # client is self-describing instead of needing an external markers file.
+        # None for non-streaming checkpoints.
+        self.streaming_markers = streaming_markers
 
         self.text_config = AutoConfig.from_pretrained(pretrained_llm, trust_remote_code=True)
 
@@ -219,6 +226,7 @@ class NeMoSpeechLMConfig(PretrainedConfig):
             "lora",
             "is_hybrid",
             "encoder_chunk_size_seconds",
+            "streaming_markers",
         ):
             raise AttributeError(name)
         alias = self._ATTR_ALIASES.get(name, name) if self.is_hybrid else name
