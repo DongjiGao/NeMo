@@ -144,7 +144,9 @@ class NeMoSpeechLMForConditionalGeneration(
             audio_signal_length=audio_signal_length,
         )
 
-    def _process_audio(self, audio_input) -> tuple[torch.Tensor, ...]:
+    def _process_audio(
+        self, audio_input: NeMoSpeechLMAudioInputs | NeMoSpeechLMEmbeddingInputs
+    ) -> tuple[torch.Tensor, ...]:
         # Precomputed embeddings (streaming/per-chunk): already encoder+proj
         # output, return as-is so vLLM merges them at the audio placeholders.
         if isinstance(audio_input, NeMoSpeechLMEmbeddingInputs):
