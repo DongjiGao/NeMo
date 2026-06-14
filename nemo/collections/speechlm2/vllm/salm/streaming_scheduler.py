@@ -72,8 +72,7 @@ def install_streaming_session_patch() -> None:
         from vllm.v1.core.sched.scheduler import Scheduler
     except Exception as e:  # pragma: no cover - defensive against vLLM layout changes
         logging.warning(
-            "StreamingSTT: could not import vLLM Scheduler (%s); session-retention "
-            "patch not installed.",
+            "StreamingSTT: could not import vLLM Scheduler (%s); session-retention " "patch not installed.",
             e,
         )
         return
@@ -136,9 +135,7 @@ def install_streaming_session_patch() -> None:
         if update.mm_features:
             base = session.num_tokens
             for mm_feature in update.mm_features:
-                mm_feature.mm_position = replace(
-                    mm_feature.mm_position, offset=mm_feature.mm_position.offset + base
-                )
+                mm_feature.mm_position = replace(mm_feature.mm_position, offset=mm_feature.mm_position.offset + base)
             session.mm_features.extend(update.mm_features)
 
         session._all_token_ids.extend(update.prompt_token_ids or ())

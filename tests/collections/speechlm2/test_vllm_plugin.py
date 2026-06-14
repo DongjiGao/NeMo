@@ -83,6 +83,17 @@ class TestNeMoSpeechLMConfig:
         assert cfg.llm_architectures == []
         assert cfg.get_text_config() is cfg.text_config
 
+    def test_streaming_markers_default_none(self):
+        """streaming_markers is optional and defaults to None for non-streaming checkpoints."""
+        assert NeMoSpeechLMConfig().streaming_markers is None
+        assert NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS).streaming_markers is None
+
+    def test_streaming_markers_round_trip(self):
+        """A streaming checkpoint may carry its turn-template markers in the config."""
+        markers = {"chunk_size": 14, "blank_token_id": 151669, "eos_id": 151645}
+        cfg = NeMoSpeechLMConfig(**{**_DEFAULT_CONFIG_KWARGS, "streaming_markers": markers})
+        assert cfg.streaming_markers == markers
+
     def test_loads_text_config(self):
         """Config should load a text_config from the pretrained LLM."""
         cfg = NeMoSpeechLMConfig(**_DEFAULT_CONFIG_KWARGS)
@@ -288,6 +299,9 @@ class TestSpecialTokens:
         from nemo.collections.speechlm2.vllm.salm.audio import _ensure_special_tokens
 
         tokenizer = MagicMock()
+        # MagicMock auto-creates attributes as truthy; set the memoization
+        # sentinel explicitly so the once-per-tokenizer guard does not short-circuit.
+        tokenizer._salm_special_tokens_ensured = False
         tokenizer.get_vocab.return_value = {}
         _ensure_special_tokens(tokenizer)
         tokenizer.add_special_tokens.assert_called_once()
@@ -298,9 +312,24 @@ class TestSpecialTokens:
         from nemo.collections.speechlm2.vllm.salm.audio import _ensure_special_tokens
 
         tokenizer = MagicMock()
+        tokenizer._salm_special_tokens_ensured = False
         tokenizer.get_vocab.return_value = {"<|audio|>": 99}
         _ensure_special_tokens(tokenizer)
         tokenizer.add_special_tokens.assert_not_called()
+
+    def test_memoizes_after_first_call(self):
+        """The once-per-tokenizer guard avoids re-materializing the vocab each chunk."""
+        from unittest.mock import MagicMock
+
+        from nemo.collections.speechlm2.vllm.salm.audio import _ensure_special_tokens
+
+        tokenizer = MagicMock()
+        tokenizer._salm_special_tokens_ensured = False
+        tokenizer.get_vocab.return_value = {}
+        _ensure_special_tokens(tokenizer)
+        _ensure_special_tokens(tokenizer)
+        tokenizer.add_special_tokens.assert_called_once()
+        assert tokenizer.get_vocab.call_count == 1
 
     def test_placeholder_str(self):
         from nemo.collections.speechlm2.vllm.salm.model import NeMoSpeechLMForConditionalGeneration
@@ -603,3 +632,64 @@ class _FakeTokenizer:
 
     def encode(self, prompt, add_special_tokens=True):
         return list(range(max(1, len(prompt.split()))))
+
+
+class TestStreamingMarkers:
+    """Tests for StreamingMarkers (no vLLM / GPU required)."""
+
+    _MARKERS = {
+        "chunk_size": 14,
+        "user_header_ids": [151644, 872, 198],
+        "uf_ah_ids": [151645, 198, 151644, 77091, 198],
+        "asst_footer_ids": [151645, 198],
+        "blank_token_id": 151669,
+        "eos_id": 151645,
+        "has_blank": True,
+        "audio_id": 151670,
+        "system_prompt": "Transcribe the audio into text.",
+    }
+
+    def test_from_dict(self):
+        from nemo.collections.speechlm2.vllm.salm.streaming_session import StreamingMarkers
+
+        m = StreamingMarkers.from_dict(self._MARKERS)
+        assert m.chunk_size == 14
+        assert m.blank_token_id == 151669
+        assert m.eos_id == 151645
+        assert m.audio_id == 151670
+        assert m.asst_footer_ids == [151645, 198]
+        assert m.user_header_ids == [151644, 872, 198]
+
+    def test_from_config(self):
+        from nemo.collections.speechlm2.vllm.salm.streaming_session import StreamingMarkers
+
+        m = StreamingMarkers.from_config(SimpleNamespace(streaming_markers=self._MARKERS))
+        assert m.chunk_size == 14
+        assert m.blank_token_id == 151669
+
+    def test_from_config_missing_raises(self):
+        from nemo.collections.speechlm2.vllm.salm.streaming_session import StreamingMarkers
+
+        with pytest.raises(ValueError, match="streaming_markers"):
+            StreamingMarkers.from_config(SimpleNamespace(streaming_markers=None))
+
+
+class TestStreamingSchedulerPatch:
+    """Tests for the StreamingSTT session-retention scheduler patch."""
+
+    def test_retain_flag_constant(self):
+        from nemo.collections.speechlm2.vllm.salm import streaming_scheduler as ss
+
+        assert ss.RETAIN_FLAG == "streaming_stt_retain_until_blank"
+
+    @pytest.mark.skipif(not _HAS_VLLM, reason="vLLM not installed")
+    def test_install_is_idempotent(self):
+        from vllm.v1.core.sched.scheduler import Scheduler
+
+        from nemo.collections.speechlm2.vllm.salm.streaming_scheduler import install_streaming_session_patch
+
+        install_streaming_session_patch()
+        assert getattr(Scheduler, "_nemo_streaming_stt_patched", False) is True
+        patched = Scheduler._update_request_as_session
+        install_streaming_session_patch()  # second call must be a no-op
+        assert Scheduler._update_request_as_session is patched
