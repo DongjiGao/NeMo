@@ -33,10 +33,15 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from nemo.utils import logging
-
-# extra_args key consumed by the scheduler patch (see streaming_scheduler.py).
-_RETAIN_FLAG = "streaming_stt_retain_until_blank"
+# The opt-in extra_args contract keys are owned by the scheduler patch; import
+# them so the producer (this file) and the consumer (streaming_scheduler) share
+# one source of truth and cannot silently drift.
+from nemo.collections.speechlm2.vllm.salm.streaming_scheduler import (
+    BLANK_ID_KEY,
+    EOS_ID_KEY,
+    FOOTER_IDS_KEY,
+    RETAIN_FLAG,
+)
 
 
 @dataclass
@@ -134,10 +139,10 @@ class StreamingSTTSession:
         self.audio_ph = [markers.audio_id]
 
         extra_args = {
-            _RETAIN_FLAG: True,
-            "streaming_stt_blank_id": markers.blank_token_id,
-            "streaming_stt_eos_id": markers.eos_id,
-            "streaming_stt_footer_ids": list(markers.asst_footer_ids),
+            RETAIN_FLAG: True,
+            BLANK_ID_KEY: markers.blank_token_id,
+            EOS_ID_KEY: markers.eos_id,
+            FOOTER_IDS_KEY: list(markers.asst_footer_ids),
         }
         self._chunk_sp = SamplingParams(
             temperature=0.0,
