@@ -43,17 +43,17 @@ This is an interim mechanism; the upstream-friendly form is an opt-in
 
 from typing import Any
 
+from nemo.collections.speechlm2.vllm.salm.streaming_constants import (
+    BLANK_ID_KEY,
+    EOS_ID_KEY,
+    FOOTER_IDS_KEY,
+    RETAIN_FLAG,
+)
 from nemo.utils import logging
 
 # Sentinel attribute set on the patched class so repeated ``register()`` calls
 # (front-end + EngineCore + workers) install the patch at most once per process.
 _PATCH_FLAG = "_nemo_streaming_stt_patched"
-
-# extra_args keys that form the opt-in StreamingSTT retention contract.
-RETAIN_FLAG = "streaming_stt_retain_until_blank"
-BLANK_ID_KEY = "streaming_stt_blank_id"
-EOS_ID_KEY = "streaming_stt_eos_id"
-FOOTER_IDS_KEY = "streaming_stt_footer_ids"
 
 
 def install_streaming_session_patch() -> None:
@@ -124,11 +124,15 @@ def install_streaming_session_patch() -> None:
                 kept.append(blank_id)
         kept_output_tokens = kept + footer_ids
 
+        # Everything below mirrors vLLM's own _update_request_as_session tail (only
+        # the kept-token policy above is NeMo-specific); keep in sync if that
+        # upstream method changes.
         # kept_output_tokens may include tokens without KV (blank/footer); fold
         # them into the next chunk's prefill by resetting to the prompt prefix.
         session._all_token_ids[:] = session._all_token_ids[: session.num_prompt_tokens]
         session._output_token_ids.clear()
-        assert session.prompt_token_ids is not None
+        if session.prompt_token_ids is None:
+            raise RuntimeError("StreamingSTT: streaming session has no prompt_token_ids to extend.")
         session.prompt_token_ids.extend(kept_output_tokens)
         session._all_token_ids.extend(kept_output_tokens)
 

@@ -33,10 +33,9 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-# The opt-in extra_args contract keys are owned by the scheduler patch; import
-# them so the producer (this file) and the consumer (streaming_scheduler) share
-# one source of truth and cannot silently drift.
-from nemo.collections.speechlm2.vllm.salm.streaming_scheduler import (
+# The opt-in extra_args contract keys live in a shared, dependency-free module so
+# the producer (this file) and the consumer (streaming_scheduler) cannot drift.
+from nemo.collections.speechlm2.vllm.salm.streaming_constants import (
     BLANK_ID_KEY,
     EOS_ID_KEY,
     FOOTER_IDS_KEY,

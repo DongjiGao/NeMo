@@ -678,9 +678,9 @@ class TestStreamingSchedulerPatch:
     """Tests for the StreamingSTT session-retention scheduler patch."""
 
     def test_retain_flag_constant(self):
-        from nemo.collections.speechlm2.vllm.salm import streaming_scheduler as ss
+        from nemo.collections.speechlm2.vllm.salm.streaming_constants import RETAIN_FLAG
 
-        assert ss.RETAIN_FLAG == "streaming_stt_retain_until_blank"
+        assert RETAIN_FLAG == "streaming_stt_retain_until_blank"
 
     @pytest.mark.skipif(not _HAS_VLLM, reason="vLLM not installed")
     def test_install_is_idempotent(self):
