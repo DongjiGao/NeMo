@@ -151,7 +151,6 @@ class StreamingSTTSession:
             output_kind=RequestOutputKind.DELTA,
             extra_args=extra_args,
         )
-        self._base_sp = SamplingParams(temperature=0.0, max_tokens=max_tokens, output_kind=RequestOutputKind.DELTA)
 
     def _chunk_wrapper(self, chunk_index: int) -> list[int]:
         """Per-chunk turn token IDs: (system on chunk 0) + user header + audio + asst header."""
@@ -186,7 +185,7 @@ class StreamingSTTSession:
 
             per_chunk: list[list[int]] = []
             cur: list[int] = []
-            async for out in self.engine.generate(gen_throttled(), self._base_sp, request_id=request_id):
+            async for out in self.engine.generate(gen_throttled(), self._chunk_sp, request_id=request_id):
                 d = out.outputs[0]
                 cur.extend(list(d.token_ids))
                 if d.finish_reason is not None or (cur and cur[-1] in (blank_id, eos_id)):
@@ -204,7 +203,7 @@ class StreamingSTTSession:
                 yield _stream_input(i)
 
         flat: list[int] = []
-        async for out in self.engine.generate(gen_throughput(), self._base_sp, request_id=request_id):
+        async for out in self.engine.generate(gen_throughput(), self._chunk_sp, request_id=request_id):
             flat.extend(list(out.outputs[0].token_ids))
             if out.finished:
                 break
