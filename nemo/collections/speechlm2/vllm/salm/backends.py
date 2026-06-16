@@ -265,6 +265,7 @@ class HybridBackend(_BaseBackend):
                         tensor[i].t(),
                     )
             elif hf_name in (
+                "backbone.embeddings.weight",
                 "backbone.embed_tokens.weight",
                 "lm_head.weight",
             ):
