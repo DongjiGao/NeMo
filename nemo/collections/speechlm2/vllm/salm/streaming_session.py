@@ -137,16 +137,24 @@ class StreamingSTTSession:
         # instead double-expands and corrupts the audio context.
         self.audio_ph = [markers.audio_id]
 
+        # For noblank checkpoints (``has_blank=False``) ``blank_token_id`` is the
+        # ``-1`` sentinel -- a comparison marker, never a real vocab id. Only feed
+        # it as a stop token / KV filler when the checkpoint has a real blank
+        # token; otherwise chunks segment on EOS alone. Feeding ``-1`` would index
+        # the embedding table at -1 and trip a CUDA gather out-of-bounds assert.
         extra_args = {
             RETAIN_FLAG: True,
-            BLANK_ID_KEY: markers.blank_token_id,
             EOS_ID_KEY: markers.eos_id,
             FOOTER_IDS_KEY: list(markers.asst_footer_ids),
         }
+        stop_token_ids = [markers.eos_id]
+        if markers.has_blank:
+            extra_args[BLANK_ID_KEY] = markers.blank_token_id
+            stop_token_ids = [markers.blank_token_id, markers.eos_id]
         self._chunk_sp = SamplingParams(
             temperature=0.0,
             max_tokens=max_tokens,
-            stop_token_ids=[markers.blank_token_id, markers.eos_id],
+            stop_token_ids=stop_token_ids,
             output_kind=RequestOutputKind.DELTA,
             extra_args=extra_args,
         )

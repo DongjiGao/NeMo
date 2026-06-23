@@ -119,8 +119,11 @@ def install_streaming_session_patch() -> None:
             kept = full_generated  # already ends on blank
         else:
             # max_tokens / other stop: append a blank like NeMo's filler.
+            # Guard ``>= 0``: noblank checkpoints carry ``blank_id == -1`` (a
+            # sentinel, not a real vocab id); appending it would index the
+            # embedding table at -1 and trip a CUDA gather out-of-bounds assert.
             kept = full_generated
-            if blank_id is not None:
+            if blank_id is not None and blank_id >= 0:
                 kept.append(blank_id)
         kept_output_tokens = kept + footer_ids
 
