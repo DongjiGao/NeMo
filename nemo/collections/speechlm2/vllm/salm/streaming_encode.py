@@ -148,6 +148,7 @@ def stream_encode(
     encode_batch_size: int = 64,
     frame_length_s: float = DEFAULT_FRAME_LENGTH_S,
     sample_rate: int = DEFAULT_SAMPLE_RATE,
+    flush_chunks: int = 0,
 ) -> list[list[torch.Tensor]]:
     """Cache-aware streaming encode of waveforms into per-chunk embeddings.
 
@@ -171,6 +172,11 @@ def stream_encode(
             pass. Utterances are sorted by length to minimize padding waste.
         frame_length_s: Seconds of audio per encoder output frame.
         sample_rate: Audio sample rate in Hz.
+        flush_chunks: Extra trailing all-silence chunks appended per utterance.
+            Streaming models with an emission delay (e.g. ``delay3``) surface a
+            chunk's text a few chunks later, so the final words of short utterances
+            are otherwise never emitted; the extra silent chunks flush them
+            (0 = off).
 
     Returns:
         One ``list[Tensor(chunk_size, hidden)]`` per input utterance, aligned to
@@ -206,7 +212,9 @@ def stream_encode(
     def _encode_batch(batch: list[torch.Tensor]) -> list[list[torch.Tensor]]:
         batch_size = len(batch)
         sample_lens = [int(w.shape[-1]) for w in batch]
-        num_chunks = [max(1, math.ceil(n / chunk_samples)) for n in sample_lens]
+        # +flush_chunks trailing all-silence chunks per utterance so an
+        # emission-delayed model can flush a short utterance's final words.
+        num_chunks = [max(1, math.ceil(n / chunk_samples)) + flush_chunks for n in sample_lens]
         max_num_chunks = max(num_chunks)
         # Pad each waveform up to a whole number of chunks, so every per-chunk slice
         # is exactly chunk_samples wide -- the trailing zero-pad is what the last

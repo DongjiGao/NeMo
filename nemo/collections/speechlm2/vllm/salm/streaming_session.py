@@ -217,21 +217,25 @@ class StreamingSTTSession:
         return flat
 
     def decode(self, token_ids: list[int]) -> str:
-        """Decode generated token IDs to text by splitting on the blank token.
+        """Decode generated token IDs to text, splitting on the chunk separator.
 
-        Mirrors NeMo ``decode_with_blank``: the blank token separates segments
-        (decoded independently to preserve BPE within a turn), EOS is dropped, and
-        segments are joined with single spaces.
+        Mirrors NeMo ``decode_with_blank``: the segment separator is the blank
+        token for has_blank checkpoints, else EOS for noblank ones. Each segment
+        is decoded independently (to preserve BPE within a turn) and the segments
+        are joined with single spaces -- so per-chunk outputs are space-joined,
+        not BPE-merged into one run. For has_blank, EOS is the turn-end and is
+        dropped (not a boundary); for noblank, EOS *is* the boundary.
         """
-        blank_id, eos_id = self.markers.blank_token_id, self.markers.eos_id
+        eos_id = self.markers.eos_id
+        sep_id = self.markers.blank_token_id if self.markers.has_blank else eos_id
         segments: list[str] = []
         current: list[int] = []
         for t in token_ids:
-            if t == blank_id:
+            if t == sep_id:
                 if current:
                     segments.append(self.tokenizer.decode(current, skip_special_tokens=True))
                     current = []
-            elif t == eos_id:
+            elif self.markers.has_blank and t == eos_id:
                 continue
             else:
                 current.append(t)
