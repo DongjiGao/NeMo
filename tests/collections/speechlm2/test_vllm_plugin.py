@@ -15,10 +15,12 @@
 """Unit tests for the vLLM NeMo Speech LM (SALM) plugin.
 
 Covers plugin registration, config loading + escape-hatch wiring, special
-token handling, and backend selection -- without requiring GPU or model
+token handling, backend selection, and StreamingSTT session decoding
+(including SOU/EOU turn boundaries) -- without requiring GPU or model
 weights.
 """
 
+import asyncio
 import importlib.util
 from types import SimpleNamespace
 
@@ -672,6 +674,301 @@ class TestStreamingMarkers:
 
         with pytest.raises(ValueError, match="streaming_markers"):
             StreamingMarkers.from_config(SimpleNamespace(streaming_markers=None))
+
+
+class _FakeSamplingParams:
+    """Stand-in for ``vllm.SamplingParams`` (records the session's decode config)."""
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _FakeStreamingEngine:
+    """Async engine double replaying a canned list of DELTA token groups."""
+
+    def __init__(self, deltas):
+        self.deltas = deltas
+        self.stream_inputs = []
+        self.abort_calls = []
+        self.reset_calls = 0
+
+    async def generate(self, inputs, sampling_params, request_id):
+        async for stream_input in inputs:
+            self.stream_inputs.append(stream_input)
+        for index, token_ids in enumerate(self.deltas):
+            yield SimpleNamespace(
+                outputs=[SimpleNamespace(token_ids=token_ids, finish_reason=None)],
+                finished=index == len(self.deltas) - 1,
+            )
+
+    async def abort(self, request_id):
+        """Awaitable abort -- the session must also accept a synchronous one."""
+        self.abort_calls.append(request_id)
+
+    def reset_mm_cache(self):
+        """Synchronous reset -- the session must also accept an awaitable one."""
+        self.reset_calls += 1
+
+
+class _FakeStreamingTokenizer:
+    def apply_chat_template(self, *args, **kwargs):
+        return [11, 12]
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        words = {42: " hello ", 43: "world"}
+        return "".join(words.get(token_id, f"token-{token_id}") for token_id in token_ids)
+
+
+_LEGACY_STREAMING_MARKERS = {
+    "chunk_size": 14,
+    "blank_token_id": 100,
+    "eos_id": 101,
+    "audio_id": 102,
+    "asst_footer_ids": [101],
+    "user_header_ids": [20],
+    "uf_ah_ids": [21],
+    "has_blank": True,
+}
+
+_TTM_STREAMING_MARKERS = {
+    "chunk_size": 2,
+    "blank_token_id": 100,
+    "eos_id": 101,
+    "audio_id": 102,
+    "sou_id": 103,
+    "eou_id": 104,
+    "asst_footer_ids": [101],
+    "user_header_ids": [],
+    "uf_ah_ids": [105],
+    "has_blank": True,
+    "frame_length_seconds": 0.08,
+}
+
+
+class TestStreamingBoundaryMarkers:
+    """SOU/EOU marker parsing and validation (no vLLM / GPU required)."""
+
+    def test_legacy_markers_have_no_boundaries(self):
+        from nemo.collections.speechlm2.vllm.salm.streaming_session import StreamingMarkers
+
+        m = StreamingMarkers.from_dict(_LEGACY_STREAMING_MARKERS)
+        assert m.has_boundaries is False
+        assert m.sou_id is None
+        assert m.eou_id is None
+
+    def test_flat_boundary_pair_is_parsed(self):
+        from nemo.collections.speechlm2.vllm.salm.streaming_session import StreamingMarkers
+
+        m = StreamingMarkers.from_dict(_TTM_STREAMING_MARKERS)
+        assert m.has_boundaries is True
+        assert (m.sou_id, m.eou_id) == (103, 104)
+        assert m.frame_length_seconds == 0.08
+
+    def test_nested_boundary_pair_is_parsed(self):
+        from nemo.collections.speechlm2.vllm.salm.streaming_session import StreamingMarkers
+
+        markers = {k: v for k, v in _TTM_STREAMING_MARKERS.items() if k not in ("sou_id", "eou_id")}
+        markers["boundary_markers"] = {"sou_id": 103, "eou_id": 104}
+
+        m = StreamingMarkers.from_dict(markers)
+        assert m.has_boundaries is True
+        assert (m.sou_id, m.eou_id) == (103, 104)
+
+    def test_partial_boundary_pair_is_rejected(self):
+        from nemo.collections.speechlm2.vllm.salm.streaming_session import StreamingMarkers
+
+        with pytest.raises(ValueError, match="both be set"):
+            StreamingMarkers.from_dict({**_TTM_STREAMING_MARKERS, "eou_id": None})
+
+    def test_colliding_boundary_ids_are_rejected(self):
+        from nemo.collections.speechlm2.vllm.salm.streaming_session import StreamingMarkers
+
+        with pytest.raises(ValueError, match="distinct"):
+            StreamingMarkers.from_dict({**_TTM_STREAMING_MARKERS, "eou_id": 101})
+
+    def test_noblank_sentinel_does_not_collide(self):
+        """``blank_token_id=-1`` is a sentinel for noblank checkpoints, not a vocab id."""
+        from nemo.collections.speechlm2.vllm.salm.streaming_session import StreamingMarkers
+
+        m = StreamingMarkers.from_dict({**_TTM_STREAMING_MARKERS, "blank_token_id": -1, "has_blank": False})
+        assert m.has_boundaries is True
+
+    def test_non_positive_frame_length_is_rejected(self):
+        from nemo.collections.speechlm2.vllm.salm.streaming_session import StreamingMarkers
+
+        with pytest.raises(ValueError, match="frame_length_seconds"):
+            StreamingMarkers.from_dict({**_TTM_STREAMING_MARKERS, "frame_length_seconds": 0.0})
+
+
+class TestStreamingSTTSessionBoundaries:
+    """Turn-boundary (TTM) session behavior against a fake vLLM engine.
+
+    The session only touches a handful of vLLM symbols, all imported lazily, so
+    the tests install minimal fakes instead of requiring a vLLM install.
+    """
+
+    @pytest.fixture
+    def streaming_session(self, monkeypatch):
+        import sys
+        from types import ModuleType
+
+        # Import the module (and its package) against the real environment first,
+        # so the fakes below only stand in for the lazily imported call sites.
+        from nemo.collections.speechlm2.vllm.salm import streaming_session as module
+
+        def fake_module(name: str, **attrs) -> ModuleType:
+            mod = ModuleType(name)
+            for attr, value in attrs.items():
+                setattr(mod, attr, value)
+            monkeypatch.setitem(sys.modules, name, mod)
+            return mod
+
+        fake_module("vllm", SamplingParams=_FakeSamplingParams)
+        fake_module("vllm.sampling_params", RequestOutputKind=SimpleNamespace(DELTA="DELTA"))
+        engine_module = fake_module("vllm.engine")
+        engine_module.protocol = fake_module(
+            "vllm.engine.protocol", StreamingInput=lambda **kwargs: SimpleNamespace(**kwargs)
+        )
+        fake_module("vllm.inputs", TokensPrompt=lambda **kwargs: SimpleNamespace(**kwargs))
+        return module
+
+    def _session(self, module, markers_dict, *, deltas, **kwargs):
+        """Build a session over a fake engine replaying ``deltas``."""
+        engine = _FakeStreamingEngine(deltas)
+        session = module.StreamingSTTSession(
+            engine,
+            _FakeStreamingTokenizer(),
+            module.StreamingMarkers.from_dict(markers_dict),
+            **kwargs,
+        )
+        return session, engine
+
+    def test_legacy_checkpoint_skips_boundary_cleanup(self, streaming_session):
+        session, engine = self._session(streaming_session, _LEGACY_STREAMING_MARKERS, deltas=[[42, 100]])
+
+        result = asyncio.run(session.transcribe_with_events([object()], "legacy-request"))
+
+        assert result.text == "hello"
+        assert result.token_ids == [42, 100]
+        assert result.boundary_events == []
+        assert result.ended_by_eou is False
+        assert result.request_aborted is False
+        assert result.mm_cache_reset is False
+        assert engine.abort_calls == []
+        assert engine.reset_calls == 0
+        # Legacy stop-token behavior is unchanged: blank + EOS, nothing else.
+        assert session._chunk_sp.stop_token_ids == [100, 101]
+
+    def test_transcribe_stays_transcript_only(self, streaming_session):
+        """``transcribe()`` keeps its ``str`` return type on both paths."""
+        legacy, _ = self._session(streaming_session, _LEGACY_STREAMING_MARKERS, deltas=[[42, 100]])
+        ttm, _ = self._session(streaming_session, _TTM_STREAMING_MARKERS, deltas=[[103, 42, 104]])
+
+        assert asyncio.run(legacy.transcribe([object()], "legacy")) == "hello"
+        assert asyncio.run(ttm.transcribe([object()], "ttm")) == "hello"
+
+    def test_transcribe_many_returns_strings_on_both_paths(self, streaming_session):
+        legacy, _ = self._session(streaming_session, _LEGACY_STREAMING_MARKERS, deltas=[[42, 100]])
+        ttm, ttm_engine = self._session(streaming_session, _TTM_STREAMING_MARKERS, deltas=[[103, 42, 104]])
+
+        assert asyncio.run(legacy.transcribe_many([[object()], [object()]])) == ["hello", "hello"]
+        assert asyncio.run(ttm.transcribe_many([[object()], [object()]])) == ["hello", "hello"]
+        assert ttm_engine.reset_calls == 1
+
+    def test_eou_is_retained_observed_and_closes_request(self, streaming_session):
+        session, engine = self._session(streaming_session, _TTM_STREAMING_MARKERS, deltas=[[103, 42, 104, 43]])
+        callbacks = []
+
+        async def on_boundary(event):
+            callbacks.append(event)
+
+        result = asyncio.run(session.transcribe_with_events([object()], "ttm-request", on_boundary=on_boundary))
+
+        assert result.text == "hello"
+        # The EOU token is kept; tokens after it in the same DELTA are dropped.
+        assert result.token_ids == [103, 42, 104]
+        assert [event.boundary_type for event in result.boundary_events] == ["sou", "eou"]
+        assert [event.token_index for event in result.boundary_events] == [0, 2]
+        assert callbacks == result.boundary_events
+        assert result.boundary_events[-1].chunk_end_audio_seconds == pytest.approx(0.16)
+        assert result.ended_by_eou is True
+        assert result.request_aborted is True
+        assert result.mm_cache_reset is True
+        assert engine.abort_calls == ["ttm-request"]
+        assert engine.reset_calls == 1
+        # EOU must stay visible to the consumer, so it is never a vLLM stop token.
+        assert 104 not in session._chunk_sp.stop_token_ids
+
+    def test_sync_boundary_callback_is_supported(self, streaming_session):
+        session, _ = self._session(streaming_session, _TTM_STREAMING_MARKERS, deltas=[[103, 104]])
+        callbacks = []
+
+        result = asyncio.run(session.transcribe_with_events([object()], "sync-callback", on_boundary=callbacks.append))
+
+        assert callbacks == result.boundary_events
+
+    def test_eou_cache_reset_can_be_disabled(self, streaming_session):
+        session, engine = self._session(
+            streaming_session, _TTM_STREAMING_MARKERS, deltas=[[104]], reset_mm_cache_on_eou=False
+        )
+
+        result = asyncio.run(session.transcribe_with_events([object()], "no-reset"))
+
+        assert result.ended_by_eou is True
+        assert result.request_aborted is True
+        assert result.mm_cache_reset is False
+        assert engine.abort_calls == ["no-reset"]
+        assert engine.reset_calls == 0
+
+    def test_observe_only_mode_continues_after_eou(self, streaming_session):
+        session, engine = self._session(
+            streaming_session, _TTM_STREAMING_MARKERS, deltas=[[103, 42, 104, 43, 101]], close_on_eou=False
+        )
+
+        result = asyncio.run(session.transcribe_with_events([object()], "observe-only"))
+
+        assert result.text == "hello world"
+        assert result.token_ids == [103, 42, 104, 43, 101]
+        assert [event.boundary_type for event in result.boundary_events] == ["sou", "eou"]
+        assert result.ended_by_eou is False
+        assert result.request_aborted is False
+        assert result.mm_cache_reset is False
+        assert engine.abort_calls == []
+        assert engine.reset_calls == 0
+
+    def test_coalesced_deltas_keep_boundary_chunk_times(self, streaming_session):
+        """One DELTA may carry several chunks' stop tokens; timestamps must follow them."""
+        session, _ = self._session(streaming_session, _TTM_STREAMING_MARKERS, deltas=[[100, 100, 103, 101, 100, 104]])
+
+        result = asyncio.run(session.transcribe_with_events([object()] * 5, "coalesced"))
+
+        assert [event.chunk_index for event in result.boundary_events] == [2, 4]
+        assert [event.chunk_end_audio_seconds for event in result.boundary_events] == [
+            pytest.approx(0.48),
+            pytest.approx(0.8),
+        ]
+
+    def test_concurrent_batch_defers_single_cache_reset(self, streaming_session):
+        session, engine = self._session(streaming_session, _TTM_STREAMING_MARKERS, deltas=[[103, 104]])
+
+        results = asyncio.run(
+            session.transcribe_many_with_events([[object()], [object()]], tag="batch", concurrency=2)
+        )
+
+        assert sorted(engine.abort_calls) == ["batch_0", "batch_1"]
+        # One engine-global reset for the whole batch, after every session ended.
+        assert engine.reset_calls == 1
+        assert all(result.ended_by_eou for result in results)
+        assert all(result.mm_cache_reset for result in results)
+
+    def test_concurrent_batch_without_eou_does_not_reset(self, streaming_session):
+        session, engine = self._session(streaming_session, _TTM_STREAMING_MARKERS, deltas=[[103, 42, 100]])
+
+        results = asyncio.run(session.transcribe_many_with_events([[object()], [object()]], tag="batch"))
+
+        assert engine.abort_calls == []
+        assert engine.reset_calls == 0
+        assert not any(result.ended_by_eou for result in results)
 
 
 class TestStreamingSchedulerPatch:
