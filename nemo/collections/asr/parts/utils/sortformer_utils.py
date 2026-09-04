@@ -61,6 +61,32 @@ def configure_output_subsampling_factor(
     return output_subsampling_factor
 
 
+def configure_streaming_mode(
+    diar_model: "SortformerEncLabelModel",
+    streaming_mode: Optional[bool],
+) -> bool:
+    """
+    Apply an inference-time streaming-mode override and return the effective mode.
+
+    Args:
+        diar_model (SortformerEncLabelModel): Model whose streaming mode is configured.
+        streaming_mode (Optional[bool]): Requested streaming mode. If ``None``, the mode restored from the
+            checkpoint is retained.
+
+    Returns:
+        effective_streaming_mode (bool): Applied streaming mode.
+    """
+    if streaming_mode is not None:
+        if type(streaming_mode) is not bool:
+            raise ValueError(f"streaming_mode must be a boolean or None, got {streaming_mode}")
+        diar_model.streaming_mode = streaming_mode
+        with open_dict(diar_model._cfg):
+            diar_model._cfg.streaming_mode = streaming_mode
+    effective_streaming_mode = bool(diar_model.streaming_mode)
+    logging.info(f"Running inference with streaming_mode={effective_streaming_mode}")
+    return effective_streaming_mode
+
+
 class InferenceProfiler:
     """Measure inference wall time and streaming-step components without including evaluation."""
 
@@ -75,22 +101,46 @@ class InferenceProfiler:
         "downsample_preds",
     )
 
-    def __init__(self, model: "SortformerEncLabelModel"):
+    def __init__(self, model: "SortformerEncLabelModel", warmup_calls: int = 0):
         """
         Initialize inference profiling for a Sortformer model.
 
         Args:
             model (SortformerEncLabelModel): Model whose inference methods will be profiled.
+            warmup_calls (int): Number of leading model-forward calls excluded from the summary, for example to
+                drop compilation warmup. Defaults to 0, which measures every call.
         """
+        if type(warmup_calls) is not int or warmup_calls < 0:
+            raise ValueError(f"warmup_calls must be a non-negative integer, got {warmup_calls}")
         self.model = model
-        self.forward_time = 0.0
-        self.preprocessor_time = 0.0
-        self.forward_calls = 0
-        self.preprocessor_calls = 0
+        self.warmup_calls = warmup_calls
+        # Per-call durations are kept so that warmup exclusion is exact rather than an average-based estimate.
+        self.forward_times: List[float] = []
+        self.preprocessor_times: List[float] = []
         self.section_times: Dict[str, float] = {}
         self.section_calls: Dict[str, int] = {}
         self._cuda_events = {}
         self._installed = False
+
+    @property
+    def forward_time(self) -> float:
+        """Total measured model-forward time in seconds, including warmup calls."""
+        return sum(self.forward_times)
+
+    @property
+    def preprocessor_time(self) -> float:
+        """Total measured preprocessor time in seconds, including warmup calls."""
+        return sum(self.preprocessor_times)
+
+    @property
+    def forward_calls(self) -> int:
+        """Number of profiled model-forward calls."""
+        return len(self.forward_times)
+
+    @property
+    def preprocessor_calls(self) -> int:
+        """Number of profiled preprocessor calls."""
+        return len(self.preprocessor_times)
 
     def _synchronize(self):
         """Synchronize pending CUDA work before recording wall-clock time."""
@@ -187,8 +237,7 @@ class InferenceProfiler:
                 return original_process_signal(*args, **kwargs)
             finally:
                 self._synchronize()
-                self.preprocessor_time += time.perf_counter() - start
-                self.preprocessor_calls += 1
+                self.preprocessor_times.append(time.perf_counter() - start)
 
         def timed_forward(*args, **kwargs):
             self._synchronize()
@@ -197,45 +246,70 @@ class InferenceProfiler:
                 return original_forward(*args, **kwargs)
             finally:
                 self._synchronize()
-                self.forward_time += time.perf_counter() - start
-                self.forward_calls += 1
+                self.forward_times.append(time.perf_counter() - start)
                 self._flush_cuda_events()
 
         self.model.process_signal = timed_process_signal
         self.model.forward = timed_forward
 
-    def log_summary(self, audio_duration: float):
+    def log_summary(self, audio_duration: float, measured_audio_duration: Optional[float] = None):
         """
-        Log accumulated inference timing measurements.
+        Log accumulated inference timing measurements, excluding the configured warmup calls.
 
         Args:
             audio_duration (float): Duration of processed audio in seconds.
+            measured_audio_duration (Optional[float]): Duration of the audio covered by the measured (non-warmup)
+                model-forward calls, in seconds. If ``None``, ``audio_duration`` is used.
         """
         self._synchronize()
         self._flush_cuda_events()
-        if audio_duration <= 0 or self.forward_time <= 0:
+        if self.warmup_calls >= self.forward_calls > 0:
             logging.warning(
-                f"Cannot summarize inference profile with audio_duration={audio_duration} "
-                f"and forward_time={self.forward_time}."
+                f"Cannot summarize inference profile: warmup_calls={self.warmup_calls} excludes all "
+                f"{self.forward_calls} model-forward calls."
             )
             return
 
-        main_inference_time = max(0.0, self.forward_time - self.preprocessor_time)
-        preprocessor_percent = 100 * self.preprocessor_time / self.forward_time
-        main_inference_percent = 100 * main_inference_time / self.forward_time
+        forward_time = sum(self.forward_times[self.warmup_calls :])
+        preprocessor_time = sum(self.preprocessor_times[self.warmup_calls :])
+        measured_calls = max(0, self.forward_calls - self.warmup_calls)
+        summary_duration = audio_duration if measured_audio_duration is None else measured_audio_duration
+        if self.warmup_calls > 0 and measured_audio_duration is None:
+            logging.warning(
+                f"warmup_calls={self.warmup_calls} excludes leading model-forward calls, but no "
+                "measured_audio_duration was given, so the reported RTF covers the full manifest duration "
+                "while the measured time does not."
+            )
+        if summary_duration <= 0 or forward_time <= 0:
+            logging.warning(
+                f"Cannot summarize inference profile with audio_duration={summary_duration} "
+                f"and forward_time={forward_time}."
+            )
+            return
+
+        main_inference_time = max(0.0, forward_time - preprocessor_time)
+        preprocessor_percent = 100 * preprocessor_time / forward_time
+        main_inference_percent = 100 * main_inference_time / forward_time
+        warmup_suffix = f", warmup_calls={self.warmup_calls}" if self.warmup_calls > 0 else ""
         logging.info(
             "Inference profile: "
-            f"audio={audio_duration:.2f}s, model_forward={self.forward_time:.3f}s "
-            f"(RTF={self.forward_time / audio_duration:.6f}, {audio_duration / self.forward_time:.2f}x realtime), "
-            f"preprocessor={self.preprocessor_time:.3f}s ({preprocessor_percent:.2f}%, "
-            f"RTF={self.preprocessor_time / audio_duration:.6f}), "
+            f"audio={summary_duration:.2f}s, model_forward={forward_time:.3f}s "
+            f"(RTF={forward_time / summary_duration:.6f}, {summary_duration / forward_time:.2f}x realtime), "
+            f"preprocessor={preprocessor_time:.3f}s ({preprocessor_percent:.2f}%, "
+            f"RTF={preprocessor_time / summary_duration:.6f}), "
             f"main_inference={main_inference_time:.3f}s ({main_inference_percent:.2f}%, "
-            f"RTF={main_inference_time / audio_duration:.6f}), "
-            f"calls={self.forward_calls}"
+            f"RTF={main_inference_time / summary_duration:.6f}), "
+            f"calls={measured_calls}{warmup_suffix}"
         )
 
         streaming_step_time = self.section_times.get("streaming_step", 0.0)
         if streaming_step_time <= 0:
+            return
+        if self.warmup_calls > 0:
+            logging.info(
+                f"Streaming step profile is omitted because warmup_calls={self.warmup_calls}: section timings are "
+                "aggregated over all model-forward calls and cannot be warmup-excluded."
+            )
             return
 
         measured_step_time = sum(self.section_times.get(section, 0.0) for section in self._STREAMING_STEP_SECTIONS)

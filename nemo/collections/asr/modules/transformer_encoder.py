@@ -31,6 +31,22 @@ from nemo.collections.asr.parts.submodules.multi_head_attention import (
     RotaryPositionalEncoding,
 )
 from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking, StackingSubsampling
+from nemo.collections.asr.parts.utils.sortformer_fa4_attention import (
+    FA4_CUTE_BACKEND,
+    FLEX_BACKEND,
+    fa4_cute_attention,
+    prepare_fa4_seqused_k,
+    validate_attention_backend,
+    validate_fa4_cute_attention_config,
+    validate_fa4_cute_inference_mode,
+)
+from nemo.collections.asr.parts.utils.sortformer_fp8_flex_attention import (
+    FP8_FLEX_BACKEND,
+    fp8_flex_attention,
+    prepare_fp8_flex_valid_lengths,
+    validate_fp8_flex_attention_config,
+    validate_fp8_flex_inference_mode,
+)
 from nemo.core.classes.module import freeze, unfreeze
 from nemo.utils import logging
 from nemo.utils.decorators import experimental
@@ -88,6 +104,13 @@ class TransformerEncoderConfig:
             ``self_attention_model='rope'``.
         rotary_fraction: Fraction of the per-head dim to rotate. Only used when
             ``self_attention_model='rope'``.
+        attention_backend: Kernel used to evaluate attention. ``"flex"`` (default) is PyTorch
+            FlexAttention, which supports every mode of this encoder. ``"fa4_cute"`` is an opt-in
+            inference-only FlashAttention-4 path for dense BF16 attention on Blackwell GPUs; see
+            ``nemo/collections/asr/parts/utils/sortformer_fa4_attention.py``. ``"fp8_flex"`` is an
+            opt-in inference-only FP8 (``float8_e4m3fn``) FlexAttention path on the Triton backend,
+            keeping the same block mask and reaching it through a single custom operator; see
+            ``nemo/collections/asr/parts/utils/sortformer_fp8_flex_attention.py``.
     """
 
     feat_in: int = 128
@@ -106,6 +129,7 @@ class TransformerEncoderConfig:
     self_attention_model: str = "rel_pos"
     rope_base: float = 10000.0
     rotary_fraction: float = 1.0
+    attention_backend: str = "flex"
 
 
 def _make_padding_mod(lengths):
@@ -216,6 +240,7 @@ class MultiHeadAttention(nn.Module):
         self.head_dim = cfg.d_model // cfg.n_heads
         self.d_model = cfg.d_model
         self.self_attention_model = cfg.self_attention_model
+        self.attn_mode = cfg.attn_mode
         self._uses_rel_pos = self.self_attention_model == "rel_pos"
         self._uses_rope = self.self_attention_model == "rope"
         if self.self_attention_model not in _SUPPORTED_SELF_ATTENTION_MODELS:
@@ -257,6 +282,19 @@ class MultiHeadAttention(nn.Module):
             self.linear_pos = None
             self.pos_bias_u = None
             self.pos_bias_v = None
+
+        self.attention_backend = FLEX_BACKEND
+        self.set_attention_backend(cfg.attention_backend)
+
+    def set_attention_backend(self, backend: str) -> str:
+        """Select the attention kernel for this layer, validating it against the layer's configuration."""
+        backend = validate_attention_backend(backend)
+        if backend == FA4_CUTE_BACKEND:
+            validate_fa4_cute_attention_config(self.attn_mode, self.self_attention_model)
+        elif backend == FP8_FLEX_BACKEND:
+            validate_fp8_flex_attention_config(self.attn_mode, self.self_attention_model)
+        self.attention_backend = backend
+        return backend
 
     def _rel_shift(self, x):
         """Transformer-XL relative-position shift.
@@ -316,12 +354,33 @@ class MultiHeadAttention(nn.Module):
         # Matrix c: fold u @ K^T into FlexAttention by rewriting Q as (Q + u).
         return score_mod, q + bias_u
 
-    def forward(self, x, block_mask=None, pos_emb=None):
-        B, T, _ = x.shape
+    def forward(self, x, block_mask=None, pos_emb=None, seqused_k=None):
+        return self.forward_from_qkv(self.w_qkv(x), block_mask=block_mask, pos_emb=pos_emb, seqused_k=seqused_k)
+
+    def forward_from_qkv(self, qkv, block_mask=None, pos_emb=None, seqused_k=None):
+        """Attention body for an already-projected fused Q/K/V tensor.
+
+        Split out of :meth:`forward` so that a path which produces the fused projection itself can reuse
+        this body verbatim instead of duplicating the qk-norm / RoPE / backend logic — for example a
+        kernel that packs ``norm1`` straight into the ``w_qkv`` GEMM and hands the resulting projection
+        here.
+
+        Args:
+            qkv: ``(B, T, 3 * d_model)`` fused Q/K/V projection — exactly what ``self.w_qkv(x)`` returns.
+            block_mask: FlexAttention block mask, as in :meth:`forward`.
+            pos_emb: Relative positional embedding, as in :meth:`forward`.
+            seqused_k: Per-sample post-subsampling key lengths, as in :meth:`forward`. The ``fa4_cute``
+                backend consumes them directly as ``seqused_k``; the ``fp8_flex`` backend forwards them
+                alongside the block mask so its custom operator can rebuild the mask's key-padding
+                ``mask_mod`` from explicit tensor state. Unused by the default FlexAttention path.
+
+        Returns:
+            out: ``(B, T, d_model)`` attention output after the output projection.
+        """
+        B, T, _ = qkv.shape
         H, D = self.n_heads, self.head_dim
 
-        qkv = self.w_qkv(x).view(B, T, 3, H, D).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
+        q, k, v = qkv.view(B, T, 3, H, D).permute(2, 0, 3, 1, 4).unbind(0)
 
         if self.qk_norm:
             q = self.q_norm(q).to(v.dtype)
@@ -330,6 +389,32 @@ class MultiHeadAttention(nn.Module):
         if self._uses_rope:
             # RoPE rotates Q/K in place; it is orthogonal to FlexAttention's score_mod.
             q, k = self.rope(q, k)
+
+        if self.attention_backend == FA4_CUTE_BACKEND:
+            validate_fa4_cute_inference_mode(self.training)
+            if seqused_k is None:
+                raise ValueError(
+                    f"attention_backend='{FA4_CUTE_BACKEND}' requires per-sample key lengths; the encoder "
+                    "must pass seqused_k into every attention layer."
+                )
+            # FA4 consumes the native (B, T, H, D) layout, so Q/K/V are handed over as last-dimension
+            # contiguous views and the output reshapes to (B, T, d_model) without a transpose+copy.
+            out = fa4_cute_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), seqused_k)
+            return self.out_proj(out.view(B, T, self.d_model))
+
+        if self.attention_backend == FP8_FLEX_BACKEND:
+            validate_fp8_flex_inference_mode(self.training)
+            if seqused_k is None:
+                raise ValueError(
+                    f"attention_backend='{FP8_FLEX_BACKEND}' requires per-sample key lengths alongside the "
+                    "block mask; the encoder must pass seqused_k into every attention layer."
+                )
+            # Same (B, H, T, D) tensors and the same block mask as the default path; only the numeric format
+            # of the kernel changes, and the BF16 output feeds the unchanged layout conversion below. The
+            # mask is decomposed into tensors by the helper and rebuilt inside the custom operator, so this
+            # layer neither rebuilds it nor depends on its object identity.
+            out = fp8_flex_attention(q, k, v, block_mask, seqused_k)
+            return self.out_proj(out.transpose(1, 2).contiguous().view(B, T, self.d_model))
 
         score_mod = None
         if self._uses_rel_pos:
@@ -473,8 +558,8 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(cfg.d_model)
         self.ffn = FeedForward(cfg)
 
-    def forward(self, x, block_mask=None, pos_emb=None):
-        x = x + self.drop(self.attn(self.norm1(x), block_mask=block_mask, pos_emb=pos_emb))
+    def forward(self, x, block_mask=None, pos_emb=None, seqused_k=None):
+        x = x + self.drop(self.attn(self.norm1(x), block_mask=block_mask, pos_emb=pos_emb, seqused_k=seqused_k))
         x = x + self.drop(self.ffn(self.norm2(x)))
         return x
 
@@ -590,6 +675,16 @@ class TransformerEncoder(nn.Module):
             largely a no-op for activation magnitudes. Only meaningful when ``pre_block_norm=False``
             or when matching pretrained checkpoints that expect this scaling.
         attn_mode: Attention pattern — currently only "full" (bidirectional) is supported.
+        attention_backend: Attention kernel — ``"flex"`` (default), ``"fa4_cute"`` or ``"fp8_flex"``.
+            ``"fa4_cute"`` is an opt-in, inference-only FlashAttention-4 path for dense BF16 attention on
+            Blackwell GPUs. ``"fp8_flex"`` is an opt-in, inference-only FP8 (``float8_e4m3fn``)
+            FlexAttention path on the Triton backend, which keeps this encoder's exact key-padding block
+            mask and returns BF16; the attention kernel stays PyTorch FlexAttention, reached through a
+            custom operator that keeps it opaque to the outer compiler.
+            Both require ``attn_mode="full"`` and a ``self_attention_model`` without
+            a score modification, and fail closed rather than falling back to BF16 FlexAttention.
+            Checkpoint configs that predate this option simply keep the default. Can also be switched after
+            construction with :meth:`set_attention_backend`.
         sync_max_audio_length: When true, sync positional encoding allocation length across distributed ranks.
     """
 
@@ -615,6 +710,7 @@ class TransformerEncoder(nn.Module):
         pos_emb_max_len: int = 5000,
         xscaling: bool = False,
         attn_mode: str = "full",
+        attention_backend: str = FLEX_BACKEND,
         sync_max_audio_length: bool = True,
     ):
         super().__init__()
@@ -636,6 +732,11 @@ class TransformerEncoder(nn.Module):
             )
         if dropout_pre_encoder is None:
             dropout_pre_encoder = drop_rate
+        attention_backend = validate_attention_backend(attention_backend)
+        if attention_backend == FA4_CUTE_BACKEND:
+            validate_fa4_cute_attention_config(attn_mode, self_attention_model)
+        elif attention_backend == FP8_FLEX_BACKEND:
+            validate_fp8_flex_attention_config(attn_mode, self_attention_model)
 
         cfg = TransformerEncoderConfig(
             feat_in=feat_in,
@@ -652,6 +753,7 @@ class TransformerEncoder(nn.Module):
             self_attention_model=self_attention_model,
             rope_base=rope_base,
             rotary_fraction=rotary_fraction,
+            attention_backend=attention_backend,
         )
         self.d_model = d_model
         self.n_layers = n_layers
@@ -661,6 +763,7 @@ class TransformerEncoder(nn.Module):
         self.sync_max_audio_length = sync_max_audio_length
         self.self_attention_model = self_attention_model
         self.attn_mode = attn_mode
+        self.attention_backend = attention_backend
 
         if subsampling == 'feature_stacking':
             self.pre_encode = FeatureStacking(subsampling_factor, feat_in, d_model)
@@ -727,6 +830,29 @@ class TransformerEncoder(nn.Module):
             self.out_proj = None
 
         self.set_max_audio_length(self.pos_emb_max_len)
+
+    def set_attention_backend(self, backend: str) -> str:
+        """Select the attention kernel used by every layer of this encoder.
+
+        Intended to be called once, after the checkpoint is restored and before ``torch.compile``, so the
+        compiled graph already contains the selected path. Rejects backends this encoder's configuration
+        cannot serve instead of silently falling back.
+
+        Args:
+            backend: One of ``"flex"`` (default), ``"fa4_cute"`` or ``"fp8_flex"``.
+
+        Returns:
+            backend (str): The normalized backend now in effect.
+        """
+        backend = validate_attention_backend(backend)
+        if backend == FA4_CUTE_BACKEND:
+            validate_fa4_cute_attention_config(self.attn_mode, self.self_attention_model)
+        elif backend == FP8_FLEX_BACKEND:
+            validate_fp8_flex_attention_config(self.attn_mode, self.self_attention_model)
+        for layer in self.layers:
+            layer.attn.set_attention_backend(backend)
+        self.attention_backend = backend
+        return backend
 
     def forward(self, audio_signal, length, bypass_pre_encode=False):
         """
@@ -800,13 +926,27 @@ class TransformerEncoder(nn.Module):
         x = self.embed_norm(x)
 
         B, T, _ = x.shape
-        mask_mod = self._build_mask_mod(length)
-        block_mask = create_block_mask(mask_mod, B=B, H=1, Q_LEN=T, KV_LEN=T, device=x.device)
+        if self.attention_backend == FA4_CUTE_BACKEND:
+            # FA4 expresses the key-padding contract through per-sample key lengths, so no block mask is
+            # built at all. The int64 -> int32 conversion is done once here rather than once per layer.
+            block_mask, seqused_k = None, prepare_fa4_seqused_k(length, T)
+        else:
+            # ``_build_mask_mod`` is the overridable hook, so the alternate backends compose with whatever
+            # masking scheme a subclass injects (sliding window, chunked-limited) rather than only the
+            # causal/padding pair this encoder builds itself.
+            mask_mod = self._build_mask_mod(length)
+            block_mask = create_block_mask(mask_mod, B=B, H=1, Q_LEN=T, KV_LEN=T, device=x.device)
+            # The FP8 path rebuilds this very mask inside its custom operator from explicit tensor state, so
+            # it needs the same per-sample valid key counts. Converted once here rather than once per layer;
+            # every layer of the stack then receives the identical tensor.
+            seqused_k = (
+                prepare_fp8_flex_valid_lengths(length, T) if self.attention_backend == FP8_FLEX_BACKEND else None
+            )
         # For ``abs_pos`` the positional information is already baked into ``x``, so we don't
         # need to thread ``pos_emb`` through each layer; only ``rel_pos`` consumes it.
         layer_pos_emb = pos_emb if self.self_attention_model == "rel_pos" else None
         for layer in self.layers:
-            x = layer(x, block_mask=block_mask, pos_emb=layer_pos_emb)
+            x = layer(x, block_mask=block_mask, pos_emb=layer_pos_emb, seqused_k=seqused_k)
 
         x = self.final_norm(x)
         if self.out_proj is not None:
