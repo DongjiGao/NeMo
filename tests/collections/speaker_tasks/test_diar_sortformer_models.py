@@ -13,19 +13,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import math
-from types import SimpleNamespace
-from unittest.mock import patch
+from types import MethodType, SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import onnx
 import pytest
 import torch
-from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import DiarizationConfig, get_tensor_path
+from examples.speaker_tasks.diarization.neural_diarizer import e2e_diarize_speech
+from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import (
+    CUDA_GRAPH_COMPILE_MODE,
+    CUDA_GRAPH_LENGTH_BUFFERS_ATTRIBUTE,
+    CUDAGRAPHS_COMPILE_BACKEND,
+    FIXED_COMPILE_ENV_VAR,
+    FIXED_COMPILE_TIME_FRAMES_ENV_VAR,
+    INDUCTOR_COMPILE_BACKEND,
+    STREAMING_CUDA_GRAPH_STEP_BOUNDARY,
+    SUPPORTED_COMPILE_BACKENDS,
+    DiarizationConfig,
+    get_tensor_path,
+    install_cuda_graph_step_marker,
+    install_streaming_cuda_graph_boundary,
+    install_streaming_cuda_graph_length_stabilizer,
+    resolve_encoder_compile_kwargs,
+    resolve_streaming_cuda_graph_targets,
+    should_enable_exact_128_boundary_shim,
+    stabilize_encoder_max_audio_length,
+    validate_compile_backend,
+    validate_cuda_graph_config,
+    validate_fixed_shape_adapter_env,
+    validate_streaming_encoder_cuda_graph_config,
+)
 from omegaconf import DictConfig
 from onnx.reference import ReferenceEvaluator
 
 from nemo.collections.asr.models import SortformerEncLabelModel
+from nemo.collections.asr.models.sortformer_diar_models import COMPILED_FLEX_EXACT_128_BOUNDARY_WIDTH
 from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking
 from nemo.collections.asr.parts.utils.sortformer_utils import InferenceProfiler, configure_output_subsampling_factor
 
@@ -482,6 +507,98 @@ class TestSortformerEncLabelModelStreaming:
             )
 
         assert frontend_inputs == [torch.Size(expected_frontend_shape)]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        (
+            "batch_size, spkcache_len, fifo_len, chunk_len, signal_frames, step_signal_lengths, "
+            "expected_frontend_width, expected_valid_lengths"
+        ),
+        [(2, 5, 16, 6, 48, [(48, 48), (48, 24)], 27, [[6, 6], [12, 9]])],
+    )
+    def test_sync_streaming_can_pad_encoder_input_to_max_length(
+        self,
+        sortformer_model,
+        batch_size,
+        spkcache_len,
+        fifo_len,
+        chunk_len,
+        signal_frames,
+        step_signal_lengths,
+        expected_frontend_width,
+        expected_valid_lengths,
+    ):
+        sortformer_model.streaming_mode = True
+        sortformer_model.async_streaming = False
+        sortformer_model.async_pad_to_max = True
+        sortformer_model.sortformer_modules.spkcache_len = spkcache_len
+        sortformer_model.sortformer_modules.fifo_len = fifo_len
+        sortformer_model.sortformer_modules.chunk_len = chunk_len
+        sortformer_model.sortformer_modules.chunk_left_context = 0
+        sortformer_model.sortformer_modules.chunk_right_context = 0
+        sortformer_model.eval()
+
+        streaming_state = sortformer_model.sortformer_modules.init_streaming_state(
+            batch_size=batch_size, async_streaming=False
+        )
+        frontend_encoder = sortformer_model.frontend_encoder
+        call_pre_encode = sortformer_model._call_pre_encode
+        streaming_update = sortformer_model.sortformer_modules.streaming_update
+        pre_encoded = []
+        frontend_calls = []
+        sync_updates = []
+
+        def capture_pre_encode(*args, **kwargs):
+            chunk_embs, chunk_lengths = call_pre_encode(*args, **kwargs)
+            pre_encoded.append((chunk_embs, chunk_lengths))
+            return chunk_embs, chunk_lengths
+
+        def capture_frontend_input(*args, **kwargs):
+            frontend_calls.append((kwargs["processed_signal"], kwargs["processed_signal_length"]))
+            return frontend_encoder(*args, **kwargs)
+
+        def capture_streaming_update(**kwargs):
+            sync_updates.append(kwargs["chunk"].shape)
+            return streaming_update(**kwargs)
+
+        sortformer_model._call_pre_encode = capture_pre_encode
+        sortformer_model.frontend_encoder = capture_frontend_input
+        sortformer_model.sortformer_modules.streaming_update = capture_streaming_update
+        sortformer_model.sortformer_modules.streaming_update_async = MagicMock(
+            side_effect=AssertionError("synchronous streaming must not use the asynchronous update")
+        )
+
+        state_widths = []
+        for signal_lengths in step_signal_lengths:
+            state_widths.append((streaming_state.spkcache.shape[1], streaming_state.fifo.shape[1]))
+            fifo_before = streaming_state.fifo.clone()
+            with torch.no_grad():
+                streaming_state, _ = sortformer_model.forward_streaming_step(
+                    processed_signal=torch.randn(batch_size, signal_frames, sortformer_model.encoder._feat_in),
+                    processed_signal_length=torch.tensor(signal_lengths),
+                    streaming_state=streaming_state,
+                    total_preds=torch.zeros(batch_size, 0, sortformer_model._cfg.max_num_of_spks),
+                )
+            chunk_embs, chunk_lengths = pre_encoded[-1]
+            encoder_input, encoder_lengths = frontend_calls[-1]
+            spkcache_width, fifo_width = state_widths[-1]
+
+            assert encoder_input.shape[1] == expected_frontend_width
+            assert encoder_lengths.tolist() == expected_valid_lengths[len(state_widths) - 1]
+            for batch_index in range(batch_size):
+                valid_length = int(encoder_lengths[batch_index])
+                assert valid_length == spkcache_width + fifo_width + int(chunk_lengths[batch_index])
+                packed_fifo = encoder_input[batch_index, spkcache_width : spkcache_width + fifo_width]
+                assert torch.equal(packed_fifo, fifo_before[batch_index, :fifo_width])
+                packed_chunk = encoder_input[batch_index, spkcache_width + fifo_width : valid_length]
+                assert torch.equal(packed_chunk, chunk_embs[batch_index, : int(chunk_lengths[batch_index])])
+                assert torch.count_nonzero(encoder_input[batch_index, valid_length:]) == 0
+
+        assert len(sync_updates) == len(step_signal_lengths)
+        sortformer_model.sortformer_modules.streaming_update_async.assert_not_called()
+        # The cache/FIFO widths and the chunk valid widths change between steps, but the encoder shape does not.
+        assert state_widths[0] != state_widths[1]
+        assert {encoder_input.shape[1] for encoder_input, _ in frontend_calls} == {expected_frontend_width}
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
@@ -1175,3 +1292,1097 @@ class TestSortformerEncLabelModelHighResolution:
         assert call_kwargs["cfg_vad_params"] is diarize_config.postprocessing_params
         assert call_kwargs["unit_10ms_frame_count"] == expected_frame_count
         assert call_kwargs["bypass_postprocessing"] is False
+
+
+class RecordingForwardModel(torch.nn.Module):
+    """Minimal module that records how its forward method was called."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def forward(self, tensor, scale=1.0):
+        self.calls.append((tensor, scale))
+        return tensor * scale
+
+
+def _cuda_graph_config(**overrides) -> DiarizationConfig:
+    """Build a valid CUDA Graph configuration, optionally overriding individual fields."""
+    fields = {
+        "compile_cuda_graphs": True,
+        "compile_encoder": True,
+        "compile_dynamic": False,
+        "streaming_mode": False,
+        "compile_cuda_graph_max_audio_length": 90432,
+    }
+    fields.update(overrides)
+    return DiarizationConfig(**fields)
+
+
+class StubEncoder(torch.nn.Module):
+    """Minimal encoder stub that mimics the positional-state setter of the frontend encoder."""
+
+    def __init__(self, adopt_requested_length: bool = True):
+        super().__init__()
+        self.adopt_requested_length = adopt_requested_length
+        self.max_audio_length = 5000
+        self.set_calls = []
+
+    def set_max_audio_length(self, max_audio_length):
+        """Record the request and adopt it unless the stub is configured to ignore it."""
+        self.set_calls.append(max_audio_length)
+        if self.adopt_requested_length:
+            self.max_audio_length = max_audio_length
+
+
+class TestSortformerCudaGraphCompilation:
+    @pytest.fixture(autouse=True)
+    def _clear_fixed_shape_adapter_env(self, monkeypatch):
+        """Keep the fixed-shape adapter inactive unless a test enables it explicitly."""
+        monkeypatch.delenv(FIXED_COMPILE_ENV_VAR, raising=False)
+        monkeypatch.delenv(FIXED_COMPILE_TIME_FRAMES_ENV_VAR, raising=False)
+
+    @pytest.mark.unit
+    def test_cuda_graphs_are_disabled_by_default(self):
+        assert DiarizationConfig().compile_cuda_graphs is False
+        assert DiarizationConfig().compile_cuda_graph_max_audio_length is None
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("compile_dynamic", [True, False])
+    def test_disabled_cuda_graphs_keep_the_existing_compile_kwargs(self, compile_dynamic):
+        cfg = DiarizationConfig(compile_encoder=True, compile_dynamic=compile_dynamic)
+
+        assert resolve_encoder_compile_kwargs(cfg) == {"dynamic": compile_dynamic}
+
+    @pytest.mark.unit
+    def test_enabled_cuda_graphs_request_reduce_overhead_with_static_shapes(self):
+        assert resolve_encoder_compile_kwargs(_cuda_graph_config()) == {
+            "dynamic": False,
+            "mode": "reduce-overhead",
+        }
+        assert CUDA_GRAPH_COMPILE_MODE == "reduce-overhead"
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "overrides, device_type, error_match",
+        [
+            ({"compile_encoder": False}, "cuda", "requires compile_encoder=True"),
+            ({"compile_dynamic": True}, "cuda", "requires compile_dynamic=False"),
+            ({"streaming_mode": True}, "cuda", "streaming_mode must be set explicitly to False"),
+            ({"streaming_mode": None}, "cuda", "streaming_mode must be set explicitly to False"),
+            ({}, "cpu", "requires a CUDA device"),
+        ],
+    )
+    def test_invalid_cuda_graph_configurations_fail_closed(self, overrides, device_type, error_match):
+        with pytest.raises(ValueError, match=error_match):
+            validate_cuda_graph_config(_cuda_graph_config(**overrides), device_type)
+
+    @pytest.mark.unit
+    def test_cuda_graph_validation_requires_the_step_marker_api(self):
+        with patch.object(torch.compiler, "cudagraph_mark_step_begin", None, create=True):
+            with pytest.raises(RuntimeError, match="cudagraph_mark_step_begin"):
+                validate_cuda_graph_config(_cuda_graph_config(), "cuda")
+
+    @pytest.mark.unit
+    def test_valid_cuda_graph_configuration_is_accepted(self):
+        with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
+            validate_cuda_graph_config(_cuda_graph_config(), "cuda")
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("compile_encoder, compile_dynamic", [(False, True), (True, True)])
+    def test_disabled_cuda_graphs_skip_validation(self, compile_encoder, compile_dynamic):
+        cfg = DiarizationConfig(compile_encoder=compile_encoder, compile_dynamic=compile_dynamic)
+
+        validate_cuda_graph_config(cfg, "cpu")
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("scale", [2.0])
+    def test_step_marker_wraps_forward_without_changing_its_behaviour(self, scale):
+        model = RecordingForwardModel()
+        tensor = torch.ones(3)
+
+        with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True) as mark_step:
+            install_cuda_graph_step_marker(model)
+            direct = model.forward(tensor, scale=scale)
+            called = model(tensor, scale=scale)
+
+        assert mark_step.call_count == 2
+        assert model.forward.__name__ == "forward"
+        assert [recorded_scale for _, recorded_scale in model.calls] == [scale, scale]
+        assert all(recorded_tensor is tensor for recorded_tensor, _ in model.calls)
+        torch.testing.assert_close(direct, tensor * scale)
+        torch.testing.assert_close(called, tensor * scale)
+
+    @pytest.mark.unit
+    def test_repeated_step_marker_installation_does_not_double_mark(self):
+        model = RecordingForwardModel()
+
+        with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True) as mark_step:
+            first = install_cuda_graph_step_marker(model)
+            second = install_cuda_graph_step_marker(model)
+            model.forward(torch.ones(2))
+
+        assert first is second
+        assert mark_step.call_count == 1
+        assert len(model.calls) == 1
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("audio_shape, audio_lengths", [((2, 8000), (8000, 6000))])
+    def test_step_marker_survives_inference_profiler_installation(self, sortformer_model, audio_shape, audio_lengths):
+        sortformer_model.streaming_mode = False
+        sortformer_model.eval()
+        profiler = InferenceProfiler(sortformer_model)
+
+        with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True) as mark_step:
+            install_cuda_graph_step_marker(sortformer_model)
+            profiler.install()
+            with torch.no_grad():
+                sortformer_model.forward(torch.randn(audio_shape), torch.tensor(audio_lengths))
+
+        assert mark_step.call_count == 1
+        assert profiler.forward_calls == 1
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("max_audio_length", [None, 0, -1, True, 90432.0, "90432"])
+    def test_invalid_max_audio_length_fails_closed(self, max_audio_length):
+        cfg = _cuda_graph_config(compile_cuda_graph_max_audio_length=max_audio_length)
+
+        with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
+            with pytest.raises(ValueError, match="compile_cuda_graph_max_audio_length to be a positive integer"):
+                validate_cuda_graph_config(cfg, "cuda")
+
+    @pytest.mark.unit
+    def test_disabled_cuda_graphs_do_not_require_a_max_audio_length(self):
+        cfg = DiarizationConfig(compile_encoder=True, compile_dynamic=False, streaming_mode=False)
+
+        validate_cuda_graph_config(cfg, "cpu")
+
+    @pytest.mark.unit
+    def test_absent_fixed_shape_adapter_env_is_accepted(self):
+        validate_fixed_shape_adapter_env(90432)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("fixed_compile", ["1", "0", None])
+    def test_matching_fixed_shape_adapter_env_is_accepted(self, monkeypatch, fixed_compile):
+        if fixed_compile is not None:
+            monkeypatch.setenv(FIXED_COMPILE_ENV_VAR, fixed_compile)
+        monkeypatch.setenv(FIXED_COMPILE_TIME_FRAMES_ENV_VAR, " 90432 ")
+
+        validate_fixed_shape_adapter_env(90432)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("time_frames", [None, "", "abc", "90432.0", "0", "-5", "11304"])
+    def test_mismatched_or_malformed_fixed_shape_adapter_env_fails_closed(self, monkeypatch, time_frames):
+        monkeypatch.setenv(FIXED_COMPILE_ENV_VAR, "1")
+        if time_frames is not None:
+            monkeypatch.setenv(FIXED_COMPILE_TIME_FRAMES_ENV_VAR, time_frames)
+
+        with pytest.raises(ValueError, match=FIXED_COMPILE_TIME_FRAMES_ENV_VAR):
+            validate_fixed_shape_adapter_env(90432)
+
+    @pytest.mark.unit
+    def test_fixed_shape_adapter_env_is_checked_by_the_config_validation(self, monkeypatch):
+        monkeypatch.setenv(FIXED_COMPILE_ENV_VAR, "1")
+        monkeypatch.setenv(FIXED_COMPILE_TIME_FRAMES_ENV_VAR, "11304")
+
+        with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
+            with pytest.raises(ValueError, match=FIXED_COMPILE_TIME_FRAMES_ENV_VAR):
+                validate_cuda_graph_config(_cuda_graph_config(), "cuda")
+
+    @pytest.mark.unit
+    def test_encoder_max_audio_length_is_stabilized_once(self):
+        encoder = StubEncoder()
+
+        stabilize_encoder_max_audio_length(encoder, 90432)
+
+        assert encoder.set_calls == [90432]
+        assert encoder.max_audio_length == 90432
+
+    @pytest.mark.unit
+    def test_stabilization_requires_a_callable_setter(self):
+        with pytest.raises(RuntimeError, match="callable set_max_audio_length"):
+            stabilize_encoder_max_audio_length(RecordingForwardModel(), 90432)
+
+    @pytest.mark.unit
+    def test_stabilization_fails_closed_when_the_length_is_not_adopted(self):
+        encoder = StubEncoder(adopt_requested_length=False)
+
+        with pytest.raises(RuntimeError, match="could not stabilize the encoder maximum audio length"):
+            stabilize_encoder_max_audio_length(encoder, 90432)
+
+        assert encoder.set_calls == [90432]
+
+    @pytest.mark.unit
+    def test_stabilization_happens_before_the_outer_compile_calls(self):
+        encoder = StubEncoder()
+        events = []
+
+        def _record_set_max_audio_length(max_audio_length):
+            events.append(("set_max_audio_length", max_audio_length))
+            encoder.max_audio_length = max_audio_length
+
+        encoder.set_max_audio_length = _record_set_max_audio_length
+
+        def _fake_compile(module, **kwargs):
+            events.append(("compile", kwargs))
+            return module
+
+        cfg = _cuda_graph_config()
+        with patch.object(torch, "compile", side_effect=_fake_compile) as compile_mock:
+            stabilize_encoder_max_audio_length(encoder, cfg.compile_cuda_graph_max_audio_length)
+            torch.compile(encoder, **resolve_encoder_compile_kwargs(cfg))
+
+        assert compile_mock.call_count == 1
+        assert events == [
+            ("set_max_audio_length", 90432),
+            ("compile", {"dynamic": False, "mode": CUDA_GRAPH_COMPILE_MODE}),
+        ]
+
+
+def _streaming_model_with_capacities(
+    include_transformer_encoder=True,
+    spkcache_len=8,
+    fifo_len=18,
+    chunk_len=6,
+    chunk_left_context=1,
+    chunk_right_context=2,
+):
+    """Build a synchronous unpadded streaming model with explicit streaming capacities."""
+    model = _create_sortformer_model(include_transformer_encoder=include_transformer_encoder)
+    model.streaming_mode = True
+    model.async_streaming = False
+    model.async_pad_to_max = False
+    model.sortformer_modules.spkcache_len = spkcache_len
+    model.sortformer_modules.fifo_len = fifo_len
+    model.sortformer_modules.chunk_len = chunk_len
+    model.sortformer_modules.chunk_left_context = chunk_left_context
+    model.sortformer_modules.chunk_right_context = chunk_right_context
+    return model.eval()
+
+
+def _record_streaming_encoder_calls(model, audio_shape=(2, 16000), audio_lengths=(16000, 12000)):
+    """Run one streaming forward, recording the compiled encoder inputs and any mark_dynamic call, in order."""
+    events = []
+    encoder_forward = model.encoder.forward
+    transformer_encoder = model.transformer_encoder
+
+    def recording_encoder_forward(*args, **kwargs):
+        events.append(("encoder", kwargs["audio_signal"].shape[1]))
+        return encoder_forward(*args, **kwargs)
+
+    def recording_mark_dynamic(tensor, dim, **bounds):
+        events.append(("mark", tensor.shape[dim], dim, bounds))
+
+    model.encoder.forward = recording_encoder_forward
+    if transformer_encoder is not None:
+        transformer_forward = transformer_encoder.forward
+
+        def recording_transformer_forward(*args, **kwargs):
+            events.append(("transformer_encoder", kwargs["encoder_states"].shape[1]))
+            return transformer_forward(*args, **kwargs)
+
+        transformer_encoder.forward = recording_transformer_forward
+
+    with patch("torch._dynamo.mark_dynamic", side_effect=recording_mark_dynamic) as mark_dynamic:
+        with torch.no_grad():
+            model(torch.randn(audio_shape), torch.tensor(audio_lengths))
+    return events, mark_dynamic
+
+
+class TestSortformerNaturalDynamicSpecialization:
+    """Dynamic compiled streaming leaves shape specialization to PyTorch instead of declaring its own bounds."""
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("include_transformer_encoder", [True, False])
+    def test_synchronous_unpadded_streaming_marks_nothing_dynamic(self, include_transformer_encoder):
+        """No explicit bounds contract, so a natural ``T <= 127`` specialization cannot violate one."""
+        model = _streaming_model_with_capacities(include_transformer_encoder=include_transformer_encoder)
+
+        events, mark_dynamic = _record_streaming_encoder_calls(model)
+
+        assert mark_dynamic.call_count == 0
+        assert [event for event in events if event[0] == "mark"] == []
+        encoder_calls = [event for event in events if event[0] == "encoder"]
+        transformer_calls = [event for event in events if event[0] == "transformer_encoder"]
+        assert len(encoder_calls) > 1
+        assert len(transformer_calls) == (len(encoder_calls) if include_transformer_encoder else 0)
+
+    @pytest.mark.unit
+    def test_launcher_dynamic_compile_request_adds_no_bounds_machinery(self, sortformer_model):
+        """A ``compile_encoder``/``compile_dynamic`` run compiles with ``{'dynamic': True}`` and nothing else."""
+        cfg = DiarizationConfig(compile_encoder=True, compile_dynamic=True)
+
+        assert resolve_encoder_compile_kwargs(cfg) == {"dynamic": True}
+        assert not hasattr(sortformer_model, "compiled_encoder_time_bounds")
+        assert not hasattr(sortformer_model, "configure_compiled_encoder_time_bounds")
+        assert not hasattr(sortformer_model, "_mark_compiled_encoder_time_dynamic")
+        assert "mark_dynamic" not in inspect.getsource(e2e_diarize_speech.main)
+
+    @pytest.mark.unit
+    def test_streaming_encoder_inputs_are_not_padded_to_a_fixed_width(self):
+        """The growing streaming widths reach the encoders unchanged: no min-128 and no capacity padding."""
+        model = _streaming_model_with_capacities()
+        packed_capacity = (
+            model.sortformer_modules.spkcache_len
+            + model.sortformer_modules.fifo_len
+            + model.sortformer_modules.chunk_left_context
+            + model.sortformer_modules.chunk_len
+            + model.sortformer_modules.chunk_right_context
+        )
+
+        events, _ = _record_streaming_encoder_calls(model)
+
+        widths = [event[1] for event in events if event[0] == "encoder"]
+        # A growing synchronous stream: the widths genuinely vary, stay below the packed capacity, and are never
+        # rounded up to a fixed minimum.
+        assert len(set(widths)) > 1
+        assert min(widths) < packed_capacity
+        assert max(widths) <= packed_capacity
+        assert min(widths) < 128
+        # The exact-128 compiled FlexAttention shim, the only width-changing exception, is off on this model, so
+        # every recorded width is the width the streaming state produced.
+        assert model.compiled_flex_exact_128_boundary_shim is False
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("audio_shape, audio_lengths", [((2, 8000), (8000, 6000))])
+    def test_offline_inference_marks_nothing_dynamic(self, sortformer_model, audio_shape, audio_lengths):
+        sortformer_model.streaming_mode = False
+        sortformer_model.eval()
+
+        with patch("torch._dynamo.mark_dynamic", MagicMock()) as mark_dynamic:
+            with torch.no_grad():
+                sortformer_model(torch.randn(audio_shape), torch.tensor(audio_lengths))
+
+        assert mark_dynamic.call_count == 0
+
+    @pytest.mark.unit
+    def test_default_flex_attention_stays_automatic(self):
+        """The default BF16 attention path forces no kernel backend on any encoder."""
+        cfg = DiarizationConfig()
+        model = _create_sortformer_model(frontend_encoder="transformer")
+
+        assert cfg.attention_backend == "flex"
+        assert not hasattr(model.encoder, "set_flex_attention_backend")
+        assert not hasattr(model.encoder, "flex_attention_backend")
+        assert not hasattr(e2e_diarize_speech, "configure_flex_attention_backend")
+        assert not hasattr(e2e_diarize_speech, "resolve_flex_attention_backend")
+
+
+class _StopAfterEncoderInput(Exception):
+    """Sentinel that ends a streaming step right after the packed encoder input reaches the frontend encoder."""
+
+
+def _run_streaming_step_with_packed_width(
+    model,
+    packed_width,
+    chunk_width=8,
+    spkcache_width=0,
+    stop_after_encoder_input=False,
+):
+    """
+    Run one streaming step whose packed encoder input is exactly ``packed_width`` frames wide.
+
+    The pre-encode call is replaced by a fabricated chunk so that the packed width is exact rather than a
+    by-product of the audio length, and the frontend encoder is wrapped to record what it was called with.
+    """
+    batch_size, emb_dim = 2, model.sortformer_modules.fc_d_model
+    streaming_state = model.sortformer_modules.init_streaming_state(
+        batch_size=batch_size, async_streaming=False, device=model.device
+    )
+    streaming_state.spkcache = torch.zeros((batch_size, spkcache_width, emb_dim), device=model.device)
+    streaming_state.fifo = torch.zeros(
+        (batch_size, packed_width - spkcache_width - chunk_width, emb_dim), device=model.device
+    )
+    chunk_embs = torch.randn((batch_size, chunk_width, emb_dim), device=model.device)
+    chunk_lengths = torch.full((batch_size,), chunk_width, dtype=torch.long, device=model.device)
+
+    encoder_calls = []
+    frontend_encoder = model.frontend_encoder
+
+    def recording_frontend_encoder(processed_signal, processed_signal_length, bypass_pre_encode=False):
+        encoder_calls.append((processed_signal, processed_signal_length))
+        if stop_after_encoder_input:
+            raise _StopAfterEncoderInput()
+        return frontend_encoder(
+            processed_signal=processed_signal,
+            processed_signal_length=processed_signal_length,
+            bypass_pre_encode=bypass_pre_encode,
+        )
+
+    model.frontend_encoder = recording_frontend_encoder
+    try:
+        with patch.object(model, "_call_pre_encode", return_value=(chunk_embs, chunk_lengths)):
+            with torch.no_grad():
+                model.forward_streaming_step(
+                    processed_signal=torch.zeros((batch_size, 80, chunk_width * 8), device=model.device),
+                    processed_signal_length=chunk_lengths,
+                    streaming_state=streaming_state,
+                    total_preds=torch.zeros((batch_size, 0, model.sortformer_modules.n_spk), device=model.device),
+                )
+    except _StopAfterEncoderInput:
+        pass
+    finally:
+        model.frontend_encoder = frontend_encoder
+    return encoder_calls, chunk_embs, streaming_state
+
+
+class TestSortformerExact128BoundaryShim:
+    """The exact-128 compiled FlexAttention boundary shim widens one width and touches nothing else."""
+
+    @pytest.mark.unit
+    def test_shim_is_disabled_by_default(self, sortformer_model):
+        assert COMPILED_FLEX_EXACT_128_BOUNDARY_WIDTH == 128
+        assert sortformer_model.compiled_flex_exact_128_boundary_shim is False
+
+    @pytest.mark.unit
+    def test_disabled_shim_passes_exact_128_unchanged(self):
+        model = _streaming_model_with_capacities(fifo_len=512, chunk_len=8, chunk_left_context=0)
+
+        encoder_calls, _, _ = _run_streaming_step_with_packed_width(model, packed_width=128)
+
+        assert len(encoder_calls) == 1
+        packed_embs, packed_lengths = encoder_calls[0]
+        assert packed_embs.shape[1] == 128
+        assert packed_lengths.tolist() == [128, 128]
+
+    @pytest.mark.unit
+    def test_enabled_shim_appends_one_masked_frame_at_exact_128(self):
+        model = _streaming_model_with_capacities(fifo_len=512, chunk_len=8, chunk_left_context=0)
+        model.compiled_flex_exact_128_boundary_shim = True
+
+        encoder_calls, chunk_embs, streaming_state = _run_streaming_step_with_packed_width(model, packed_width=128)
+
+        packed_embs, packed_lengths = encoder_calls[0]
+        assert packed_embs.shape[1] == 129
+        # The valid length stays at the logical width, so the appended frame is masked everywhere downstream.
+        assert packed_lengths.tolist() == [128, 128]
+        expected_frame = torch.full_like(packed_embs[:, -1], model.negative_init_val)
+        assert torch.equal(packed_embs[:, -1], expected_frame)
+        # The logical sequence is untouched: the chunk still ends the valid prefix.
+        assert torch.equal(packed_embs[:, 120:128], chunk_embs)
+        # Neither the chunk tensor nor the streaming state the update consumed grew by the appended frame.
+        assert chunk_embs.shape[1] == 8
+        assert streaming_state.fifo.shape[1] == 128
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("packed_width", [64, 126, 127, 129, 130])
+    def test_enabled_shim_leaves_other_widths_unchanged(self, packed_width):
+        model = _streaming_model_with_capacities(fifo_len=512, chunk_len=8, chunk_left_context=0)
+        model.compiled_flex_exact_128_boundary_shim = True
+
+        encoder_calls, _, _ = _run_streaming_step_with_packed_width(model, packed_width=packed_width)
+
+        packed_embs, packed_lengths = encoder_calls[0]
+        assert packed_embs.shape[1] == packed_width
+        assert packed_lengths.tolist() == [packed_width, packed_width]
+
+    @pytest.mark.unit
+    def test_enabled_shim_leaves_the_fixed_shape_streaming_path_unchanged(self):
+        """``async_pad_to_max=True`` already produces a fixed width, which the shim must not widen to 129."""
+        model = _streaming_model_with_capacities(
+            spkcache_len=64, fifo_len=56, chunk_len=8, chunk_left_context=0, chunk_right_context=0
+        )
+        model.async_pad_to_max = True
+        model.compiled_flex_exact_128_boundary_shim = True
+
+        encoder_calls, _, _ = _run_streaming_step_with_packed_width(
+            model, packed_width=128, spkcache_width=64, stop_after_encoder_input=True
+        )
+
+        packed_embs, packed_lengths = encoder_calls[0]
+        assert packed_embs.shape[1] == 128
+        assert packed_lengths.tolist() == [128, 128]
+
+
+def _exact_128_shim_config(**overrides) -> DiarizationConfig:
+    """Build the one configuration the exact-128 boundary shim targets, optionally overriding single fields."""
+    fields = {
+        "compile_encoder": True,
+        "compile_dynamic": True,
+        "streaming_mode": True,
+        "async_streaming": False,
+        "async_pad_to_max": False,
+        "attention_backend": "flex",
+        "precision": "bf16",
+    }
+    fields.update(overrides)
+    return DiarizationConfig(**fields)
+
+
+class TestSortformerExact128BoundaryShimActivation:
+    """The launcher enables the shim for exactly one configuration and for no neighbouring one."""
+
+    @pytest.mark.unit
+    def test_default_configuration_does_not_enable_the_shim(self):
+        assert should_enable_exact_128_boundary_shim(DiarizationConfig()) is False
+
+    @pytest.mark.unit
+    def test_synchronous_unpadded_dynamic_bf16_flex_enables_the_shim(self):
+        assert should_enable_exact_128_boundary_shim(_exact_128_shim_config()) is True
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"compile_encoder": False},
+            {"compile_dynamic": False},
+            {"streaming_mode": False},
+            {"streaming_mode": None},
+            {"async_streaming": True},
+            {"async_pad_to_max": True},
+            {"attention_backend": "fa4_cute"},
+            {"attention_backend": "fp8_flex"},
+            {"precision": "32"},
+        ],
+    )
+    def test_each_required_condition_is_necessary(self, overrides):
+        assert should_enable_exact_128_boundary_shim(_exact_128_shim_config(**overrides)) is False
+
+    @pytest.mark.unit
+    def test_launcher_enables_the_shim_on_the_model_and_logs_the_widths(self):
+        main_source = inspect.getsource(e2e_diarize_speech.main)
+        assert "should_enable_exact_128_boundary_shim(cfg)" in main_source
+        assert "compiled_flex_exact_128_boundary_shim = True" in main_source
+        assert "Exact-128 compiled FlexAttention boundary shim enabled" in main_source
+        assert "the valid length stays " in main_source
+
+
+class TestSortformerCompileBackendSelection:
+    @pytest.mark.unit
+    def test_compile_backend_defaults_to_inductor(self):
+        assert DiarizationConfig().compile_backend == INDUCTOR_COMPILE_BACKEND
+        assert SUPPORTED_COMPILE_BACKENDS == (INDUCTOR_COMPILE_BACKEND, CUDAGRAPHS_COMPILE_BACKEND)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("compile_backend", ["eager", "aot_eager", "INDUCTOR", "", None])
+    def test_unknown_compile_backend_fails_closed(self, compile_backend):
+        cfg = DiarizationConfig(compile_encoder=True, compile_backend=compile_backend)
+
+        with pytest.raises(ValueError, match="is not supported"):
+            validate_compile_backend(cfg)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("compile_encoder, compile_dynamic", [(False, True), (True, True), (True, False)])
+    def test_default_backend_is_always_accepted(self, compile_encoder, compile_dynamic):
+        cfg = DiarizationConfig(compile_encoder=compile_encoder, compile_dynamic=compile_dynamic)
+
+        validate_compile_backend(cfg)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "cfg_factory",
+        [
+            lambda: DiarizationConfig(
+                compile_encoder=True, compile_dynamic=True, compile_backend=CUDAGRAPHS_COMPILE_BACKEND
+            ),
+            lambda: _cuda_graph_config(compile_backend=CUDAGRAPHS_COMPILE_BACKEND),
+        ],
+    )
+    def test_cudagraphs_backend_is_rejected_outside_the_streaming_graph_mode(self, cfg_factory):
+        with pytest.raises(ValueError, match="requires compile_streaming_encoder_cuda_graphs=True"):
+            validate_compile_backend(cfg_factory())
+
+    @pytest.mark.unit
+    def test_unavailable_cudagraphs_backend_is_rejected_before_the_model_is_restored(self):
+        cfg = _streaming_encoder_cuda_graph_config(compile_backend=CUDAGRAPHS_COMPILE_BACKEND)
+
+        with patch.object(torch._dynamo, "list_backends", return_value=["inductor", "onnxrt"]):
+            with pytest.raises(RuntimeError, match="not registered by this PyTorch build"):
+                validate_compile_backend(cfg)
+
+    @pytest.mark.unit
+    def test_registered_cudagraphs_backend_is_accepted(self):
+        cfg = _streaming_encoder_cuda_graph_config(compile_backend=CUDAGRAPHS_COMPILE_BACKEND)
+
+        with patch.object(torch._dynamo, "list_backends", return_value=["cudagraphs", "inductor"]) as list_backends:
+            validate_compile_backend(cfg)
+
+        assert list_backends.call_count == 1
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("compile_dynamic", [True, False])
+    def test_inductor_streaming_graph_kwargs_are_unchanged(self, compile_dynamic):
+        cfg = _streaming_encoder_cuda_graph_config(compile_dynamic=compile_dynamic)
+
+        assert cfg.compile_backend == INDUCTOR_COMPILE_BACKEND
+        assert resolve_encoder_compile_kwargs(cfg) == {"dynamic": False, "mode": CUDA_GRAPH_COMPILE_MODE}
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("compile_dynamic", [True, False])
+    def test_cudagraphs_streaming_graph_kwargs_replace_the_inductor_mode(self, compile_dynamic):
+        cfg = _streaming_encoder_cuda_graph_config(
+            compile_dynamic=compile_dynamic, compile_backend=CUDAGRAPHS_COMPILE_BACKEND
+        )
+
+        assert resolve_encoder_compile_kwargs(cfg) == {"dynamic": False, "backend": CUDAGRAPHS_COMPILE_BACKEND}
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("compile_backend", [INDUCTOR_COMPILE_BACKEND, CUDAGRAPHS_COMPILE_BACKEND])
+    def test_both_encoder_targets_receive_identical_backend_kwargs(self, sortformer_model, compile_backend):
+        cfg = _streaming_encoder_cuda_graph_config(compile_backend=compile_backend)
+        targets = resolve_streaming_cuda_graph_targets(sortformer_model)
+        compile_kwargs = resolve_encoder_compile_kwargs(cfg)
+        recorded = []
+
+        def _fake_compile(module, **kwargs):
+            recorded.append((module, kwargs))
+            return module
+
+        with patch.object(torch, "compile", side_effect=_fake_compile):
+            for module in targets.values():
+                torch.compile(module, **compile_kwargs)
+
+        assert [module for module, _ in recorded] == list(targets.values())
+        assert [kwargs for _, kwargs in recorded] == [compile_kwargs, compile_kwargs]
+
+
+def _streaming_encoder_cuda_graph_config(**overrides) -> DiarizationConfig:
+    """Build a valid streaming encoder CUDA Graph configuration, optionally overriding individual fields."""
+    fields = {
+        "compile_streaming_encoder_cuda_graphs": True,
+        "compile_encoder": True,
+        "streaming_mode": True,
+        "async_pad_to_max": True,
+    }
+    fields.update(overrides)
+    return DiarizationConfig(**fields)
+
+
+class StubTransformerEncoder(torch.nn.Module):
+    """Minimal stand-in for the optional transformer encoder, whose layer stack decides whether it is captured."""
+
+    def __init__(self, num_layers: int = 2):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(torch.nn.Identity() for _ in range(num_layers))
+
+    def forward(self, encoder_states, encoder_mask):
+        """Return a masked copy of the encoder states."""
+        return encoder_states * encoder_mask.unsqueeze(-1)
+
+
+class StubStreamingModel(torch.nn.Module):
+    """Minimal stand-in for a restored model: a primary encoder behind the per-step frontend_encoder boundary."""
+
+    def __init__(self, transformer_encoder=None):
+        super().__init__()
+        self.encoder = RecordingForwardModel()
+        self.transformer_encoder = transformer_encoder
+        # Records what the unwrapped boundary itself received, which is what a captured graph would see.
+        self.boundary_calls = []
+
+    def frontend_encoder(self, processed_signal, processed_signal_length, bypass_pre_encode=False):
+        """Call the primary encoder the way one streaming step of the real model does."""
+        self.boundary_calls.append((processed_signal, processed_signal_length, bypass_pre_encode))
+        return self.encoder(processed_signal), processed_signal_length
+
+
+class TestSortformerStreamingEncoderCudaGraphCompilation:
+    @pytest.fixture(autouse=True)
+    def _clear_fixed_shape_adapter_env(self, monkeypatch):
+        """Keep the offline fixed-shape adapter inactive so a stray environment cannot fail these tests."""
+        monkeypatch.delenv(FIXED_COMPILE_ENV_VAR, raising=False)
+        monkeypatch.delenv(FIXED_COMPILE_TIME_FRAMES_ENV_VAR, raising=False)
+
+    @pytest.mark.unit
+    def test_streaming_encoder_cuda_graphs_are_disabled_by_default(self):
+        assert DiarizationConfig().compile_streaming_encoder_cuda_graphs is False
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("compile_dynamic", [True, False])
+    def test_disabled_graph_modes_keep_the_existing_compile_kwargs(self, compile_dynamic):
+        cfg = DiarizationConfig(compile_encoder=True, compile_dynamic=compile_dynamic)
+
+        assert cfg.compile_cuda_graphs is False
+        assert cfg.compile_streaming_encoder_cuda_graphs is False
+        assert resolve_encoder_compile_kwargs(cfg) == {"dynamic": compile_dynamic}
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("compile_dynamic", [True, False])
+    def test_streaming_graph_mode_pins_the_captured_encoders(self, compile_dynamic):
+        # Both capture targets are compiled with the same static-shape arguments whatever compile_dynamic asks for,
+        # because only their fixed-shape streaming forwards are captured.
+        cfg = _streaming_encoder_cuda_graph_config(compile_dynamic=compile_dynamic)
+
+        assert resolve_encoder_compile_kwargs(cfg) == {"dynamic": False, "mode": CUDA_GRAPH_COMPILE_MODE}
+
+    @pytest.mark.unit
+    def test_offline_graph_mode_keeps_its_compile_kwargs(self):
+        assert resolve_encoder_compile_kwargs(_cuda_graph_config()) == {
+            "dynamic": False,
+            "mode": CUDA_GRAPH_COMPILE_MODE,
+        }
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "overrides, device_type, error_match",
+        [
+            ({"compile_cuda_graphs": True}, "cuda", "mutually exclusive with compile_cuda_graphs=True"),
+            ({"compile_encoder": False}, "cuda", "requires compile_encoder=True"),
+            ({"streaming_mode": False}, "cuda", "streaming_mode must be set explicitly to True"),
+            ({"streaming_mode": None}, "cuda", "streaming_mode must be set explicitly to True"),
+            ({"async_pad_to_max": False}, "cuda", "requires async_pad_to_max=True"),
+            ({}, "cpu", "requires a CUDA device"),
+        ],
+    )
+    def test_invalid_streaming_graph_configurations_fail_closed(self, overrides, device_type, error_match):
+        cfg = _streaming_encoder_cuda_graph_config(**overrides)
+
+        with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
+            with pytest.raises(ValueError, match=error_match):
+                validate_streaming_encoder_cuda_graph_config(cfg, device_type)
+
+    @pytest.mark.unit
+    def test_streaming_graph_validation_requires_the_step_marker_api(self):
+        with patch.object(torch.compiler, "cudagraph_mark_step_begin", None, create=True):
+            with pytest.raises(RuntimeError, match="cudagraph_mark_step_begin"):
+                validate_streaming_encoder_cuda_graph_config(_streaming_encoder_cuda_graph_config(), "cuda")
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("compile_dynamic", [True, False])
+    def test_valid_streaming_graph_configuration_is_accepted(self, compile_dynamic):
+        cfg = _streaming_encoder_cuda_graph_config(compile_dynamic=compile_dynamic)
+
+        with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
+            # The streaming mode pins its own capture targets, so it never requires global static shapes.
+            validate_streaming_encoder_cuda_graph_config(cfg, "cuda")
+            # The offline validation stays inert because its own flag is disabled.
+            validate_cuda_graph_config(cfg, "cuda")
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("streaming_mode", [None, False, True])
+    def test_disabled_streaming_graph_mode_skips_validation(self, streaming_mode):
+        cfg = DiarizationConfig(compile_encoder=True, streaming_mode=streaming_mode)
+
+        validate_streaming_encoder_cuda_graph_config(cfg, "cpu")
+
+    @pytest.mark.unit
+    def test_offline_graph_configuration_stays_valid(self):
+        cfg = _cuda_graph_config()
+
+        assert cfg.compile_streaming_encoder_cuda_graphs is False
+        with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
+            validate_streaming_encoder_cuda_graph_config(cfg, "cuda")
+            validate_cuda_graph_config(cfg, "cuda")
+
+    @pytest.mark.unit
+    def test_checkpoint_without_a_transformer_encoder_targets_the_primary_encoder(self):
+        # The production checkpoint keeps all of its attention/feed-forward blocks in the primary encoder.
+        model = _create_sortformer_model(include_transformer_encoder=False)
+
+        targets = resolve_streaming_cuda_graph_targets(model)
+
+        assert model.transformer_encoder is None
+        assert targets == {"encoder": model.encoder}
+
+    @pytest.mark.unit
+    def test_optional_transformer_encoder_is_targeted_as_well_when_present(self, sortformer_model):
+        targets = resolve_streaming_cuda_graph_targets(sortformer_model)
+
+        assert list(targets) == ["encoder", "transformer_encoder"]
+        assert targets["encoder"] is sortformer_model.encoder
+        assert targets["transformer_encoder"] is sortformer_model.transformer_encoder
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("num_layers", [None, 0])
+    def test_absent_or_empty_optional_transformer_encoder_is_accepted(self, num_layers):
+        transformer_encoder = None if num_layers is None else StubTransformerEncoder(num_layers=num_layers)
+        model = StubStreamingModel(transformer_encoder=transformer_encoder)
+
+        assert resolve_streaming_cuda_graph_targets(model) == {"encoder": model.encoder}
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "make_model, error_match",
+        [
+            (lambda: SimpleNamespace(), "primary encoder module"),
+            (
+                lambda: SimpleNamespace(encoder=None, frontend_encoder=lambda **kwargs: None),
+                "primary encoder module",
+            ),
+            (lambda: SimpleNamespace(encoder=RecordingForwardModel()), "boundary on the restored model"),
+            (
+                lambda: SimpleNamespace(encoder=RecordingForwardModel(), frontend_encoder=None),
+                "boundary on the restored model",
+            ),
+        ],
+    )
+    def test_missing_primary_encoder_or_call_boundary_fails_closed(self, make_model, error_match):
+        with pytest.raises(ValueError, match=error_match):
+            resolve_streaming_cuda_graph_targets(make_model())
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("num_calls", [3])
+    def test_step_marker_marks_every_frontend_encoder_call(self, num_calls):
+        model = StubStreamingModel(transformer_encoder=StubTransformerEncoder())
+        processed_signal = torch.ones(2, 4, 3)
+        processed_signal_length = torch.tensor([4, 3])
+
+        with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True) as mark_step:
+            first = install_cuda_graph_step_marker(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+            second = install_cuda_graph_step_marker(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+            for _ in range(num_calls):
+                model.frontend_encoder(
+                    processed_signal=processed_signal,
+                    processed_signal_length=processed_signal_length,
+                    bypass_pre_encode=True,
+                )
+
+        # Repeated installation is a no-op, and the marked boundary is the one the streaming steps call.
+        assert first is second is model.frontend_encoder
+        assert mark_step.call_count == num_calls
+        assert len(model.encoder.calls) == num_calls
+        # The streaming mode marks the per-step boundary only, never the outer model forward.
+        assert model.forward.__func__ is type(model).forward
+
+    @pytest.mark.unit
+    def test_step_marking_requires_the_named_boundary(self):
+        with pytest.raises(ValueError, match=f"callable {STREAMING_CUDA_GRAPH_STEP_BOUNDARY}"):
+            install_cuda_graph_step_marker(SimpleNamespace(), method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("include_transformer_encoder", [True, False])
+    @pytest.mark.parametrize(
+        "spkcache_len, fifo_len, chunk_len, audio_shape, audio_lengths",
+        [(5, 18, 6, (2, 16000), (16000, 12000))],
+    )
+    def test_one_step_marker_precedes_the_captured_encoder_calls_of_every_streaming_step(
+        self, include_transformer_encoder, spkcache_len, fifo_len, chunk_len, audio_shape, audio_lengths
+    ):
+        model = _create_sortformer_model(include_transformer_encoder=include_transformer_encoder)
+        model.streaming_mode = True
+        model.async_streaming = False
+        model.async_pad_to_max = True
+        model.sortformer_modules.spkcache_len = spkcache_len
+        model.sortformer_modules.fifo_len = fifo_len
+        model.sortformer_modules.chunk_len = chunk_len
+        model.sortformer_modules.chunk_left_context = 0
+        model.sortformer_modules.chunk_right_context = 0
+        model.eval()
+        targets = resolve_streaming_cuda_graph_targets(model)
+
+        assert ("transformer_encoder" in targets) is include_transformer_encoder
+
+        events = []
+        encoder_input_shapes = []
+        transformer_input_shapes = []
+        # _call_pre_encode() invokes this submodule directly, so it stays outside the captured encoder forward.
+        pre_encode_forward = model.encoder.pre_encode.forward
+        encoder_forward = targets["encoder"].forward
+
+        def recording_pre_encode(*args, **kwargs):
+            events.append("pre_encode")
+            return pre_encode_forward(*args, **kwargs)
+
+        def recording_encoder_forward(*args, **kwargs):
+            events.append("encoder_forward")
+            encoder_input_shapes.append(kwargs["audio_signal"].shape)
+            return encoder_forward(*args, **kwargs)
+
+        model.encoder.pre_encode.forward = recording_pre_encode
+        targets["encoder"].forward = recording_encoder_forward
+        if include_transformer_encoder:
+            transformer_forward = targets["transformer_encoder"].forward
+
+            def recording_transformer_forward(*args, **kwargs):
+                events.append("transformer_forward")
+                transformer_input_shapes.append(kwargs["encoder_states"].shape)
+                return transformer_forward(*args, **kwargs)
+
+            targets["transformer_encoder"].forward = recording_transformer_forward
+
+        with patch.object(
+            torch.compiler,
+            "cudagraph_mark_step_begin",
+            MagicMock(side_effect=lambda: events.append("mark")),
+            create=True,
+        ) as mark_step:
+            install_cuda_graph_step_marker(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+            with torch.no_grad():
+                model(torch.randn(audio_shape), torch.tensor(audio_lengths))
+
+        step_events = ["pre_encode", "mark", "encoder_forward"]
+        if include_transformer_encoder:
+            step_events.append("transformer_forward")
+        num_steps = len(encoder_input_shapes)
+
+        # One model forward runs many streaming steps, and each of them marks exactly once: after the uncaptured
+        # pre-encode call, before the captured primary encoder call, and never between that call and the optional
+        # transformer encoder consuming its output.
+        assert num_steps > 1
+        assert events == step_events * num_steps
+        assert mark_step.call_count == num_steps
+        # No marker is installed on the outer model forward in the streaming mode.
+        assert model.forward.__func__ is type(model).forward
+        # async_pad_to_max keeps the captured input shapes identical across streaming steps.
+        packed_shape = torch.Size((audio_shape[0], spkcache_len + fifo_len + chunk_len))
+        assert {shape[:2] for shape in encoder_input_shapes} == {packed_shape}
+        assert len(transformer_input_shapes) == (num_steps if include_transformer_encoder else 0)
+        assert {shape[:2] for shape in transformer_input_shapes} <= {packed_shape}
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("call_style", ["keyword", "positional"])
+    def test_fresh_same_shape_length_tensors_reach_the_boundary_through_one_buffer(self, call_style):
+        # Every streaming step builds a new length tensor, which is what made PyTorch re-record the graph.
+        model = StubStreamingModel()
+        processed_signal = torch.ones(2, 4, 3)
+        caller_lengths = [torch.tensor([4, 3]), torch.tensor([4, 2]), torch.tensor([3, 1])]
+
+        install_streaming_cuda_graph_length_stabilizer(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+        for caller_length in caller_lengths:
+            if call_style == "keyword":
+                model.frontend_encoder(
+                    processed_signal=processed_signal,
+                    processed_signal_length=caller_length,
+                    bypass_pre_encode=True,
+                )
+            else:
+                model.frontend_encoder(processed_signal, caller_length, True)
+
+        received_signals = [call[0] for call in model.boundary_calls]
+        received_lengths = [call[1] for call in model.boundary_calls]
+        assert len(model.boundary_calls) == len(caller_lengths)
+        # One stable pointer for the captured call, carrying the newest values on every step.
+        assert len({length.data_ptr() for length in received_lengths}) == 1
+        assert all(length is not caller for length, caller in zip(received_lengths, caller_lengths))
+        assert torch.equal(received_lengths[-1], caller_lengths[-1])
+        # bypass_pre_encode reaches the boundary unchanged through both call styles.
+        assert [call[2] for call in model.boundary_calls] == [True] * len(caller_lengths)
+        # The caller's own tensors are untouched, and the large feature tensor is never copied or replaced.
+        assert [caller.tolist() for caller in caller_lengths] == [[4, 3], [4, 2], [3, 1]]
+        assert all(signal is processed_signal for signal in received_signals)
+
+    @pytest.mark.unit
+    def test_each_call_sees_its_own_newest_length_values(self):
+        model = StubStreamingModel()
+        observed = []
+        install_streaming_cuda_graph_length_stabilizer(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+        boundary = model.frontend_encoder
+
+        def recording_boundary(*args, **kwargs):
+            _, length = boundary(*args, **kwargs)
+            observed.append(length.tolist())
+            return None, length
+
+        model.frontend_encoder = recording_boundary
+        for values in ([4, 3], [2, 2], [1, 0]):
+            model.frontend_encoder(
+                processed_signal=torch.ones(2, 4, 3),
+                processed_signal_length=torch.tensor(values),
+                bypass_pre_encode=True,
+            )
+
+        assert observed == [[4, 3], [2, 2], [1, 0]]
+
+    @pytest.mark.unit
+    def test_a_returned_length_is_not_the_retained_buffer(self):
+        # The stub boundary hands its length argument straight back, as the encoder does for pre-encoded inputs.
+        model = StubStreamingModel()
+        install_streaming_cuda_graph_length_stabilizer(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+
+        _, first_length = model.frontend_encoder(
+            processed_signal=torch.ones(2, 4, 3),
+            processed_signal_length=torch.tensor([4, 3]),
+            bypass_pre_encode=True,
+        )
+        model.frontend_encoder(
+            processed_signal=torch.ones(2, 4, 3),
+            processed_signal_length=torch.tensor([1, 0]),
+            bypass_pre_encode=True,
+        )
+
+        # A caller keeping the returned length across steps still sees the values of its own step.
+        assert first_length.tolist() == [4, 3]
+        assert first_length is not model.boundary_calls[0][1]
+
+    @pytest.mark.unit
+    def test_alternating_supported_shapes_reuse_one_buffer_each(self):
+        # A final partial batch alternates with the full batch, and each shape must recur into its own buffer.
+        model = StubStreamingModel()
+        install_streaming_cuda_graph_length_stabilizer(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+        pointers_by_shape = {}
+
+        for batch_size in (4, 4, 2, 4, 2, 2):
+            model.frontend_encoder(
+                processed_signal=torch.ones(batch_size, 4, 3),
+                processed_signal_length=torch.full((batch_size,), batch_size),
+                bypass_pre_encode=False,
+            )
+            pointers_by_shape.setdefault(batch_size, set()).add(model.boundary_calls[-1][1].data_ptr())
+
+        assert {batch_size: len(pointers) for batch_size, pointers in pointers_by_shape.items()} == {4: 1, 2: 1}
+        buffers = getattr(model.frontend_encoder, CUDA_GRAPH_LENGTH_BUFFERS_ATTRIBUTE)
+        assert len(buffers) == 2
+        assert {tuple(buffer.shape) for buffer in buffers.values()} == {(4,), (2,)}
+
+    @pytest.mark.unit
+    def test_length_stabilizer_installation_is_idempotent(self):
+        model = StubStreamingModel()
+
+        first = install_streaming_cuda_graph_length_stabilizer(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+        second = install_streaming_cuda_graph_length_stabilizer(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+
+        assert first is second is model.frontend_encoder
+        # The stabilizer never touches the outer model forward.
+        assert model.forward.__func__ is type(model).forward
+
+    @pytest.mark.unit
+    def test_length_stabilization_requires_the_named_boundary(self):
+        with pytest.raises(ValueError, match=f"callable {STREAMING_CUDA_GRAPH_STEP_BOUNDARY}"):
+            install_streaming_cuda_graph_length_stabilizer(
+                SimpleNamespace(), method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY
+            )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("num_calls", [3])
+    def test_marker_stays_once_per_step_and_precedes_the_stabilized_boundary(self, num_calls):
+        model = StubStreamingModel(transformer_encoder=StubTransformerEncoder())
+        events = []
+        boundary = type(model).frontend_encoder
+
+        def recording_boundary(self, processed_signal, processed_signal_length, bypass_pre_encode=False):
+            events.append("boundary")
+            return boundary(self, processed_signal, processed_signal_length, bypass_pre_encode)
+
+        model.frontend_encoder = MethodType(recording_boundary, model)
+        with patch.object(
+            torch.compiler,
+            "cudagraph_mark_step_begin",
+            MagicMock(side_effect=lambda: events.append("mark")),
+            create=True,
+        ) as mark_step:
+            install_streaming_cuda_graph_boundary(_streaming_encoder_cuda_graph_config(), model)
+            # Repeated setup of the whole boundary stays a no-op for both wrappers.
+            install_streaming_cuda_graph_boundary(_streaming_encoder_cuda_graph_config(), model)
+            for _ in range(num_calls):
+                model.frontend_encoder(
+                    processed_signal=torch.ones(2, 4, 3),
+                    processed_signal_length=torch.tensor([4, 3]),
+                    bypass_pre_encode=True,
+                )
+
+        assert mark_step.call_count == num_calls
+        assert events == ["mark", "boundary"] * num_calls
+        assert len({call[1].data_ptr() for call in model.boundary_calls}) == 1
+        assert model.forward.__func__ is type(model).forward
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "cfg_factory, expected",
+        [
+            (_streaming_encoder_cuda_graph_config, True),
+            (lambda: DiarizationConfig(compile_encoder=True), False),
+            (_cuda_graph_config, False),
+        ],
+    )
+    def test_setup_installs_the_boundary_only_for_the_streaming_graph_mode(self, cfg_factory, expected):
+        model = StubStreamingModel()
+
+        with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
+            assert install_streaming_cuda_graph_boundary(cfg_factory(), model) is expected
+
+        stabilized = hasattr(model.frontend_encoder, CUDA_GRAPH_LENGTH_BUFFERS_ATTRIBUTE)
+        assert stabilized is expected
+        # The disabled and the offline graph paths keep the original bound boundary and the unmarked model forward.
+        untouched_boundary = MethodType(type(model).frontend_encoder, model)
+        assert (model.frontend_encoder == untouched_boundary) is not expected
+        assert model.forward.__func__ is type(model).forward

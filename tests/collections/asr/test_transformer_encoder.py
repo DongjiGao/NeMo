@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import dataclasses
+import importlib.util
 
 import numpy as np
 import pytest
@@ -21,6 +22,7 @@ import torch
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 
 from nemo.collections.asr.models.configs import CacheAwareStreamingConfig
+from nemo.collections.asr.modules import transformer_encoder as transformer_encoder_module
 from nemo.collections.asr.modules.transformer_encoder import (
     FeatureStacking,
     StreamingTransformerEncoder,
@@ -31,6 +33,18 @@ from nemo.collections.asr.modules.transformer_encoder import (
 )
 from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
 from nemo.collections.asr.parts.submodules.multi_head_attention import RotaryPositionalEncoding
+from nemo.collections.asr.parts.utils.sortformer_fa4_attention import SUPPORTED_CAPABILITY_MAJORS
+from nemo.collections.asr.parts.utils.sortformer_fp8_flex_attention import (
+    SUPPORTED_CAPABILITY_MAJORS as FP8_FLEX_CAPABILITY_MAJORS,
+)
+
+_CAPABILITY = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+FA4_SUPPORTED = (
+    importlib.util.find_spec("flash_attn") is not None
+    and _CAPABILITY is not None
+    and _CAPABILITY[0] in SUPPORTED_CAPABILITY_MAJORS
+)
+FP8_FLEX_SUPPORTED = _CAPABILITY is not None and _CAPABILITY[0] in FP8_FLEX_CAPABILITY_MAJORS
 
 
 class TestTransformerEncoderConfig:
@@ -51,6 +65,7 @@ class TestTransformerEncoderConfig:
         assert cfg.self_attention_model == "rel_pos"
         assert cfg.rope_base == 10000.0
         assert cfg.rotary_fraction == 1.0
+        assert cfg.attention_backend == "flex"
 
     @pytest.mark.unit
     def test_custom_config(self):
@@ -621,6 +636,349 @@ class TestTransformerEncoder:
         for name, param in model.named_parameters():
             assert param.grad is not None, f"No gradient for {name}"
             assert not torch.isnan(param.grad).any(), f"NaN gradient for {name}"
+
+
+class TestAttentionBackend:
+    """Tests for the opt-in ``fa4_cute`` attention backend; ``flex`` stays the default everywhere."""
+
+    def _rope_encoder(self, **kwargs):
+        return TransformerEncoder(
+            feat_in=128,
+            d_model=256,
+            n_heads=4,
+            n_layers=2,
+            drop_rate=0.0,
+            dropout_pre_encoder=0.0,
+            self_attention_model="rope",
+            **kwargs,
+        )
+
+    @pytest.mark.unit
+    def test_default_backend_is_flex(self):
+        model = TransformerEncoder(feat_in=128, d_model=64, n_heads=4, n_layers=2)
+        assert model.attention_backend == "flex"
+        assert all(layer.attn.attention_backend == "flex" for layer in model.layers)
+
+    @pytest.mark.unit
+    def test_set_attention_backend_applies_to_every_layer(self):
+        model = self._rope_encoder()
+        assert model.set_attention_backend("fa4_cute") == "fa4_cute"
+        assert model.attention_backend == "fa4_cute"
+        assert all(layer.attn.attention_backend == "fa4_cute" for layer in model.layers)
+
+        model.set_attention_backend("flex")
+        assert all(layer.attn.attention_backend == "flex" for layer in model.layers)
+
+    @pytest.mark.unit
+    def test_constructor_accepts_the_backend(self):
+        model = self._rope_encoder(attention_backend="fa4_cute")
+        assert all(layer.attn.attention_backend == "fa4_cute" for layer in model.layers)
+
+    @pytest.mark.unit
+    def test_invalid_backend_raises(self):
+        with pytest.raises(ValueError, match="is not supported"):
+            self._rope_encoder(attention_backend="fa4")
+        with pytest.raises(ValueError, match="is not supported"):
+            self._rope_encoder().set_attention_backend("flash")
+
+    @pytest.mark.unit
+    def test_causal_mode_is_rejected(self):
+        with pytest.raises(ValueError, match="attn_mode='full'"):
+            self._rope_encoder(attn_mode="causal", attention_backend="fa4_cute")
+        model = self._rope_encoder(attn_mode="causal")
+        with pytest.raises(ValueError, match="attn_mode='full'"):
+            model.set_attention_backend("fa4_cute")
+        assert model.attention_backend == "flex"
+
+    @pytest.mark.unit
+    def test_rel_pos_score_mod_is_rejected(self):
+        model = TransformerEncoder(feat_in=128, d_model=256, n_heads=4, n_layers=2, self_attention_model="rel_pos")
+        with pytest.raises(ValueError, match="relative-position"):
+            model.set_attention_backend("fa4_cute")
+        assert model.attention_backend == "flex"
+
+    @pytest.mark.unit
+    def test_cpu_forward_fails_closed_without_falling_back(self):
+        """An unsupported device must raise instead of silently reverting to FlexAttention."""
+        model = self._rope_encoder(attention_backend="fa4_cute").eval().to(torch.bfloat16)
+        x = torch.randn(2, 16, 256, dtype=torch.bfloat16)
+        lengths = torch.tensor([16, 9])
+
+        with torch.no_grad(), pytest.raises(RuntimeError, match="requires CUDA"):
+            model(audio_signal=x, length=lengths, bypass_pre_encode=True)
+
+    @pytest.mark.unit
+    def test_training_mode_forward_fails_closed(self):
+        """Training mode must be rejected even under no_grad, where the grad-bearing-input check cannot fire."""
+        model = self._rope_encoder(attention_backend="fa4_cute").train().to(torch.bfloat16)
+        x = torch.randn(2, 16, 256, dtype=torch.bfloat16)
+        lengths = torch.tensor([16, 9])
+
+        with torch.no_grad(), pytest.raises(RuntimeError, match="inference-only"):
+            model(audio_signal=x, length=lengths, bypass_pre_encode=True)
+
+    @pytest.mark.skipif(not FA4_SUPPORTED, reason="requires CUDA, flash_attn and a Blackwell GPU")
+    def test_matches_flex_backend_on_valid_frames(self):
+        """End-to-end encoder A/B at a small dense RoPE shape with unequal and zero lengths."""
+        torch.manual_seed(0)
+        model = self._rope_encoder().cuda().to(torch.bfloat16).eval()
+        x = torch.randn(3, 64, 256, device="cuda", dtype=torch.bfloat16)
+        lengths = torch.tensor([64, 21, 0], device="cuda")
+
+        with torch.no_grad():
+            flex_out, _ = model(audio_signal=x, length=lengths, bypass_pre_encode=True)
+            model.set_attention_backend("fa4_cute")
+            fa4_out, _ = model(audio_signal=x, length=lengths, bypass_pre_encode=True)
+
+        assert fa4_out.shape == flex_out.shape
+        assert torch.isfinite(fa4_out).all()
+        for sample, valid in enumerate([64, 21, 0]):
+            if valid == 0:
+                continue
+            torch.testing.assert_close(
+                fa4_out[sample, :, :valid].float(), flex_out[sample, :, :valid].float(), atol=5e-2, rtol=0
+            )
+
+
+class TestFp8FlexAttentionBackend:
+    """Tests for the opt-in ``fp8_flex`` attention backend; ``flex`` stays the default everywhere."""
+
+    def _rope_encoder(self, **kwargs):
+        return TransformerEncoder(
+            feat_in=128,
+            d_model=256,
+            n_heads=4,
+            n_layers=2,
+            drop_rate=0.0,
+            dropout_pre_encoder=0.0,
+            qk_norm=True,
+            self_attention_model="rope",
+            **kwargs,
+        )
+
+    @pytest.mark.unit
+    def test_constructor_accepts_the_backend(self):
+        model = self._rope_encoder(attention_backend="fp8_flex")
+        assert model.attention_backend == "fp8_flex"
+        assert all(layer.attn.attention_backend == "fp8_flex" for layer in model.layers)
+
+    @pytest.mark.unit
+    def test_set_attention_backend_applies_to_every_layer(self):
+        model = self._rope_encoder()
+        assert model.attention_backend == "flex"
+        assert model.set_attention_backend("fp8_flex") == "fp8_flex"
+        assert all(layer.attn.attention_backend == "fp8_flex" for layer in model.layers)
+
+        model.set_attention_backend("flex")
+        assert all(layer.attn.attention_backend == "flex" for layer in model.layers)
+
+    @pytest.mark.unit
+    def test_misspelled_backend_raises(self):
+        with pytest.raises(ValueError, match="is not supported"):
+            self._rope_encoder(attention_backend="fp8")
+        with pytest.raises(ValueError, match="is not supported"):
+            self._rope_encoder().set_attention_backend("fp8-flex")
+
+    @pytest.mark.unit
+    def test_causal_mode_is_rejected(self):
+        with pytest.raises(ValueError, match="attn_mode='full'"):
+            self._rope_encoder(attn_mode="causal", attention_backend="fp8_flex")
+        model = self._rope_encoder(attn_mode="causal")
+        with pytest.raises(ValueError, match="attn_mode='full'"):
+            model.set_attention_backend("fp8_flex")
+        assert model.attention_backend == "flex"
+        assert all(layer.attn.attention_backend == "flex" for layer in model.layers)
+
+    @pytest.mark.unit
+    def test_rel_pos_score_mod_is_rejected(self):
+        model = TransformerEncoder(feat_in=128, d_model=256, n_heads=4, n_layers=2, self_attention_model="rel_pos")
+        with pytest.raises(ValueError, match="relative-position"):
+            model.set_attention_backend("fp8_flex")
+        assert model.attention_backend == "flex"
+        assert all(layer.attn.attention_backend == "flex" for layer in model.layers)
+
+    @pytest.mark.unit
+    def test_cpu_forward_fails_closed_without_falling_back(self):
+        """An unsupported device must raise instead of silently reverting to BF16 FlexAttention."""
+        model = self._rope_encoder(attention_backend="fp8_flex").eval().to(torch.bfloat16)
+        x = torch.randn(2, 16, 256, dtype=torch.bfloat16)
+        lengths = torch.tensor([16, 9])
+
+        with torch.no_grad(), pytest.raises(RuntimeError, match="requires CUDA"):
+            model(audio_signal=x, length=lengths, bypass_pre_encode=True)
+
+    @pytest.mark.unit
+    def test_training_mode_forward_fails_closed(self):
+        """Training mode must be rejected even under no_grad, where the grad-bearing-input check cannot fire."""
+        model = self._rope_encoder(attention_backend="fp8_flex").train().to(torch.bfloat16)
+        x = torch.randn(2, 16, 256, dtype=torch.bfloat16)
+        lengths = torch.tensor([16, 9])
+
+        with torch.no_grad(), pytest.raises(RuntimeError, match="inference-only"):
+            model(audio_signal=x, length=lengths, bypass_pre_encode=True)
+
+    @pytest.mark.unit
+    def test_valid_lengths_are_prepared_once_and_shared_by_every_layer(self, monkeypatch):
+        """One int32 conversion per encoder forward, and the identical tensor reaches every FP8 layer."""
+        model = self._rope_encoder(attention_backend="fp8_flex").eval().to(torch.bfloat16)
+        prepared, calls = [], []
+        real_prepare = transformer_encoder_module.prepare_fp8_flex_valid_lengths
+
+        def counting_prepare(length, seq_len):
+            valid_lengths = real_prepare(length, seq_len)
+            prepared.append(valid_lengths)
+            return valid_lengths
+
+        def fake_fp8_attention(query, key, value, block_mask, valid_lengths):
+            calls.append((block_mask, valid_lengths))
+            return torch.zeros_like(query)
+
+        monkeypatch.setattr(transformer_encoder_module, "prepare_fp8_flex_valid_lengths", counting_prepare)
+        monkeypatch.setattr(transformer_encoder_module, "fp8_flex_attention", fake_fp8_attention)
+
+        x = torch.randn(2, 16, 256, dtype=torch.bfloat16)
+        lengths = torch.tensor([16, 9])
+        with torch.no_grad():
+            model(audio_signal=x, length=lengths, bypass_pre_encode=True)
+
+        assert len(prepared) == 1
+        assert prepared[0].dtype == torch.int32 and prepared[0].is_contiguous()
+        assert prepared[0].tolist() == [16, 9]
+        assert len(calls) == len(model.layers)
+        for block_mask, valid_lengths in calls:
+            assert valid_lengths is prepared[0]
+            assert block_mask is calls[0][0]
+
+    @pytest.mark.unit
+    def test_layer_without_lengths_fails_closed(self):
+        """A layer driven directly must not silently attend without the key-padding contract."""
+        model = self._rope_encoder(attention_backend="fp8_flex").eval().to(torch.bfloat16)
+        x = torch.randn(2, 16, 256, dtype=torch.bfloat16)
+
+        with torch.no_grad(), pytest.raises(ValueError, match="per-sample key lengths"):
+            model.layers[0].attn(x, block_mask=None, seqused_k=None)
+
+    @pytest.mark.unit
+    def test_default_flex_backend_prepares_no_valid_lengths(self, monkeypatch):
+        """The default path is untouched: no length preparation, and layers still see seqused_k=None."""
+        model = self._rope_encoder().eval().to(torch.bfloat16)
+        prepared, seen = [], []
+        monkeypatch.setattr(
+            transformer_encoder_module,
+            "prepare_fp8_flex_valid_lengths",
+            lambda *args: prepared.append(args),
+        )
+        for layer in model.layers:
+            original_forward = layer.attn.forward
+
+            def recording_forward(x, block_mask=None, pos_emb=None, seqused_k=None, _inner=original_forward):
+                seen.append(seqused_k)
+                return _inner(x, block_mask=block_mask, pos_emb=pos_emb, seqused_k=seqused_k)
+
+            layer.attn.forward = recording_forward
+
+        x = torch.randn(2, 16, 256, dtype=torch.bfloat16)
+        with torch.no_grad():
+            model(audio_signal=x, length=torch.tensor([16, 9]), bypass_pre_encode=True)
+
+        assert prepared == []
+        assert seen == [None, None]
+
+    @pytest.mark.unit
+    def test_fa4_backend_keeps_its_own_length_preparation(self, monkeypatch):
+        """FA4 still builds seqused_k itself, and never routes through the FP8 length helper."""
+        model = self._rope_encoder(attention_backend="fa4_cute").eval().to(torch.bfloat16)
+        fp8_prepared, fa4_prepared = [], []
+        real_fa4_prepare = transformer_encoder_module.prepare_fa4_seqused_k
+
+        def counting_fa4_prepare(length, seq_len):
+            fa4_prepared.append(length)
+            return real_fa4_prepare(length, seq_len)
+
+        monkeypatch.setattr(
+            transformer_encoder_module,
+            "prepare_fp8_flex_valid_lengths",
+            lambda *args: fp8_prepared.append(args),
+        )
+        monkeypatch.setattr(transformer_encoder_module, "prepare_fa4_seqused_k", counting_fa4_prepare)
+
+        x = torch.randn(2, 16, 256, dtype=torch.bfloat16)
+        with torch.no_grad(), pytest.raises(RuntimeError, match="requires CUDA"):
+            model(audio_signal=x, length=torch.tensor([16, 9]), bypass_pre_encode=True)
+
+        assert fp8_prepared == []
+        assert len(fa4_prepared) == 1
+
+    @pytest.mark.skipif(not FP8_FLEX_SUPPORTED, reason="requires CUDA and a Blackwell GPU")
+    def test_matches_flex_backend_on_valid_frames(self):
+        """End-to-end encoder A/B at a small dense RoPE + QK-norm shape with unequal nonzero lengths."""
+        torch.manual_seed(0)
+        model = self._rope_encoder().cuda().to(torch.bfloat16).eval()
+        x = torch.randn(3, 128, 256, device="cuda", dtype=torch.bfloat16)
+        valid_lengths = [128, 41, 7]
+        lengths = torch.tensor(valid_lengths, device="cuda")
+
+        with torch.no_grad():
+            flex_out, _ = model(audio_signal=x, length=lengths, bypass_pre_encode=True)
+            model.set_attention_backend("fp8_flex")
+            fp8_out, _ = model(audio_signal=x, length=lengths, bypass_pre_encode=True)
+
+        assert fp8_out.shape == flex_out.shape
+        assert fp8_out.dtype == flex_out.dtype
+        assert torch.isfinite(fp8_out).all()
+        # Attention runs on a lossy E4M3 cast, so this only bounds the encoder-level drift; final DER is the
+        # accuracy decision for the direct-cast choice.
+        for sample, valid in enumerate(valid_lengths):
+            torch.testing.assert_close(
+                fp8_out[sample, :, :valid].float(), flex_out[sample, :, :valid].float(), atol=3e-1, rtol=0
+            )
+
+
+class TestDefaultFlexAttentionKernelSelection:
+    """The default BF16 FlexAttention path forces no kernel backend and keeps PyTorch's automatic selection."""
+
+    def _encoder(self):
+        return TransformerEncoder(
+            feat_in=128,
+            d_model=256,
+            n_heads=4,
+            n_layers=2,
+            drop_rate=0.0,
+            dropout_pre_encoder=0.0,
+            self_attention_model="rope",
+        ).eval()
+
+    def _record_attention_kwargs(self, monkeypatch, encoder):
+        calls = []
+
+        def recording_flex_attention(query, key, value, **kwargs):
+            calls.append(kwargs)
+            return torch.zeros_like(query)
+
+        monkeypatch.setattr(transformer_encoder_module, "flex_attention", recording_flex_attention)
+        with torch.no_grad():
+            encoder(audio_signal=torch.randn(2, 16, 256), length=torch.tensor([16, 9]), bypass_pre_encode=True)
+        return calls
+
+    @pytest.mark.unit
+    def test_default_call_passes_no_kernel_options(self, monkeypatch):
+        """Automatic backend selection: no kernel options reach the call at all, on any layer."""
+        calls = self._record_attention_kwargs(monkeypatch, self._encoder())
+
+        assert len(calls) == 2
+        assert all("kernel_options" not in kwargs for kwargs in calls)
+        assert all(set(kwargs) == {"block_mask", "score_mod"} for kwargs in calls)
+
+    @pytest.mark.unit
+    def test_no_backend_pinning_api_is_exposed(self):
+        """The rejected per-encoder kernel pin is gone, so nothing can narrow the automatic selection."""
+        encoder = self._encoder()
+
+        assert not hasattr(encoder, "set_flex_attention_backend")
+        assert not hasattr(encoder, "flex_attention_backend")
+        assert all(not hasattr(layer.attn, "flex_attention_backend") for layer in encoder.layers)
+        assert not hasattr(transformer_encoder_module, "flex_attention_kernel_options")
+        assert not hasattr(transformer_encoder_module, "FLEX_ATTENTION_TRITON_BACKEND")
 
 
 class TestSelfAttentionModel:
@@ -1686,3 +2044,62 @@ class TestStreamingTransformerEncoder:
                 cache_last_channel_len=clcl,
                 bypass_pre_encode=True,
             )
+
+
+class TestForwardFromQkv:
+    """``MultiHeadAttention.forward`` is now a thin wrapper over ``forward_from_qkv``.
+
+    The NVFP4 producer fusion drives that entry point with a fused projection it computed itself, so the split
+    must be exactly a refactor: the default forward, its backward, and every positional mode stay unchanged.
+    """
+
+    @staticmethod
+    def _encoder(mode, qk_norm=False, device="cpu"):
+        torch.manual_seed(0)
+        model = TransformerEncoder(
+            feat_in=32,
+            d_model=64,
+            n_heads=4,
+            n_layers=2,
+            drop_rate=0.0,
+            qk_norm=qk_norm,
+            self_attention_model=mode,
+        )
+        return model.to(device).eval()
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("mode", ["abs_pos", "rel_pos", "rope", "no_pos"])
+    @pytest.mark.parametrize("qk_norm", [False, True])
+    def test_forward_from_qkv_reproduces_forward(self, mode, qk_norm):
+        model = self._encoder(mode, qk_norm=qk_norm)
+        attn = model.layers[0].attn
+        x = torch.randn(2, 12, 64)
+        pos_emb = model.pos_enc(x=x)[1] if mode == "rel_pos" else None
+
+        with torch.no_grad():
+            expected = attn(x, pos_emb=pos_emb)
+            actual = attn.forward_from_qkv(attn.w_qkv(x), pos_emb=pos_emb)
+
+        torch.testing.assert_close(actual, expected)
+
+    @pytest.mark.unit
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention has no CPU backward implementation")
+    def test_default_block_forward_and_backward_are_unchanged(self):
+        """The default (unfused, trainable) block still produces finite gradients for every parameter.
+
+        Runs on CUDA like the encoder's own ``test_backward_pass``: FlexAttention, which every block forward
+        goes through, raises on a CPU backward, so the requirement can only be checked on a supported device.
+        """
+        model = self._encoder("rel_pos", device="cuda").train()
+        block = model.layers[0]
+        x = torch.randn(2, 12, 64, device="cuda", requires_grad=True)
+        pos_emb = model.pos_enc(x=x.detach())[1]
+
+        out = block(x, pos_emb=pos_emb)
+        out.sum().backward()
+
+        assert out.shape == x.shape
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+        for name, parameter in block.named_parameters():
+            assert parameter.grad is not None, f"'{name}' received no gradient"
+            assert torch.isfinite(parameter.grad).all(), f"'{name}' received a non-finite gradient"

@@ -13,18 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from nemo.collections.asr.parts.utils.sortformer_utils import (
+    InferenceProfiler,
+    configure_streaming_mode,
     get_prediction_cache_metadata,
     load_prediction_tensors,
     save_prediction_tensors,
     validate_prediction_tensors,
 )
+
+
+def _make_profiler(warmup_calls, forward_times, preprocessor_times, section_times=None, section_calls=None):
+    """Build a profiler with pre-recorded per-call timings, bypassing an actual model forward pass."""
+    profiler = InferenceProfiler(SimpleNamespace(device=torch.device("cpu")), warmup_calls=warmup_calls)
+    profiler.forward_times = list(forward_times)
+    profiler.preprocessor_times = list(preprocessor_times)
+    profiler.section_times = dict(section_times or {})
+    profiler.section_calls = dict(section_calls or {})
+    return profiler
 
 
 @pytest.mark.unit
@@ -374,3 +388,178 @@ def test_save_prediction_tensors_removes_temporary_file_after_failure(
 
     assert tensor_path.read_bytes() == original_contents
     assert list(tensor_path.parent.glob(f".{tensor_path.name}.*.tmp")) == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "checkpoint_streaming_mode, streaming_mode_override, expected_streaming_mode",
+    [
+        (True, None, True),
+        (False, None, False),
+        (True, False, False),
+        (False, True, True),
+        (True, True, True),
+    ],
+    ids=["keep-streaming", "keep-offline", "force-offline", "force-streaming", "streaming-unchanged"],
+)
+def test_configure_streaming_mode(checkpoint_streaming_mode, streaming_mode_override, expected_streaming_mode):
+    diar_model = SimpleNamespace(
+        streaming_mode=checkpoint_streaming_mode,
+        _cfg=OmegaConf.create({"streaming_mode": checkpoint_streaming_mode}),
+    )
+
+    effective_streaming_mode = configure_streaming_mode(diar_model, streaming_mode_override)
+
+    assert effective_streaming_mode is expected_streaming_mode
+    assert diar_model.streaming_mode is expected_streaming_mode
+    assert diar_model._cfg.streaming_mode is expected_streaming_mode
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "checkpoint_streaming_mode, streaming_mode_override, error_match",
+    [
+        (True, "False", "streaming_mode must be a boolean"),
+        (True, 0, "streaming_mode must be a boolean"),
+    ],
+    ids=["string", "integer"],
+)
+def test_configure_streaming_mode_rejects_non_boolean(checkpoint_streaming_mode, streaming_mode_override, error_match):
+    diar_model = SimpleNamespace(
+        streaming_mode=checkpoint_streaming_mode,
+        _cfg=OmegaConf.create({"streaming_mode": checkpoint_streaming_mode}),
+    )
+
+    with pytest.raises(ValueError, match=error_match):
+        configure_streaming_mode(diar_model, streaming_mode_override)
+
+    assert diar_model.streaming_mode is checkpoint_streaming_mode
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "forward_times, preprocessor_times, section_times, section_calls, audio_duration, expected_summary",
+    [
+        (
+            (1.0, 1.0),
+            (0.25, 0.25),
+            {"streaming_step": 1.0, "pre_encode": 0.4},
+            {"streaming_step": 2, "pre_encode": 2},
+            10.0,
+            "audio=10.00s, model_forward=2.000s (RTF=0.200000, 5.00x realtime), "
+            "preprocessor=0.500s (25.00%, RTF=0.050000), main_inference=1.500s (75.00%, RTF=0.150000), calls=2",
+        )
+    ],
+)
+def test_log_summary_without_warmup_measures_every_call(
+    caplog, forward_times, preprocessor_times, section_times, section_calls, audio_duration, expected_summary
+):
+    profiler = _make_profiler(0, forward_times, preprocessor_times, section_times, section_calls)
+
+    with caplog.at_level(logging.INFO):
+        profiler.log_summary(audio_duration)
+
+    assert profiler.forward_time == pytest.approx(sum(forward_times))
+    assert profiler.preprocessor_time == pytest.approx(sum(preprocessor_times))
+    assert profiler.forward_calls == len(forward_times)
+    assert profiler.preprocessor_calls == len(preprocessor_times)
+    assert f"Inference profile: {expected_summary}" in caplog.text
+    assert "warmup_calls" not in caplog.text
+    assert "Streaming step profile: total=1.000s, calls=2" in caplog.text
+    assert "pre_encode: total=0.400s" in caplog.text
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    (
+        "warmup_calls, forward_times, preprocessor_times, section_times, section_calls, audio_duration, "
+        "measured_audio_duration, expected_summary"
+    ),
+    [
+        (
+            1,
+            (10.0, 1.5, 0.5),
+            (2.0, 0.5, 0.5),
+            {"streaming_step": 9.0, "pre_encode": 3.0},
+            {"streaming_step": 3, "pre_encode": 3},
+            100.0,
+            60.0,
+            "audio=60.00s, model_forward=2.000s (RTF=0.033333, 30.00x realtime), "
+            "preprocessor=1.000s (50.00%, RTF=0.016667), main_inference=1.000s (50.00%, RTF=0.016667), "
+            "calls=2, warmup_calls=1",
+        )
+    ],
+)
+def test_log_summary_excludes_warmup_calls_exactly(
+    caplog,
+    warmup_calls,
+    forward_times,
+    preprocessor_times,
+    section_times,
+    section_calls,
+    audio_duration,
+    measured_audio_duration,
+    expected_summary,
+):
+    profiler = _make_profiler(warmup_calls, forward_times, preprocessor_times, section_times, section_calls)
+
+    with caplog.at_level(logging.INFO):
+        profiler.log_summary(audio_duration, measured_audio_duration=measured_audio_duration)
+
+    assert f"Inference profile: {expected_summary}" in caplog.text
+    # Section timings aggregate every call, so the streaming breakdown must not pose as warmup-excluded.
+    assert "Streaming step profile: total" not in caplog.text
+    assert "Streaming step profile is omitted because warmup_calls=1" in caplog.text
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "warmup_calls, forward_times, preprocessor_times, audio_duration, expected_warning",
+    [
+        (2, (1.0, 1.0), (0.5, 0.5), 10.0, "excludes all 2 model-forward calls"),
+        (5, (1.0, 1.0), (0.5, 0.5), 10.0, "excludes all 2 model-forward calls"),
+    ],
+    ids=["equal-to-call-count", "greater-than-call-count"],
+)
+def test_log_summary_rejects_warmup_counts_covering_every_call(
+    caplog, warmup_calls, forward_times, preprocessor_times, audio_duration, expected_warning
+):
+    profiler = _make_profiler(warmup_calls, forward_times, preprocessor_times)
+
+    with caplog.at_level(logging.INFO):
+        profiler.log_summary(audio_duration)
+
+    assert expected_warning in caplog.text
+    assert "Inference profile:" not in caplog.text
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "warmup_calls, error_match",
+    [
+        (-1, "warmup_calls must be a non-negative integer"),
+        (1.5, "warmup_calls must be a non-negative integer"),
+        ("1", "warmup_calls must be a non-negative integer"),
+    ],
+    ids=["negative", "float", "string"],
+)
+def test_profiler_rejects_invalid_warmup_calls(warmup_calls, error_match):
+    with pytest.raises(ValueError, match=error_match):
+        InferenceProfiler(SimpleNamespace(device=torch.device("cpu")), warmup_calls=warmup_calls)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "warmup_calls, forward_times, preprocessor_times, audio_duration, expected_warning",
+    [(1, (2.0, 1.0), (0.5, 0.25), 10.0, "no measured_audio_duration was given")],
+)
+def test_log_summary_warns_when_warmup_excluded_without_measured_duration(
+    caplog, warmup_calls, forward_times, preprocessor_times, audio_duration, expected_warning
+):
+    profiler = _make_profiler(warmup_calls, forward_times, preprocessor_times)
+
+    with caplog.at_level(logging.INFO):
+        profiler.log_summary(audio_duration)
+
+    assert expected_warning in caplog.text
+    assert "audio=10.00s, model_forward=1.000s" in caplog.text
