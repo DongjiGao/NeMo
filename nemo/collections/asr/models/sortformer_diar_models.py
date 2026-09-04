@@ -50,6 +50,10 @@ from nemo.utils import logging
 
 __all__ = ['SortformerEncLabelModel']
 
+# Physical encoder time width that trips the pinned torch 2.12 Inductor fusion assertion when a synchronous,
+# unpadded, dynamically compiled BF16 FlexAttention encoder is called with exactly this many frames.
+COMPILED_FLEX_EXACT_128_BOUNDARY_WIDTH = 128
+
 
 class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixin):
     """
@@ -191,8 +195,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.loss = safe_instantiate(self._cfg.loss)
 
         self.async_streaming = self._cfg.get("async_streaming", False)
-        # Async rows are ragged; padding to full state capacity keeps the encoder time dimension fixed.
+        # Padding to full state capacity keeps the encoder time dimension fixed. In async streaming this packs
+        # ragged rows; in synchronous streaming it pads the growing cache/FIFO widths to their configured maxima.
         self.async_pad_to_max = self._cfg.get("async_pad_to_max", False)
+        # Temporary compatibility shim for a pinned torch 2.12 Inductor fusion failure; disabled by default and
+        # enabled only by a launcher that runs synchronous, unpadded, dynamically compiled BF16 FlexAttention.
+        self.compiled_flex_exact_128_boundary_shim = self._cfg.get("compiled_flex_exact_128_boundary_shim", False)
         self.streaming_mode = self._cfg.get("streaming_mode", False)
         if self.streaming_mode:
             # Validate streaming parameters once at initialization for streaming models
@@ -418,11 +426,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, diar_frame_count, num_speakers)
         """
         encoder_mask = self.sortformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
-        trans_emb_seq = (
-            self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
-            if self.transformer_encoder is not None
-            else emb_seq
-        )
+        if self.transformer_encoder is not None:
+            trans_emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
+        else:
+            trans_emb_seq = emb_seq
         trans_emb_seq = self.sortformer_modules.upsample_hidden(trans_emb_seq)
         if self.high_resolution:
             output_mask = encoder_mask.repeat_interleave(self.upsample_factor, dim=1)
@@ -1000,12 +1007,36 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                     output_length=output_length,
                 )
             )
+        elif self.async_pad_to_max:
+            # Synchronous speaker-cache and FIFO rows are dense, so their valid lengths are their physical widths.
+            # Padding to the configured capacities keeps the encoder time dimension fixed across chunks.
+            spkcache_lengths = torch.full_like(chunk_pre_encode_lengths, streaming_state.spkcache.shape[1])
+            fifo_lengths = torch.full_like(chunk_pre_encode_lengths, streaming_state.fifo.shape[1])
+            output_length = (
+                self.sortformer_modules.spkcache_len
+                + self.sortformer_modules.fifo_len
+                + self.sortformer_modules.chunk_left_context
+                + self.sortformer_modules.chunk_len
+                + self.sortformer_modules.chunk_right_context
+            )
+            spkcache_fifo_chunk_pre_encode_embs, spkcache_fifo_chunk_pre_encode_lengths = (
+                self.sortformer_modules.concat_and_pad(
+                    [streaming_state.spkcache, streaming_state.fifo, chunk_pre_encode_embs],
+                    [spkcache_lengths, fifo_lengths, chunk_pre_encode_lengths],
+                    output_length=output_length,
+                )
+            )
         else:
             spkcache_fifo_chunk_pre_encode_embs = self.sortformer_modules.concat_embs(
                 [streaming_state.spkcache, streaming_state.fifo, chunk_pre_encode_embs], dim=1, device=self.device
             )
             spkcache_fifo_chunk_pre_encode_lengths = (
                 streaming_state.spkcache.shape[1] + streaming_state.fifo.shape[1] + chunk_pre_encode_lengths
+            )
+            # The shim only widens the encoder input of this step; the valid lengths and the chunk tensor that the
+            # streaming-state update consumes stay exactly as they were built above.
+            spkcache_fifo_chunk_pre_encode_embs = self._apply_compiled_flex_exact_128_boundary_shim(
+                spkcache_fifo_chunk_pre_encode_embs
             )
         spkcache_fifo_chunk_fc_encoder_embs, spkcache_fifo_chunk_fc_encoder_lengths = self.frontend_encoder(
             processed_signal=spkcache_fifo_chunk_pre_encode_embs,
@@ -1084,6 +1115,36 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         total_preds = torch.cat([total_preds, chunk_preds], dim=1)
 
         return streaming_state, total_preds
+
+    def _apply_compiled_flex_exact_128_boundary_shim(self, pre_encode_embs):
+        """
+        Append one masked frame when the packed encoder input is exactly 128 frames wide.
+
+        Temporary compatibility shim for the pinned torch 2.12 build, where a synchronous, unpadded, dynamically
+        compiled BF16 FlexAttention encoder fails inside Inductor kernel fusion at exactly this physical width.
+        Making the compiled encoder see 129 frames avoids that specialization while the logical sequence is
+        unchanged: the appended frame is filled with the model's negative initialization value and stays outside
+        the valid lengths, which this shim deliberately does not touch. Every other width is returned unchanged.
+
+        Args:
+            pre_encode_embs (torch.Tensor): Packed speaker-cache, FIFO and chunk embeddings with shape
+                ``(B, T_packed, D)``.
+
+        Returns:
+            pre_encode_embs (torch.Tensor): The same tensor, or a new tensor with one appended masked frame when
+                the shim is enabled and ``T_packed`` is exactly 128.
+        """
+        if not self.compiled_flex_exact_128_boundary_shim:
+            return pre_encode_embs
+        if pre_encode_embs.shape[1] != COMPILED_FLEX_EXACT_128_BOUNDARY_WIDTH:
+            return pre_encode_embs
+        masked_frame = torch.full(
+            (pre_encode_embs.shape[0], 1, pre_encode_embs.shape[2]),
+            self.negative_init_val,
+            dtype=pre_encode_embs.dtype,
+            device=pre_encode_embs.device,
+        )
+        return torch.cat([pre_encode_embs, masked_frame], dim=1)
 
     @staticmethod
     def _align_predictions_and_targets(preds, targets, target_lens):
