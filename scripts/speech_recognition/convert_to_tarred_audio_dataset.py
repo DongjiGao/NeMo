@@ -1,4 +1,5 @@
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2020, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -87,11 +88,9 @@ from datetime import datetime
 from io import BytesIO
 from typing import Any, List, Optional, Union
 
-import numpy as np
 import soundfile
 from joblib import Parallel, delayed
 from omegaconf import DictConfig, OmegaConf, open_dict
-from tabulate import tabulate
 from tqdm import tqdm
 
 try:
@@ -218,34 +217,15 @@ class ASRTarredDatasetBuilder:
         # Read the existing manifest
         entries, total_duration, filtered_entries, filtered_duration = self._read_manifest(manifest_path, config)
 
-        header = [
-            "Min.\nduration",
-            "Max.\nduration",
-            "Entries amount\nafter filtration",
-            "Total duration\nafter filtration",
-            "Shards\namount",
-            "Entries\nper shard",
-            "Remainded\nentries",
-        ]
-
-        entires_amount = f'{len(entries)} / {len(entries) + len(filtered_entries)}'
-        entries_duration = f'{total_duration:.2f} / {total_duration + filtered_duration:.2f} s'
-        entries_per_shard = len(entries) // config.num_shards
-        remainder = len(entries) % config.num_shards
-
-        data = [
-            [
-                f"{config.min_duration} s",
-                f"{config.max_duration} s",
-                f"{entires_amount}",
-                f"{entries_duration}",
-                f"{config.num_shards}",
-                f"{entries_per_shard}",
-                f"{remainder}",
-            ]
-        ]
-
-        print('\n' + tabulate(data, headers=header, tablefmt="grid", colalign=["center"] * len(header)))
+        print(
+            f"\n  Min duration:              {config.min_duration} s"
+            f"\n  Max duration:              {config.max_duration} s"
+            f"\n  Entries after filtration:   {len(entries)} / {len(entries) + len(filtered_entries)}"
+            f"\n  Duration after filtration:  {total_duration:.2f} / {total_duration + filtered_duration:.2f} s"
+            f"\n  Shards:                    {config.num_shards}"
+            f"\n  Entries per shard:         {len(entries) // config.num_shards}"
+            f"\n  Remainder entries:         {len(entries) % config.num_shards}"
+        )
         if dry_run:
             return
 
@@ -643,7 +623,7 @@ class ASRTarredDatasetBuilder:
         # Trim audio based on offset and duration.
         start_sample = int(offset * sampling_rate)
         num_frames = int(duration * sampling_rate) if duration else -1
-        audio, sampling_rate = soundfile.read(file_path, start=start_sample, frames=num_frames)
+        audio, sampling_rate = soundfile.read(audio_filepath, start=start_sample, frames=num_frames)
 
         # Determine codec parameters.
         if codec is not None:

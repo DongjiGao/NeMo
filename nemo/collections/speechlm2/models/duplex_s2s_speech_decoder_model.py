@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -64,7 +65,8 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
         # pretrained LM head weights.
         # However, for S2S we need to access the activations before LM head directly
         # to feed them to the audio codec head.
-        self.tokenizer = AutoTokenizer(self.cfg.pretrained_llm, use_fast=True)
+        tokenizer_src = self.cfg.get("tokenizer_path", None) or self.cfg.pretrained_llm
+        self.tokenizer = AutoTokenizer(tokenizer_src, use_fast=True)
         llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights).train()
         self.llm = llm.model  # fetch PretrainedBaseModel from model "ForCausalLM"
         self.lm_head = llm.lm_head

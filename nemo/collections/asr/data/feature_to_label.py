@@ -1,4 +1,5 @@
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2020, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
@@ -20,6 +21,9 @@ from nemo.collections.common.parts.preprocessing import collections
 from nemo.core.classes import Dataset
 from nemo.core.neural_types import AcousticEncodedRepresentation, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
+
+if TYPE_CHECKING:
+    from nemo.collections.asr.parts.preprocessing.perturb import AudioAugmentor
 
 
 def _feature_collate_fn(batch):
@@ -307,7 +311,7 @@ class FeatureToLabelDataset(Dataset):
         *,
         manifest_filepath: str,
         labels: List[str] = None,
-        augmentor: 'nemo.collections.asr.parts.perturb.AudioAugmentor' = None,
+        augmentor: 'AudioAugmentor' = None,
         window_length_in_sec: float = 0.63,
         shift_length_in_sec: float = 0.01,
         is_regression_task: bool = False,
@@ -420,7 +424,7 @@ class FeatureToMultiLabelDataset(Dataset):
         *,
         manifest_filepath: str,
         labels: List[str] = None,
-        augmentor: 'nemo.collections.asr.parts.perturb.AudioAugmentor' = None,
+        augmentor: 'AudioAugmentor' = None,
         delimiter: Optional[str] = None,
         is_regression_task: bool = False,
         cal_labels_occurrence: Optional[bool] = False,

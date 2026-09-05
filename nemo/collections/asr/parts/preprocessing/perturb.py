@@ -1,4 +1,5 @@
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2020, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -184,7 +185,7 @@ class TimeStretchPerturbation(Perturbation):
     .. [1] Ellis, D. P. W. "A phase vocoder in Matlab." Columbia University, 2002.
        `<http://www.ee.columbia.edu/~dpwe/resources/matlab/pvoc/>`_
     .. [2] librosa.effects.time_stretch
-       `<https://librosa.org/doc/main/generated/librosa.effects.time_stretch.html>`_
+       `<https://librosa.org/doc/latest/api/generated/librosa.effects.time_stretch.html#librosa.effects.time_stretch>`_
 
     Args:
         min_speed_rate: Minimum sampling rate modifier.
@@ -1209,10 +1210,8 @@ def process_augmentations(augmenter, global_rank=0, world_size=1) -> Optional[Au
     Then in the training script,
     ```python
     import copy
-    from ruamel.yaml import YAML
-    yaml = YAML(typ="safe")
-    with open(model_config) as f:
-        params = yaml.load(f)
+    from omegaconf import OmegaConf
+    params = OmegaConf.to_container(OmegaConf.load(model_config), resolve=True)
     # Train Config for Data Loader
     train_dl_params = copy.deepcopy(params["AudioToTextDataLayer"])
     train_dl_params.update(params["AudioToTextDataLayer"]["train"])

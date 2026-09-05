@@ -1,4 +1,5 @@
-# Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -95,10 +96,12 @@ class Adafactor(Optimizer):
 
     @property
     def supports_memory_efficient_fp16(self):
+        """Whether this optimizer supports memory-efficient fp16 training."""
         return True
 
     @property
     def supports_flat_params(self):
+        """Whether this optimizer supports flattened parameters."""
         return False
 
     def _get_lr(self, param_group, param_state):

@@ -1,4 +1,5 @@
-# Copyright (c) 2020-2025, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2020-2025, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,10 +18,11 @@
 
 coverage run -a --data-file=/workspace/.coverage --source=/workspace/nemo examples/asr/asr_hybrid_transducer_ctc/speech_to_text_hybrid_rnnt_ctc_bpe_prompt.py \
     --config-path="../conf/fastconformer/hybrid_transducer_ctc" --config-name="fastconformer_hybrid_transducer_ctc_bpe_prompt" \
-    model.train_ds.manifest_filepath=/home/TestData/asr/prompt_parakeet/multilingual_train.json \
-    model.validation_ds.manifest_filepath=/home/TestData/asr/prompt_parakeet/multilingual_dev.json \
-    model.test_ds.manifest_filepath=/home/TestData/asr/prompt_parakeet/multilingual_dev.json \
+    model.train_ds.manifest_filepath=/home/TestData/asr/prompt_parakeet/multilingual_train_target_lang_field.json \
+    model.validation_ds.manifest_filepath=/home/TestData/asr/prompt_parakeet/multilingual_dev_target_lang_field.json \
+    model.test_ds.manifest_filepath=/home/TestData/asr/prompt_parakeet/multilingual_dev_target_lang_field.json \
     model.tokenizer.dir="/home/TestData/asr/prompt_parakeet/merged_universal_tokenizer/" \
+    model.train_ds.num_workers=4 \
     model.validation_ds.batch_size=4 \
     trainer.devices=1 \
     trainer.accelerator="gpu" \

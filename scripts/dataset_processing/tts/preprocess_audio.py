@@ -1,4 +1,5 @@
-# Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -46,7 +47,6 @@ from typing import Tuple
 
 import librosa
 import soundfile as sf
-from hydra.utils import instantiate
 from joblib import Parallel, delayed
 from omegaconf import OmegaConf
 from tqdm import tqdm
@@ -54,6 +54,7 @@ from tqdm import tqdm
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest, write_manifest
 from nemo.collections.tts.parts.preprocessing.audio_trimming import AudioTrimmer
 from nemo.collections.tts.parts.utils.tts_dataset_utils import get_abs_rel_paths, normalize_volume
+from nemo.core.classes.common import safe_instantiate
 from nemo.utils import logging
 
 
@@ -218,7 +219,7 @@ def main():
 
     if args.trim_config_path:
         audio_trimmer_config = OmegaConf.load(args.trim_config_path)
-        audio_trimmer = instantiate(audio_trimmer_config)
+        audio_trimmer = safe_instantiate(audio_trimmer_config)
     else:
         audio_trimmer = None
 

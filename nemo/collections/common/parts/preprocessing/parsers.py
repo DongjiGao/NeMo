@@ -1,4 +1,5 @@
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2020, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -106,6 +107,7 @@ class CharParser:
         return tokens
 
     def decode(self, str_input):
+        """Decode token ids into labels."""
         r_map = {}
         for k, v in self._labels_map.items():
             r_map[v] = k

@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -537,7 +538,9 @@ class TestTranscriptionMixin:
     def test_timestamps_with_transcribe_hybrid_prompt(self, audio_files, hybrid_rnnt_ctc_bpe_model_with_prompt):
         audio1, audio2 = audio_files
 
-        output = hybrid_rnnt_ctc_bpe_model_with_prompt.transcribe([audio1, audio2], timestamps=True)
+        output = hybrid_rnnt_ctc_bpe_model_with_prompt.transcribe(
+            [audio1, audio2], timestamps=True, target_lang="en-US"
+        )
 
         # check len of output
         assert len(output) == 2

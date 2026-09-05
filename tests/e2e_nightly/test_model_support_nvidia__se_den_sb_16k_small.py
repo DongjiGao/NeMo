@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -61,7 +62,7 @@ def test_model_training_step():
     input_signal = torch.randn(B, C, T, device=d)
     input_length = torch.tensor([T], device=d)
     target_signal = torch.randn(B, C, T, device=d)
-    loss, _loss_enc, _loss_time = model._step(
+    loss = model._step(
         target_signal=target_signal,
         input_signal=input_signal,
         input_length=input_length,

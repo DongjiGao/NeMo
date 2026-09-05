@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -74,7 +75,7 @@ def load_model(cfg: DictConfig, trainer: pl.Trainer) -> ASRModel:
         )
     if cfg.get("init_from_ptl_ckpt", None):
         logging.info(f"Loading weights from checkpoint: {cfg.init_from_ptl_ckpt}")
-        state_dict = torch.load(cfg.init_from_ptl_ckpt, map_location='cpu', weights_only=False)['state_dict']
+        state_dict = torch.load(cfg.init_from_ptl_ckpt, map_location='cpu')['state_dict']
         model.load_state_dict(state_dict, strict=True)
     return model
 

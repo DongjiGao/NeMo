@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +21,7 @@ exercised — we validate cut metadata and loader-call semantics only.
 
 import tarfile
 from pathlib import Path
+from unittest.mock import patch
 
 import lhotse
 import pytest
@@ -367,13 +369,16 @@ class _FakeTokenizer:
 
 @pytest.mark.unit
 def test_salm_dataset_batch_loader_enabled(monkeypatch):
-    pytest.importorskip("aistore")  # AISBatchLoader requires the aistore client.
     monkeypatch.setenv("USE_AIS_GET_BATCH", "true")
     from nemo.collections.speechlm2.data.salm_dataset import SALMDataset
 
-    ds = SALMDataset(tokenizer=_FakeTokenizer())
-    assert isinstance(ds.load_audio, AudioSamples)
-    assert ds.load_audio.use_batch_loader is True
+    with patch("nemo.collections.speechlm2.data.salm_dataset.AudioSamples") as audio_samples:
+        ds = SALMDataset(tokenizer=_FakeTokenizer())
+
+    audio_samples.assert_called_once_with(
+        fault_tolerant=True, use_batch_loader=True, ais_force_individual=False, mono_downmix=True
+    )
+    assert ds.load_audio is audio_samples.return_value
 
 
 @pytest.mark.unit
@@ -381,6 +386,10 @@ def test_salm_dataset_batch_loader_disabled(monkeypatch):
     monkeypatch.delenv("USE_AIS_GET_BATCH", raising=False)
     from nemo.collections.speechlm2.data.salm_dataset import SALMDataset
 
-    ds = SALMDataset(tokenizer=_FakeTokenizer())
-    assert isinstance(ds.load_audio, AudioSamples)
-    assert ds.load_audio.use_batch_loader is False
+    with patch("nemo.collections.speechlm2.data.salm_dataset.AudioSamples") as audio_samples:
+        ds = SALMDataset(tokenizer=_FakeTokenizer())
+
+    audio_samples.assert_called_once_with(
+        fault_tolerant=True, use_batch_loader=False, ais_force_individual=False, mono_downmix=True
+    )
+    assert ds.load_audio is audio_samples.return_value

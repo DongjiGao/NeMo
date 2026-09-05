@@ -1,4 +1,5 @@
-# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -83,7 +84,7 @@ def __process_transcript(file_path: str):
             wav_name = wav_name.replace('DL', 'SF')
             wav_file = file_path / "wavs" / (wav_name + ".wav")
             assert os.path.exists(wav_file), f"{wav_file} not found!"
-            duration = subprocess.check_output(f"soxi -D {wav_file}", shell=True)
+            duration = subprocess.check_output(["soxi", "-D", str(wav_file)])
             simplified_text = cc.convert(text)
             normalized_text = normalizer_call(simplified_text)
             entry = {

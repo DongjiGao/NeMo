@@ -1,4 +1,5 @@
-# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,9 +15,9 @@
 
 
 import torch
-from hydra.utils import instantiate
 from tqdm import tqdm
 
+from nemo.core.classes.common import safe_instantiate
 from nemo.core.config import hydra_runner
 
 
@@ -46,7 +47,7 @@ CFG_NAME2FUNC = {
 
 @hydra_runner(config_path='ljspeech/ds_conf', config_name='ds_for_fastpitch_align')
 def main(cfg):
-    dataset = instantiate(cfg.dataset)
+    dataset = safe_instantiate(cfg.dataset)
     dataloader = torch.utils.data.DataLoader(
         dataset=dataset,
         batch_size=1,

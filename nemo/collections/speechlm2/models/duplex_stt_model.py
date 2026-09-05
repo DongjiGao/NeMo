@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -83,12 +84,13 @@ class DuplexSTTModel(LightningModule, HFHubMixin):
         llm = load_pretrained_hf(
             self.cfg.pretrained_llm,
             pretrained_weights=self.cfg.pretrained_weights,
-            trust_remote_code=self.cfg.get("trust_remote_code", True),
+            trust_remote_code=self.cfg.get("trust_remote_code", False),
         ).train()
 
         # Initialize tokenizer with optional special tokens from config
+        tokenizer_src = self.cfg.get("tokenizer_path", None) or self.cfg.pretrained_llm
         self.tokenizer = AutoTokenizer(
-            self.cfg.pretrained_llm,
+            tokenizer_src,
             use_fast=True,
             bos_token=self.cfg.get("bos_token", None),
             eos_token=self.cfg.get("eos_token", None),

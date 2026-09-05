@@ -1,4 +1,5 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +14,7 @@
 # limitations under the License.
 
 """
-Tests for cpWER calculation in nemo.collections.asr.metrics.der.
+Tests for cpWER calculation in nemo.collections.asr.metrics.cpwer.
 All expected values are pre-verified against MeetEval (https://github.com/fgnt/meeteval).
 """
 
@@ -21,7 +22,7 @@ from itertools import permutations
 import pytest
 import torch
 
-from nemo.collections.asr.metrics.der import (
+from nemo.collections.asr.metrics.cpwer import (
     calculate_session_cpWER,
     calculate_session_cpWER_bruteforce,
     concat_perm_word_error_rate,

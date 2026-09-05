@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -56,6 +57,9 @@ class CacheAwareCTCInferenceWrapper(CacheAwareASRInferenceWrapper):
             self.asr_model.encoder.setup_streaming_params()
 
         self.drop_extra_pre_encoded = self.get_drop_extra_pre_encoded()
+
+        self.cast_dtype = torch.float32 if self.use_amp else self.compute_dtype
+        self.asr_model.to(self.cast_dtype)
 
     def get_blank_id(self) -> int:
         """
@@ -179,6 +183,8 @@ class CacheAwareCTCInferenceWrapper(CacheAwareASRInferenceWrapper):
 
         if processed_signal_length.device != self.device:
             processed_signal_length = processed_signal_length.to(self.device)
+
+        processed_signal = processed_signal.to(self.cast_dtype)
 
         if context is None:
             # create a dummy context

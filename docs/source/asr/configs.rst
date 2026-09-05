@@ -10,7 +10,7 @@ for audio files, parameters for any augmentation being performed, as well as the
 this page cover each of these in more detail.
 
 Example configuration files for all of the NeMo ASR scripts can be found in the
-`config directory of the examples <https://github.com/NVIDIA/NeMo/tree/stable/examples/asr/conf>`_.
+`config directory of the examples <https://github.com/NVIDIA-NeMo/Speech/tree/stable/examples/asr/conf>`_.
 
 .. _asr-configs-dataset-configuration:
 
@@ -234,7 +234,7 @@ BLEU score relies on TorchMetrics' SacreBLEU implementation and supports all Sac
 
 **Dynamic Tokenizer Selection**
 
-In multilingual training scenarios, it is somtimes desireable to configure the BLEU tokenizer per sample to avoid sub-optimal parsing (e.g. tokenizing Chinese characters as English words). This can be toggled with ``check_cuts_for_bleu_tokenizers: true``. When enabled with Lhotse dataloading, BLEU will check individual ``cuts`` in a batch's Lhotse ``CutSet`` for the ``bleu_tokenizer`` attribute. If found, the tokenizer will be used for that sample. If not, the default ``bleu_tokenizer`` from config will be used.
+In multilingual training scenarios, it is sometimes desirable to configure the BLEU tokenizer per sample to avoid sub-optimal parsing (e.g. tokenizing Chinese characters as English words). This can be toggled with ``check_cuts_for_bleu_tokenizers: true``. When enabled with Lhotse dataloading, BLEU will check individual ``cuts`` in a batch's Lhotse ``CutSet`` for the ``bleu_tokenizer`` attribute. If found, the tokenizer will be used for that sample. If not, the default ``bleu_tokenizer`` from config will be used.
 
 MultiTask Metrics
 ~~~~~~~~~~~~~~~~~
@@ -412,7 +412,7 @@ The config files for Conformer-CTC model contain character-based encoding and su
 respectively. Some components of the configs of :ref:`Conformer-CTC <Conformer-CTC_model>` include the following datasets:
 
 * ``train_ds``, ``validation_ds``, and ``test_ds``
-* opimizer (``optim``)
+* optimizer (``optim``)
 * augmentation (``spec_augment``)
 * ``decoder``
 * ``trainer``
@@ -430,6 +430,61 @@ Conformer-Transducer
 ~~~~~~~~~~~~~~~~~~~~
 
 Please refer to the model page of :ref:`Conformer-Transducer <Conformer-Transducer_model>` for more information on this model.
+
+
+Streaming Transformer
+~~~~~~~~~~~~~~~~~~~~~
+
+:ref:`nemo.collections.asr.modules.StreamingTransformerEncoder <streaming-transformer-encoder-api>`
+is a convolution-free Transformer encoder for streaming ASR. It extends
+:ref:`TransformerEncoder <transformer-encoder-api>` with local attention and a rolling KV cache,
+and implements the same cache-aware streaming interface as ``ConformerEncoder``, so it can be
+driven by the shared streaming tooling unchanged.
+
+Attention is bounded by ``att_context_size: [left, right]``, in encoder frames, under one of two
+``att_context_style`` values:
+
+* ``chunked_limited`` — frames are grouped into chunks of ``right + 1``, and a query attends to
+  its whole chunk plus the ``left // (right + 1)`` preceding chunks. The look-ahead does **not**
+  compound across layers, so streaming stays exact at any depth. Use this for in-chunk look-ahead.
+* ``sliding_window`` (default) — a query attends to ``[t - left, t + right]``. Exact for
+  streaming only when ``right == 0``, since a sliding right context compounds across layers.
+
+The read-only ``cache_size`` property reports how many encoder frames the rolling KV cache retains.
+For ``sliding_window`` it equals ``left``. For ``chunked_limited`` it is rounded down to the visible
+whole chunks when ``right`` is finite: ``(left // (right + 1)) * (right + 1)``. An unlimited right
+context uses ``left`` directly. A negative cache size means unbounded left context;
+``setup_streaming_params`` maps it to ``max_context`` (10,000 frames by default) for the allocated
+streaming cache. This is separate from ``pre_encode_cache_size``, which retains input-feature frames
+needed before subsampling.
+
+Passing a list of pairs trains one model across several latencies; one entry is sampled per
+training batch, and evaluation and streaming use the first entry (or whatever
+``set_default_att_context_size`` pins). Select the operating point at inference with
+``transcribe_speech.py att_context_size=[70,13]``.
+
+.. code-block:: yaml
+
+  model:
+    encoder:
+      _target_: nemo.collections.asr.modules.transformer_encoder.StreamingTransformerEncoder
+      d_model: 1024
+      n_heads: 8
+      n_layers: 48
+      subsampling: feature_stacking
+      subsampling_factor: 8
+      self_attention_model: rope     # rel_pos | abs_pos | rope | no_pos
+      qk_norm: true
+      att_context_style: chunked_limited
+      att_context_size: [[70, 13], [70, 6], [70, 1], [70, 0]]
+      # Input-frame look-back prepended to each streaming chunk so the mel front-end's STFT
+      # window has its context. Must be a multiple of ``subsampling_factor``. ``FeatureStacking``
+      # is non-overlapping and needs none of this offline, but a streaming front-end that
+      # recomputes the spectrogram per chunk does.
+      pre_encode_cache_size: ${model.encoder.subsampling_factor}
+
+A ready-to-train RNN-T recipe ships at
+``examples/asr/conf/transformer/transformer_stacking_rnnt_bpe_streaming.yaml``.
 
 
 Transducer Configurations
@@ -746,6 +801,28 @@ is supported for both CTC and Transducer model variations (or any other kind of 
 conformer as encoder).
 
 
+Fused Subsampling Kernels Config
+--------------------------------
+
+With `Triton <https://triton-lang.org>`_ installed, the ``dw_striding`` pre-encoder of
+:ref:`nemo.collections.asr.modules.ConformerEncoder <conformer-encoder-api>` runs as fused Triton kernels rather than
+separate PyTorch convolutions. Weights and checkpoints are identical either way, so only speed and peak memory change.
+
+The kernels need ``dw_striding``, a ``subsampling_factor`` of 4 or more, a ReLU activation and CUDA inputs. Anything
+else uses the PyTorch path, as do tracing and export. Use ``use_triton`` to control this:
+
+.. code-block:: yaml
+
+   model:
+      # ...
+      encoder:
+        # ...
+        use_triton: false  # null, the default, uses the kernels when Triton is installed
+
+Asking for ``use_triton: true`` on a configuration the kernels do not cover logs a warning and falls back to PyTorch.
+Asking for it without Triton installed raises on the first forward pass that would have used the kernels.
+
+
 .. _Hybrid-Transducer-CTC-Prompt_model__Config:
 
 Hybrid-Transducer-CTC with Prompt Conditioning Configuration
@@ -826,3 +903,100 @@ A complete example configuration can be found at:
       model.validation_ds.manifest_filepath=<path_to_val_manifest> \
       model.tokenizer.dir=<path_to_tokenizer> \
       model.test_ds.manifest_filepath=<path_to_test_manifest>
+
+
+.. _RNNT-Prompt_model__Config:
+
+RNN-T with Prompt Conditioning Configuration
+--------------------------------------------
+
+The :ref:`RNN-T model with prompt conditioning <RNNT-Prompt_model>`
+(``EncDecRNNTBPEModelWithPrompt``) is the RNN-T-only counterpart of the hybrid prompt model
+(no auxiliary CTC head). It targets cache-aware streaming multilingual ASR using the same
+one-hot language-ID prompt concatenation as the hybrid variant.
+
+**Key Configuration Parameters:**
+
+The prompt-specific parameters live in the ``model_defaults`` section, mirroring the hybrid
+variant:
+
+.. code-block:: yaml
+
+  model:
+    model_defaults:
+      # Prompt Feature Configuration
+      initialize_prompt_feature: true  # Enable prompt conditioning
+      num_prompts: 128                 # Number of supported prompt categories
+      prompt_dictionary: {             # Mapping from identifiers to prompt indices
+        'en-US': 0,
+        'de-DE': 1,
+        'fr-FR': 2,
+        'es-ES': 3,
+        # ... additional language codes ...
+        'auto': 127,                   # Per-sample dynamic language (read from manifest)
+      }
+
+**Dataset Configuration:**
+
+The model uses the same index-based Lhotse dataset
+(``LhotseSpeechToTextBpeDatasetWithPromptIndex``) as the hybrid model:
+
+.. code-block:: yaml
+
+  model:
+    train_ds:
+      use_lhotse: true
+      initialize_prompt_feature: true
+      prompt_field: "target_lang"     # Field name for per-sample prompt extraction
+      prompt_dictionary: ${model.model_defaults.prompt_dictionary}
+      num_prompts: ${model.model_defaults.num_prompts}
+
+    validation_ds:
+      use_lhotse: true
+      initialize_prompt_feature: true
+      prompt_field: "target_lang"
+      prompt_dictionary: ${model.model_defaults.prompt_dictionary}
+      num_prompts: ${model.model_defaults.num_prompts}
+
+**Manifest Format:**
+
+Identical to the hybrid model — each entry needs a ``target_lang`` field:
+
+.. code-block:: json
+
+  {
+    "audio_filepath": "/path/to/audio.wav",
+    "text": "transcription text",
+    "duration": 10.5,
+    "target_lang": "en-US"
+  }
+
+**Example Configuration:**
+
+A cache-aware streaming RNN-T prompt config ships at:
+``<NeMo_git_root>/examples/asr/conf/fastconformer/cache_aware_streaming/fastconformer_transducer_bpe_streaming_prompt.yaml``
+
+**Training Command:**
+
+.. code-block:: bash
+
+  python <NeMo_git_root>/examples/asr/asr_transducer/speech_to_text_rnnt_bpe_prompt.py \
+      --config-path=<NeMo_git_root>/examples/asr/conf/fastconformer/cache_aware_streaming/ \
+      --config-name=fastconformer_transducer_bpe_streaming_prompt.yaml \
+      model.train_ds.manifest_filepath=<path_to_train_manifest> \
+      model.validation_ds.manifest_filepath=<path_to_val_manifest> \
+      model.tokenizer.dir=<path_to_tokenizer> \
+      model.test_ds.manifest_filepath=<path_to_test_manifest>
+
+**Streaming Inference:**
+
+The standard cache-aware streaming inference script accepts ``target_lang`` (and the optional
+``strip_lang_tags`` / ``lang_tag_pattern`` flags) for prompt-conditioned models:
+
+.. code-block:: bash
+
+  python <NeMo_git_root>/examples/asr/asr_cache_aware_streaming/speech_to_text_cache_aware_streaming_infer.py \
+      model_path=<path_to_nemo_checkpoint> \
+      dataset_manifest=<path_to_manifest> \
+      target_lang=<en-US|auto|...> \
+      strip_lang_tags=true

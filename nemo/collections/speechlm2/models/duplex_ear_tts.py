@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -92,10 +93,11 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         self.audio_codec_run_dtype = getattr(torch, self.cfg.get("audio_codec_run_dtype", "float32"), torch.float32)
 
         # Load tokenizer
+        tokenizer_src = self.cfg.get("tokenizer_path", None) or self.cfg.pretrained_lm_name
         self.tokenizer = AutoTokenizer(
-            self.cfg.pretrained_lm_name,
+            tokenizer_src,
             use_fast=True,
-            trust_remote_code=True,
+            trust_remote_code=self.cfg.get("trust_remote_code", False),
             bos_token=self.cfg.get("bos_token", None),
             eos_token=self.cfg.get("eos_token", None),
             pad_token=self.cfg.get("pad_token", None),
@@ -181,7 +183,9 @@ class DuplexEARTTS(LightningModule, HFHubMixin):
         """Load language model for RVQ-EAR-TTS."""
         if cfg.pretrained_lm_name:
             language_model = load_pretrained_hf(
-                self.cfg.pretrained_lm_name, pretrained_weights=True, trust_remote_code=True
+                self.cfg.pretrained_lm_name,
+                pretrained_weights=True,
+                trust_remote_code=self.cfg.get("trust_remote_code", False),
             ).eval()
         else:
             language_model = None

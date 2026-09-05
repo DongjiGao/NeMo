@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,9 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import editdistance
 import pytest
 import torch
+from kaldialign import edit_distance
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 
@@ -166,7 +167,9 @@ def test_multi_task_streaming_decoding(
 
     # compare decoding results with reference transcripts
     ref_transcripts = [item['text'] for item in manifest]
-    assert editdistance.eval(ref_transcripts, all_hyps) <= len(ref_transcripts) * 0.1  # Expected WER is less than 10%
+    assert (
+        edit_distance(ref_transcripts, all_hyps)['total'] <= len(ref_transcripts) * 0.1
+    )  # Expected WER is less than 10%
 
     # compute latency
     audio_encoder_fs = 80  # in ms

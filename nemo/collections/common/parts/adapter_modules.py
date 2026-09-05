@@ -1,4 +1,5 @@
-# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,11 +16,11 @@
 from dataclasses import dataclass, field, is_dataclass
 from typing import Any, Optional
 
-from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from torch import nn as nn
 
 from nemo.collections.common.parts.utils import activation_registry
+from nemo.core.classes.common import safe_instantiate
 from nemo.core.classes.mixins import access_mixins, adapter_mixin_strategies
 
 
@@ -49,7 +50,7 @@ class AdapterModuleUtil(access_mixins.AccessMixin):
         # The config must have the `_target_` field pointing to the actual adapter strategy class
         # which will load that strategy dynamically to this module.
         if isinstance(adapter_strategy, dict) or OmegaConf.is_config(adapter_strategy):
-            self.adapter_strategy = instantiate(adapter_strategy)
+            self.adapter_strategy = safe_instantiate(adapter_strategy)
         elif isinstance(adapter_strategy, adapter_mixin_strategies.AbstractAdapterStrategy):
             self.adapter_strategy = adapter_strategy
         else:
@@ -136,6 +137,7 @@ class LinearAdapter(nn.Module, AdapterModuleUtil):
         self.reset_parameters()
 
     def reset_parameters(self):
+        """Initialize adapter projection parameters."""
         # Final layer initializations must be 0
         if self.norm_position == 'pre':
             self.module[-1].weight.data *= 0
@@ -145,6 +147,7 @@ class LinearAdapter(nn.Module, AdapterModuleUtil):
             self.module[-1].bias.data *= 0
 
     def forward(self, x):
+        """Apply the adapter module to the input tensor."""
         x = self.module(x)
 
         # Add dropout if available
@@ -156,6 +159,8 @@ class LinearAdapter(nn.Module, AdapterModuleUtil):
 
 @dataclass
 class LinearAdapterConfig:
+    """Configuration for a linear adapter module."""
+
     in_features: int
     dim: int
     activation: str = 'swish'

@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -147,6 +148,19 @@ class GPUBiasingMultiModelBase(abc.ABC, nn.Module):
         """
         pass
 
+    @abstractmethod
+    def get_alphas(self, model_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Return per-stream biasing alpha weights for blank LM scaling.
+
+        Args:
+            model_ids: per-stream model ids [batch_size] (-1 = no biasing for that stream)
+
+        Returns:
+            tensor [batch_size] with alpha per stream (0.0 where model_ids < 0)
+        """
+        pass
+
 
 class GPUBiasingMultiModelReference(GPUBiasingMultiModelBase):
     """Reference implementation (incompatible with CUDA graphs)"""
@@ -225,6 +239,14 @@ class GPUBiasingMultiModelReference(GPUBiasingMultiModelBase):
         return torch.full(
             [batch_size], fill_value=self.bos_state if bos else self.START_STATE, device=device, dtype=torch.long
         )
+
+    def get_alphas(self, model_ids: torch.Tensor) -> torch.Tensor:
+        valid = model_ids >= 0
+        if not self.alphas:
+            return torch.zeros(model_ids.shape[0], device=model_ids.device, dtype=torch.float32)
+        alphas = torch.tensor(self.alphas, device=model_ids.device, dtype=torch.float32)
+        gathered = alphas[model_ids]
+        return torch.where(valid, gathered, torch.zeros_like(gathered))
 
     def advance(
         self, states: torch.Tensor, model_ids: torch.Tensor, eos_id: int | None = None
@@ -574,6 +596,11 @@ class GPUBiasingMultiModel(GPUBiasingMultiModelBase):
         return torch.full(
             [batch_size], fill_value=self.bos_state if bos else self.START_STATE, device=device, dtype=torch.long
         )
+
+    def get_alphas(self, model_ids: torch.Tensor) -> torch.Tensor:
+        valid = model_ids >= 0
+        gathered = self.model2alpha[model_ids]
+        return torch.where(valid, gathered, torch.zeros_like(gathered))
 
     def advance(
         self, states: torch.Tensor, model_ids: torch.Tensor, eos_id: int | None = None

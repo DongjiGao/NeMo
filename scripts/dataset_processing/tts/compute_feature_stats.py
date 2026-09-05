@@ -1,4 +1,5 @@
-# Copyright (c) 2023, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2023, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -62,11 +63,11 @@ from pathlib import Path
 from typing import List, Tuple
 
 import torch
-from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
+from nemo.core.classes.common import safe_instantiate
 
 
 def get_args():
@@ -176,7 +177,7 @@ def main():
             raise ValueError(f"Stats path already exists: {stats_path}")
 
     feature_config = OmegaConf.load(feature_config_path)
-    feature_config = instantiate(feature_config)
+    feature_config = safe_instantiate(feature_config)
     featurizer_dict = feature_config.featurizers
 
     print(f"Found featurizers for {list(featurizer_dict.keys())}.")
