@@ -55,9 +55,8 @@ from pytorch_lightning import seed_everything
 
 from nemo.collections.asr.metrics.der import score_labels
 from nemo.collections.asr.models import SortformerEncLabelModel
-from nemo.collections.asr.models.sortformer_diar_models import COMPILED_FLEX_EXACT_128_BOUNDARY_WIDTH
 from nemo.collections.asr.parts.utils.diarization_utils import convert_pred_mat_to_segments
-from nemo.collections.asr.parts.utils.sortformer_fa4_attention import (
+from nemo.collections.asr.parts.utils.sortformer_attention_backends import (
     FLEX_BACKEND,
     attention_backend_cache_identity,
     attention_backend_info,
@@ -114,9 +113,9 @@ class DiarizationConfig:
     # Audio duration, in seconds, covered by the measured (non-warmup) forward calls; manifest total otherwise.
     measured_audio_duration: Optional[float] = None
 
-    # Attention backend for the transformer encoders: flex (default, PyTorch FlexAttention), fa4_cute
-    # (opt-in inference-only FlashAttention-4 on Blackwell GPUs) or fp8_flex (opt-in inference-only
-    # float8_e4m3fn FlexAttention on the Triton backend, Blackwell GPUs, same key-padding block mask).
+    # Attention backend for the transformer encoders: flex (default, PyTorch FlexAttention) or fp8_flex
+    # (opt-in inference-only float8_e4m3fn FlexAttention on the Triton backend, Blackwell GPUs, same
+    # key-padding block mask).
     attention_backend: str = "flex"
 
     use_lhotse: bool = True
@@ -371,32 +370,6 @@ def resolve_encoder_compile_kwargs(cfg: DiarizationConfig) -> Dict[str, Any]:
     if cfg.compile_cuda_graphs or cfg.compile_streaming_encoder_cuda_graphs:
         return {"dynamic": False, "mode": CUDA_GRAPH_COMPILE_MODE}
     return {"dynamic": cfg.compile_dynamic}
-
-
-def should_enable_exact_128_boundary_shim(cfg: DiarizationConfig) -> bool:
-    """
-    Decide whether the exact-128 compiled FlexAttention boundary shim applies to this configuration.
-
-    The pinned torch 2.12 build fails inside Inductor kernel fusion when a synchronous, unpadded, dynamically
-    compiled BF16 FlexAttention encoder is called with a physical time width of exactly
-    ``COMPILED_FLEX_EXACT_128_BOUNDARY_WIDTH``. That is the only combination the shim is meant for, so every other
-    run - eager, asynchronous, fixed-shape, statically compiled, non-Flex or non-BF16 - keeps its current behaviour.
-
-    Args:
-        cfg (DiarizationConfig): The configuration object containing the compilation and streaming options.
-
-    Returns:
-        enabled (bool): True when all conditions of the failing combination hold.
-    """
-    return (
-        cfg.compile_encoder
-        and cfg.compile_dynamic
-        and cfg.streaming_mode is True
-        and not cfg.async_streaming
-        and not cfg.async_pad_to_max
-        and cfg.attention_backend == FLEX_BACKEND
-        and str(cfg.precision).startswith("bf16")
-    )
 
 
 def validate_fixed_shape_adapter_env(max_audio_length: int) -> None:
@@ -923,17 +896,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     if cfg.attention_backend != FLEX_BACKEND:
         backend_info = attention_backend_info(cfg.attention_backend, diar_model.device)
         logging.info(f"Attention backend details: {json.dumps(backend_info)}")
-
-    if should_enable_exact_128_boundary_shim(cfg):
-        diar_model.compiled_flex_exact_128_boundary_shim = True
-        boundary_width = COMPILED_FLEX_EXACT_128_BOUNDARY_WIDTH
-        logging.info(
-            "Exact-128 compiled FlexAttention boundary shim enabled: this run is synchronous, unpadded, dynamically "
-            "compiled BF16 FlexAttention, where the pinned PyTorch build fails Inductor kernel fusion at a physical "
-            f"encoder time width of exactly {boundary_width}. One masked frame is appended only at that width, so "
-            f"the compiled encoder sees physical T={boundary_width + 1} while the valid length stays "
-            f"{boundary_width}. All other widths, the streaming state and the valid lengths are unchanged."
-        )
 
     if cfg.compile_cuda_graphs:
         # Materialize the retained positional state before compilation so that no batch extends it from inside a
