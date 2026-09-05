@@ -22,8 +22,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
 from nemo.collections.asr.parts.utils import sortformer_fp8_flex_attention
-from nemo.collections.asr.parts.utils.sortformer_fa4_attention import (
-    FA4_CUTE_BACKEND,
+from nemo.collections.asr.parts.utils.sortformer_attention_backends import (
     FLEX_BACKEND,
     SUPPORTED_ATTENTION_BACKENDS,
     attention_backend_cache_identity,
@@ -173,10 +172,9 @@ class TestBackendSelection:
         assert validate_attention_backend(FP8_FLEX_BACKEND) == FP8_FLEX_BACKEND
 
     @pytest.mark.unit
-    def test_default_and_fa4_selection_are_unchanged(self):
+    def test_default_selection_is_unchanged(self):
         assert validate_attention_backend(None) == FLEX_BACKEND
         assert validate_attention_backend(FLEX_BACKEND) == FLEX_BACKEND
-        assert validate_attention_backend(FA4_CUTE_BACKEND) == FA4_CUTE_BACKEND
 
     @pytest.mark.unit
     @pytest.mark.parametrize("backend", ["fp8", "FP8_FLEX", "fp8-flex", "fp8_flex ", "flex_fp8", "fp8flex"])
@@ -231,7 +229,6 @@ class TestModelWiring:
     @pytest.mark.unit
     def test_cache_identity_is_distinct_and_non_null(self):
         assert attention_backend_cache_identity(FP8_FLEX_BACKEND) == FP8_FLEX_BACKEND
-        assert attention_backend_cache_identity(FP8_FLEX_BACKEND) != attention_backend_cache_identity(FA4_CUTE_BACKEND)
         # Unchanged defaults: caches written before any backend option existed keep matching a default run.
         assert attention_backend_cache_identity(FLEX_BACKEND) is None
         assert attention_backend_cache_identity(None) is None
@@ -245,9 +242,8 @@ class TestModelWiring:
         assert info["inference_only"] is True
         assert info["supported_capability_majors"] == list(SUPPORTED_CAPABILITY_MAJORS)
         assert set(info) >= {"torch_version", "cuda_version", "cuda_available", "device_name", "compute_capability"}
-        # Must never be mislabeled as FA4 / FlashAttention.
+        # Must never be mislabeled as FlashAttention.
         assert "flash_attn_version" not in info
-        assert FA4_CUTE_BACKEND not in repr(info)
 
     @pytest.mark.unit
     def test_backend_info_names_the_custom_op_without_claiming_a_custom_kernel(self):
@@ -263,7 +259,6 @@ class TestModelWiring:
     @pytest.mark.unit
     def test_dispatched_backend_info_matches_the_selected_backend(self):
         assert attention_backend_info(FP8_FLEX_BACKEND)["backend"] == FP8_FLEX_BACKEND
-        assert attention_backend_info(FA4_CUTE_BACKEND)["backend"] == FA4_CUTE_BACKEND
         assert attention_backend_info(FLEX_BACKEND)["backend"] == FLEX_BACKEND
 
     @pytest.mark.unit

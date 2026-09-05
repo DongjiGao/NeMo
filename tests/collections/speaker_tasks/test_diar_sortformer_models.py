@@ -39,7 +39,6 @@ from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech impor
     install_streaming_cuda_graph_length_stabilizer,
     resolve_encoder_compile_kwargs,
     resolve_streaming_cuda_graph_targets,
-    should_enable_exact_128_boundary_shim,
     stabilize_encoder_max_audio_length,
     validate_compile_backend,
     validate_cuda_graph_config,
@@ -50,7 +49,6 @@ from omegaconf import DictConfig
 from onnx.reference import ReferenceEvaluator
 
 from nemo.collections.asr.models import SortformerEncLabelModel
-from nemo.collections.asr.models.sortformer_diar_models import COMPILED_FLEX_EXACT_128_BOUNDARY_WIDTH
 from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking
 from nemo.collections.asr.parts.utils.sortformer_utils import InferenceProfiler, configure_output_subsampling_factor
 
@@ -1639,9 +1637,6 @@ class TestSortformerNaturalDynamicSpecialization:
         assert min(widths) < packed_capacity
         assert max(widths) <= packed_capacity
         assert min(widths) < 128
-        # The exact-128 compiled FlexAttention shim, the only width-changing exception, is off on this model, so
-        # every recorded width is the width the streaming state produced.
-        assert model.compiled_flex_exact_128_boundary_shim is False
 
     @pytest.mark.unit
     @pytest.mark.parametrize("audio_shape, audio_lengths", [((2, 8000), (8000, 6000))])
@@ -1724,127 +1719,6 @@ def _run_streaming_step_with_packed_width(
     finally:
         model.frontend_encoder = frontend_encoder
     return encoder_calls, chunk_embs, streaming_state
-
-
-class TestSortformerExact128BoundaryShim:
-    """The exact-128 compiled FlexAttention boundary shim widens one width and touches nothing else."""
-
-    @pytest.mark.unit
-    def test_shim_is_disabled_by_default(self, sortformer_model):
-        assert COMPILED_FLEX_EXACT_128_BOUNDARY_WIDTH == 128
-        assert sortformer_model.compiled_flex_exact_128_boundary_shim is False
-
-    @pytest.mark.unit
-    def test_disabled_shim_passes_exact_128_unchanged(self):
-        model = _streaming_model_with_capacities(fifo_len=512, chunk_len=8, chunk_left_context=0)
-
-        encoder_calls, _, _ = _run_streaming_step_with_packed_width(model, packed_width=128)
-
-        assert len(encoder_calls) == 1
-        packed_embs, packed_lengths = encoder_calls[0]
-        assert packed_embs.shape[1] == 128
-        assert packed_lengths.tolist() == [128, 128]
-
-    @pytest.mark.unit
-    def test_enabled_shim_appends_one_masked_frame_at_exact_128(self):
-        model = _streaming_model_with_capacities(fifo_len=512, chunk_len=8, chunk_left_context=0)
-        model.compiled_flex_exact_128_boundary_shim = True
-
-        encoder_calls, chunk_embs, streaming_state = _run_streaming_step_with_packed_width(model, packed_width=128)
-
-        packed_embs, packed_lengths = encoder_calls[0]
-        assert packed_embs.shape[1] == 129
-        # The valid length stays at the logical width, so the appended frame is masked everywhere downstream.
-        assert packed_lengths.tolist() == [128, 128]
-        expected_frame = torch.full_like(packed_embs[:, -1], model.negative_init_val)
-        assert torch.equal(packed_embs[:, -1], expected_frame)
-        # The logical sequence is untouched: the chunk still ends the valid prefix.
-        assert torch.equal(packed_embs[:, 120:128], chunk_embs)
-        # Neither the chunk tensor nor the streaming state the update consumed grew by the appended frame.
-        assert chunk_embs.shape[1] == 8
-        assert streaming_state.fifo.shape[1] == 128
-
-    @pytest.mark.unit
-    @pytest.mark.parametrize("packed_width", [64, 126, 127, 129, 130])
-    def test_enabled_shim_leaves_other_widths_unchanged(self, packed_width):
-        model = _streaming_model_with_capacities(fifo_len=512, chunk_len=8, chunk_left_context=0)
-        model.compiled_flex_exact_128_boundary_shim = True
-
-        encoder_calls, _, _ = _run_streaming_step_with_packed_width(model, packed_width=packed_width)
-
-        packed_embs, packed_lengths = encoder_calls[0]
-        assert packed_embs.shape[1] == packed_width
-        assert packed_lengths.tolist() == [packed_width, packed_width]
-
-    @pytest.mark.unit
-    def test_enabled_shim_leaves_the_fixed_shape_streaming_path_unchanged(self):
-        """``async_pad_to_max=True`` already produces a fixed width, which the shim must not widen to 129."""
-        model = _streaming_model_with_capacities(
-            spkcache_len=64, fifo_len=56, chunk_len=8, chunk_left_context=0, chunk_right_context=0
-        )
-        model.async_pad_to_max = True
-        model.compiled_flex_exact_128_boundary_shim = True
-
-        encoder_calls, _, _ = _run_streaming_step_with_packed_width(
-            model, packed_width=128, spkcache_width=64, stop_after_encoder_input=True
-        )
-
-        packed_embs, packed_lengths = encoder_calls[0]
-        assert packed_embs.shape[1] == 128
-        assert packed_lengths.tolist() == [128, 128]
-
-
-def _exact_128_shim_config(**overrides) -> DiarizationConfig:
-    """Build the one configuration the exact-128 boundary shim targets, optionally overriding single fields."""
-    fields = {
-        "compile_encoder": True,
-        "compile_dynamic": True,
-        "streaming_mode": True,
-        "async_streaming": False,
-        "async_pad_to_max": False,
-        "attention_backend": "flex",
-        "precision": "bf16",
-    }
-    fields.update(overrides)
-    return DiarizationConfig(**fields)
-
-
-class TestSortformerExact128BoundaryShimActivation:
-    """The launcher enables the shim for exactly one configuration and for no neighbouring one."""
-
-    @pytest.mark.unit
-    def test_default_configuration_does_not_enable_the_shim(self):
-        assert should_enable_exact_128_boundary_shim(DiarizationConfig()) is False
-
-    @pytest.mark.unit
-    def test_synchronous_unpadded_dynamic_bf16_flex_enables_the_shim(self):
-        assert should_enable_exact_128_boundary_shim(_exact_128_shim_config()) is True
-
-    @pytest.mark.unit
-    @pytest.mark.parametrize(
-        "overrides",
-        [
-            {"compile_encoder": False},
-            {"compile_dynamic": False},
-            {"streaming_mode": False},
-            {"streaming_mode": None},
-            {"async_streaming": True},
-            {"async_pad_to_max": True},
-            {"attention_backend": "fa4_cute"},
-            {"attention_backend": "fp8_flex"},
-            {"precision": "32"},
-        ],
-    )
-    def test_each_required_condition_is_necessary(self, overrides):
-        assert should_enable_exact_128_boundary_shim(_exact_128_shim_config(**overrides)) is False
-
-    @pytest.mark.unit
-    def test_launcher_enables_the_shim_on_the_model_and_logs_the_widths(self):
-        main_source = inspect.getsource(e2e_diarize_speech.main)
-        assert "should_enable_exact_128_boundary_shim(cfg)" in main_source
-        assert "compiled_flex_exact_128_boundary_shim = True" in main_source
-        assert "Exact-128 compiled FlexAttention boundary shim enabled" in main_source
-        assert "the valid length stays " in main_source
 
 
 class TestSortformerCompileBackendSelection:

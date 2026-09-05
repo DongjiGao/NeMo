@@ -19,21 +19,32 @@ A model quantized by the NVFP4 recipe holds TorchAO ``NVFP4Tensor`` weights, whi
 connector cannot write. This connector stores them so that ``restore_from`` reconstructs the
 quantized model directly, without the calibration artifacts or recipe options that produced it.
 
-Storage format
+Archive layout
 --------------
-Weights are written to ``model_weights.safetensors``. Each quantized weight is decomposed with
-``NVFP4Tensor.__tensor_flatten__`` into four tensors -- the packed FP4 ``qdata``, the
-per-16-element-block E4M3 ``scale``, the ``per_tensor_scale`` weight global scale and the
-``act_per_tensor_scale`` static activation scale -- stored under ``<parameter>::<attribute>`` keys.
-The accompanying flatten context holds only scalars and is written as JSON in the safetensors
-metadata header, together with a per-weight payload digest and provenance fields
-(:data:`META_TORCHAO_VERSION`, :data:`META_EXPORT_PRECISION`, :data:`META_QUANTIZATION_SUMMARY`,
-:data:`META_SOURCE_CHECKPOINT_SHA256`). Unquantized weights are written unchanged.
+Alongside NeMo's usual ``model_config.yaml``, the archive holds two members:
+
+``model_weights.safetensors``
+    Unquantized weights unchanged. Each quantized weight is decomposed with
+    ``NVFP4Tensor.__tensor_flatten__`` into four tensors -- the packed FP4 ``qdata``, the
+    per-16-element-block E4M3 ``scale``, the ``per_tensor_scale`` weight global scale and the
+    ``act_per_tensor_scale`` static activation scale -- stored under ``<parameter>::<attribute>``
+    keys. The separator identifies which entries are payload, so no list of quantized weights is
+    stored anywhere.
+
+``quantization_config.json``
+    The flatten context needed to rebuild an ``NVFP4Tensor``, plus provenance. Keeping it a separate
+    member rather than safetensors metadata makes it readable without a binary parse, and marks the
+    archive as this format.
+
+The context is stored once, not per weight: this recipe quantizes every target identically, so all
+93 contexts of a produced checkpoint were byte-identical. Export refuses a model whose weights
+disagree rather than silently keeping one of them; per-weight contexts can be added as a format
+version when a recipe needs them.
 
 The flattened primitives are stored rather than a pickled ``NVFP4Tensor`` because ``torch.save`` of
 the subclass binds the archive to one TorchAO release: 0.17 and 0.18 disagree on the
-``is_swizzled_scales`` default, which changes the scale layout. Recording that flag per weight and
-reconstructing through the installed TorchAO keeps the archive readable across both.
+``is_swizzled_scales`` default, which changes the scale layout. Recording that flag in the context
+and reconstructing through the installed TorchAO keeps the archive readable across both.
 
 Restore
 -------
@@ -42,15 +53,13 @@ archive's config has BF16 ``torch.nn.Linear`` weights whose shape and dtype do n
 NVFP4 payload. The remaining weights load normally, and the keys missing from that load are required
 to equal exactly the reconstructed ones, so bypassing ``load_state_dict`` does not weaken it.
 
-Each payload digest is verified before the weight is installed. A TorchAO version differing from the
-one recorded at export is reported through :data:`TORCHAO_VERSION_MISMATCH_MESSAGE`.
-
-:func:`resolve_nvfp4_save_restore_connector` identifies these archives by their weights member, so a
+:func:`resolve_nvfp4_save_restore_connector` identifies these archives by their config member, so a
 caller can restore one from ``model_path`` alone.
 """
 
-import hashlib
 import json
+import os
+import tarfile
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -62,47 +71,30 @@ __all__ = [
     "CHECKPOINT_FORMAT",
     "CHECKPOINT_FORMAT_VERSION",
     "PAYLOAD_SEPARATOR",
+    "QUANTIZATION_CONFIG_MEMBER",
     "SortformerNVFP4SaveRestoreConnector",
     "is_nvfp4_checkpoint",
-    "payload_digest",
     "resolve_nvfp4_save_restore_connector",
 ]
 
-# Identity of this container, written into the safetensors metadata so a reader can refuse a file it
-# does not understand instead of misinterpreting one.
+# Identity of this container, so a reader can refuse a file it does not understand instead of
+# misinterpreting one.
 CHECKPOINT_FORMAT = "sortformer_nvfp4"
 CHECKPOINT_FORMAT_VERSION = 1
+
+# Archive member holding the quantization config. Its presence is what marks an archive as this
+# format.
+QUANTIZATION_CONFIG_MEMBER = "quantization_config.json"
 
 # Separates a parameter's state-dict key from the flattened attribute it carries. Chosen because it
 # cannot occur in a module FQN, so splitting is unambiguous and a plain BF16 key is never mistaken
 # for part of a quantized payload.
 PAYLOAD_SEPARATOR = "::"
 
-# Metadata keys. safetensors metadata values must be strings, so every structured value is JSON.
-META_FORMAT = "format"
-META_FORMAT_VERSION = "format_version"
-META_TORCHAO_VERSION = "torchao_version"
-META_CONTEXTS = "nvfp4_contexts"
-META_DIGESTS = "payload_digests"
-META_QUANTIZATION_SUMMARY = "quantization_summary"
-META_SOURCE_CHECKPOINT_SHA256 = "source_checkpoint_sha256"
-# The dtype the weights were cast to before conversion. Block amax is read from the weight as it
-# stands, so converting an FP32 weight and converting its BF16 rounding yield different E4M3 block
-# scales and different FP4 codes. Recorded so the conditions the weights were derived under are
-# recoverable from the archive.
-META_EXPORT_PRECISION = "export_precision"
-
-# Canonical per-weight payload digest. Hashing each attribute's dtype and shape alongside its raw
-# bytes makes a reshaped or re-dtyped payload a different payload.
-PAYLOAD_DIGEST_METHOD = (
-    "sha256 over sorted attributes of (name + '|' + str(dtype) + '|' + str(tuple(shape)) + '|' + "
-    "contiguous_cpu_raw_bytes)"
-)
-
 TORCHAO_VERSION_MISMATCH_MESSAGE = (
-    "The checkpoint records TorchAO {recorded} but TorchAO {installed} is installed. The stored payload is "
+    "The checkpoint records TorchAO {recorded} but TorchAO {installed} is installed. The stored context is "
     "layout-explicit and is expected to reconstruct correctly, but the packing arithmetic was validated against "
-    "the recorded version. Re-export with the installed version to remove this warning."
+    "the recorded version."
 )
 
 _TORCH_DTYPE_PREFIX = "torch."
@@ -134,30 +126,6 @@ def _name_to_dtype(name: str) -> torch.dtype:
     return resolved
 
 
-def payload_digest(attributes: Dict[str, torch.Tensor]) -> str:
-    """
-    Canonical digest of one quantized weight's payload.
-
-    The digest is :data:`PAYLOAD_DIGEST_METHOD`. It is computed over the attributes in sorted order so
-    that it depends on the values carried and not on dictionary ordering, and it survives the
-    safetensors write/read round trip.
-
-    Args:
-        attributes (Dict[str, torch.Tensor]): Flattened attribute name to tensor.
-
-    Returns:
-        digest (str): 64-character lowercase hexadecimal SHA-256.
-    """
-    digest = hashlib.sha256()
-    for name in sorted(attributes):
-        tensor = attributes[name].detach().cpu().contiguous()
-        header = f"{name}|{tensor.dtype}|{tuple(tensor.shape)}|".encode("utf-8")
-        digest.update(header)
-        # view(uint8) needs at least one dimension, and the two global scales are 0-dim scalars.
-        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest()
-
-
 def _installed_torchao_version() -> Optional[str]:
     """TorchAO version string, or ``None`` when TorchAO is not importable."""
     try:
@@ -169,7 +137,7 @@ def _installed_torchao_version() -> Optional[str]:
 
 def _context_to_json(context: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Convert one flatten context into a JSON-representable mapping.
+    Convert a flatten context into a JSON-representable mapping.
 
     Args:
         context (Dict[str, Any]): The context returned by ``NVFP4Tensor.__tensor_flatten__``.
@@ -186,14 +154,14 @@ def _context_to_json(context: Dict[str, Any]) -> Dict[str, Any]:
     for key, value in context.items():
         if isinstance(value, torch.Tensor):
             raise TypeError(
-                f"Flatten context entry '{key}' is a Tensor. This format stores context as JSON, so a tensor "
+                f"Flatten context entry '{key}' is a Tensor. This format stores the context as JSON, so a tensor "
                 "there would be dropped and the restored weight would not execute the exported arithmetic."
             )
         if isinstance(value, torch.dtype):
             encoded[key] = {"__dtype__": _dtype_to_name(value)}
         elif value is None or isinstance(value, (bool, int, float, str)):
             encoded[key] = value
-        elif hasattr(value, "__dict__") and type(value).__name__:
+        elif hasattr(value, "__dict__"):
             # Dataclass-like, e.g. QuantizeTensorToNVFP4Kwargs. Its type name is recorded so the
             # loader rebuilds the same class rather than guessing from the field names.
             fields = dict(vars(value))
@@ -209,20 +177,19 @@ def _context_to_json(context: Dict[str, Any]) -> Dict[str, Any]:
     return encoded
 
 
-def _context_from_json(encoded: Dict[str, Any], kwargs_factory: Dict[str, Any]) -> Dict[str, Any]:
+def _context_from_json(encoded: Dict[str, Any]) -> Dict[str, Any]:
     """
     Rebuild a flatten context from its JSON form.
 
     Args:
         encoded (Dict[str, Any]): Mapping produced by :func:`_context_to_json`.
-        kwargs_factory (Dict[str, Any]): Class name to callable for the dataclass-like entries.
 
     Returns:
         context (Dict[str, Any]): Context suitable for ``__tensor_unflatten__``.
 
     Raises:
-        ValueError: If a recorded class name has no factory, since constructing the wrong activation
-            quantization config would change what the weight executes.
+        ValueError: If a recorded class name is not available, since constructing the wrong
+            activation quantization config would change what the weight executes.
     """
     context: Dict[str, Any] = {}
     for key, value in encoded.items():
@@ -230,7 +197,7 @@ def _context_from_json(encoded: Dict[str, Any], kwargs_factory: Dict[str, Any]) 
             context[key] = _name_to_dtype(value["__dtype__"])
         elif isinstance(value, dict) and "__class__" in value:
             class_name = value["__class__"]
-            factory = kwargs_factory.get(class_name)
+            factory = _kwargs_factory(class_name)
             if factory is None:
                 raise ValueError(
                     f"The checkpoint's context entry '{key}' names {class_name!r}, which this TorchAO build does "
@@ -242,21 +209,18 @@ def _context_from_json(encoded: Dict[str, Any], kwargs_factory: Dict[str, Any]) 
     return context
 
 
-def _kwargs_factories() -> Dict[str, Any]:
-    """Class-name to constructor map for the context's dataclass-like entries."""
-    factories: Dict[str, Any] = {}
+def _kwargs_factory(class_name: str) -> Optional[Any]:
+    """
+    Constructor for a context entry's dataclass-like value, or ``None`` if TorchAO lacks it.
+
+    Resolved from the module that defines ``NVFP4Tensor`` rather than a hardcoded path, because that
+    module is already known to be importable and TorchAO has moved these helpers between releases.
+    """
     try:
-        from torchao.quantization.quantize_.common import QuantizeTensorToNVFP4Kwargs
-
-        factories["QuantizeTensorToNVFP4Kwargs"] = QuantizeTensorToNVFP4Kwargs
+        from torchao.prototype.mx_formats import nvfp4_tensor
     except ImportError:
-        try:
-            from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
-
-            factories["QuantizeTensorToNVFP4Kwargs"] = QuantizeTensorToNVFP4Kwargs
-        except ImportError:
-            logging.debug("QuantizeTensorToNVFP4Kwargs is not importable from either known location.")
-    return factories
+        return None
+    return getattr(nvfp4_tensor, class_name, None)
 
 
 def _is_quantized(tensor: Any) -> bool:
@@ -264,34 +228,25 @@ def _is_quantized(tensor: Any) -> bool:
     return isinstance(tensor, torch.Tensor) and hasattr(tensor, "__tensor_flatten__")
 
 
-# Name of the weights member that identifies an archive as this format, checked without extracting.
-NVFP4_WEIGHTS_MEMBER = "model_weights.safetensors"
-
-
 def is_nvfp4_checkpoint(path: str) -> bool:
     """
-    Whether a ``.nemo`` archive carries an NVFP4 safetensors payload.
+    Whether a ``.nemo`` archive carries an NVFP4 quantization config.
 
-    Decided from the archive's table of contents, which is cheap and does not extract a 90 MB
-    member. A path that is not a readable tar is reported as ``False`` rather than raising, so the
-    ordinary restore path still produces its own error message for a genuinely broken file.
+    Decided from the archive's table of contents, which does not extract any member. A path that is
+    not a readable tar is reported as ``False`` rather than raising, so the ordinary restore path
+    still produces its own error message for a genuinely broken file.
 
     Args:
         path (str): Path to a ``.nemo`` archive.
 
     Returns:
-        is_nvfp4 (bool): ``True`` when the archive contains :data:`NVFP4_WEIGHTS_MEMBER`.
+        is_nvfp4 (bool): ``True`` when the archive contains :data:`QUANTIZATION_CONFIG_MEMBER`.
     """
-    import tarfile
-
     try:
         with tarfile.open(path, "r:*") as archive:
-            for member in archive.getnames():
-                if member.lstrip("./") == NVFP4_WEIGHTS_MEMBER:
-                    return True
+            return any(name.lstrip("./") == QUANTIZATION_CONFIG_MEMBER for name in archive.getnames())
     except (OSError, tarfile.TarError):
         return False
-    return False
 
 
 def resolve_nvfp4_save_restore_connector(path: str) -> Optional["SortformerNVFP4SaveRestoreConnector"]:
@@ -307,7 +262,7 @@ def resolve_nvfp4_save_restore_connector(path: str) -> Optional["SortformerNVFP4
     """
     if not is_nvfp4_checkpoint(path):
         return None
-    logging.info(f"{path} carries an NVFP4 payload; restoring with the NVFP4 connector.")
+    logging.info(f"{path} carries an NVFP4 quantization config; restoring with the NVFP4 connector.")
     return SortformerNVFP4SaveRestoreConnector()
 
 
@@ -319,49 +274,44 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
     result is a normal ``.nemo`` archive and ``push_to_hf_hub`` works unchanged.
 
     Args:
-        quantization_summary (Optional[Dict[str, Any]]): Summary returned by
-            the quantization step that produced the model, recorded for provenance.
-        source_checkpoint_sha256 (Optional[str]): Digest of the BF16 checkpoint this was quantized
-            from, recorded so an artifact can be traced to its origin.
-        strict_torchao_version (bool): Fail rather than warn when the installed TorchAO differs from
-            the one recorded at export.
+        export_precision (Optional[str]): Dtype the weights were cast to before conversion. Block
+            amax is read from the weight as it stands, so an FP32 weight and its BF16 rounding give
+            different FP4 codes; recorded so that condition is recoverable from the archive.
+        source_checkpoint_sha256 (Optional[str]): Digest of the checkpoint this was quantized from,
+            recorded so an artifact can be traced to its origin.
     """
 
     def __init__(
         self,
-        quantization_summary: Optional[Dict[str, Any]] = None,
-        source_checkpoint_sha256: Optional[str] = None,
-        strict_torchao_version: bool = False,
         export_precision: Optional[str] = None,
+        source_checkpoint_sha256: Optional[str] = None,
     ) -> None:
         super().__init__()
-        # Not "model_weights.ckpt": the name also marks the archive as this format, which
-        # is_nvfp4_checkpoint() uses to select this connector.
+        # Not "model_weights.ckpt": the name marks the payload as safetensors rather than a pickle.
         self._model_weights_ckpt = "model_weights.safetensors"
-        self._quantization_summary = quantization_summary
-        self._source_checkpoint_sha256 = source_checkpoint_sha256
-        self._strict_torchao_version = strict_torchao_version
         self._export_precision = export_precision
-        self._restored_contexts: Dict[str, Dict[str, Any]] = {}
-        self._restored_digests: Dict[str, str] = {}
-        self.restored_export_precision: Optional[str] = None
+        self._source_checkpoint_sha256 = source_checkpoint_sha256
+        self._restored_context: Dict[str, Any] = {}
 
     def _save_state_dict_to_disk(self, state_dict: Dict[str, Any], filepath: str) -> None:
         """
-        Write the state dict as safetensors, decomposing every quantized weight into plain tensors.
+        Write the state dict as safetensors and the quantization config beside it.
+
+        The config is written into the same directory because ``save_to`` archives that directory
+        wholesale, so no override of the archiving step is needed.
 
         Args:
             state_dict (Dict[str, Any]): Model state dict, possibly holding TorchAO tensor subclasses.
             filepath (str): Destination path for the safetensors file.
 
         Raises:
-            TypeError: If a quantized weight's flatten context cannot be represented as JSON.
+            TypeError: If a flatten context cannot be represented as JSON.
+            ValueError: If the quantized weights do not all share one flatten context.
         """
         from safetensors.torch import save_file
 
         tensors: Dict[str, torch.Tensor] = {}
         contexts: Dict[str, Dict[str, Any]] = {}
-        digests: Dict[str, str] = {}
 
         for key, value in state_dict.items():
             if not _is_quantized(value):
@@ -369,40 +319,43 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
                 continue
 
             names, context = value.__tensor_flatten__()
-            attributes = {name: getattr(value, name) for name in names}
-            for name, attribute in attributes.items():
-                tensors[f"{key}{PAYLOAD_SEPARATOR}{name}"] = attribute.detach().cpu().contiguous()
+            for name in names:
+                tensors[f"{key}{PAYLOAD_SEPARATOR}{name}"] = getattr(value, name).detach().cpu().contiguous()
             contexts[key] = _context_to_json(context)
-            digests[key] = payload_digest(attributes)
 
-        metadata = {
-            META_FORMAT: CHECKPOINT_FORMAT,
-            META_FORMAT_VERSION: str(CHECKPOINT_FORMAT_VERSION),
-            META_TORCHAO_VERSION: str(_installed_torchao_version()),
-            META_CONTEXTS: json.dumps(contexts, sort_keys=True, separators=(",", ":")),
-            META_DIGESTS: json.dumps(digests, sort_keys=True, separators=(",", ":")),
-        }
-        if self._quantization_summary is not None:
-            metadata[META_QUANTIZATION_SUMMARY] = json.dumps(
-                self._quantization_summary, sort_keys=True, separators=(",", ":"), default=str
+        if not contexts:
+            raise ValueError("No quantized weights found; use the ordinary connector for an unquantized model.")
+
+        distinct = {json.dumps(c, sort_keys=True) for c in contexts.values()}
+        if len(distinct) != 1:
+            raise ValueError(
+                f"The {len(contexts)} quantized weights carry {len(distinct)} different flatten contexts. Format "
+                f"version {CHECKPOINT_FORMAT_VERSION} stores one shared context and cannot represent this model."
             )
-        if self._source_checkpoint_sha256 is not None:
-            metadata[META_SOURCE_CHECKPOINT_SHA256] = self._source_checkpoint_sha256
-        if self._export_precision is not None:
-            metadata[META_EXPORT_PRECISION] = str(self._export_precision)
 
-        save_file(tensors, filepath, metadata=metadata)
-        logging.info(
-            f"Wrote {len(contexts)} quantized and {len(tensors) - sum(len(c) for c in contexts.values())} "
-            f"plain entries to {filepath}"
-        )
+        config = {
+            "format": CHECKPOINT_FORMAT,
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "producer": {
+                "torchao_version": _installed_torchao_version(),
+                "export_precision": self._export_precision,
+                "source_checkpoint_sha256": self._source_checkpoint_sha256,
+            },
+            "context": json.loads(distinct.pop()),
+        }
+        config_path = os.path.join(os.path.dirname(filepath), QUANTIZATION_CONFIG_MEMBER)
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump(config, handle, indent=2, sort_keys=True)
+
+        save_file(tensors, filepath)
+        logging.info(f"Wrote {len(contexts)} quantized and {len(tensors)} total entries to {filepath}")
 
     def _load_state_dict_from_disk(self, model_weights: str, map_location: Optional[Any] = "cpu") -> Dict[str, Any]:
         """
-        Read the safetensors payload, keeping quantized attributes separate for later reconstruction.
+        Read the safetensors payload and the quantization config beside it.
 
-        The contexts and digests are stashed on the connector because ``restore_from`` reads the file
-        before it installs weights, and reconstruction needs both.
+        The context is stashed on the connector because ``restore_from`` reads the weights before it
+        installs them, and reconstruction needs it.
 
         Args:
             model_weights (str): Path to the safetensors file inside the unpacked archive.
@@ -412,52 +365,36 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
             state_dict (Dict[str, Any]): Plain keys plus separator-suffixed quantized attributes.
 
         Raises:
-            ValueError: If the file is not this format or records an unreadable version.
+            ValueError: If the config is absent, is not this format, or records an unreadable version.
         """
-        from safetensors import safe_open
+        from safetensors.torch import load_file
 
-        device = "cpu"
-        if map_location is not None and str(map_location) != "cpu":
-            device = str(map_location)
+        config_path = os.path.join(os.path.dirname(model_weights), QUANTIZATION_CONFIG_MEMBER)
+        if not os.path.isfile(config_path):
+            raise ValueError(f"{model_weights} has no {QUANTIZATION_CONFIG_MEMBER} beside it.")
+        with open(config_path, encoding="utf-8") as handle:
+            config = json.load(handle)
 
-        state_dict: Dict[str, Any] = {}
-        with safe_open(model_weights, framework="pt", device=device) as handle:
-            metadata = handle.metadata() or {}
-            recorded_format = metadata.get(META_FORMAT)
-            if recorded_format != CHECKPOINT_FORMAT:
-                raise ValueError(
-                    f"{model_weights} records format {recorded_format!r}, not {CHECKPOINT_FORMAT!r}. This "
-                    "connector will not guess at the layout of an unknown container."
-                )
-            recorded_version = int(metadata.get(META_FORMAT_VERSION, -1))
-            if recorded_version != CHECKPOINT_FORMAT_VERSION:
-                raise ValueError(
-                    f"{model_weights} records format version {recorded_version}, but this build reads version "
-                    f"{CHECKPOINT_FORMAT_VERSION}."
-                )
+        if config.get("format") != CHECKPOINT_FORMAT:
+            raise ValueError(
+                f"{config_path} records format {config.get('format')!r}, not {CHECKPOINT_FORMAT!r}. This connector "
+                "will not guess at the layout of an unknown container."
+            )
+        if config.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+            raise ValueError(
+                f"{config_path} records format version {config.get('format_version')!r}, but this build reads "
+                f"version {CHECKPOINT_FORMAT_VERSION}."
+            )
 
-            self._restored_contexts = json.loads(metadata.get(META_CONTEXTS, "{}"))
-            self._restored_digests = json.loads(metadata.get(META_DIGESTS, "{}"))
-            self.restored_export_precision = metadata.get(META_EXPORT_PRECISION)
-            if self.restored_export_precision is not None:
-                logging.info(
-                    f"{model_weights} was quantized at precision={self.restored_export_precision}; serving at a "
-                    "different precision executes different FP4 codes than were validated."
-                )
+        self._restored_context = config["context"]
 
-            recorded_torchao = metadata.get(META_TORCHAO_VERSION)
-            installed_torchao = str(_installed_torchao_version())
-            if recorded_torchao and recorded_torchao != installed_torchao:
-                message = TORCHAO_VERSION_MISMATCH_MESSAGE.format(
-                    recorded=recorded_torchao, installed=installed_torchao
-                )
-                if self._strict_torchao_version:
-                    raise ValueError(message)
-                logging.warning(message)
+        recorded = (config.get("producer") or {}).get("torchao_version")
+        installed = _installed_torchao_version()
+        if recorded and recorded != installed:
+            logging.warning(TORCHAO_VERSION_MISMATCH_MESSAGE.format(recorded=recorded, installed=installed))
 
-            for key in handle.keys():
-                state_dict[key] = handle.get_tensor(key)
-        return state_dict
+        device = "cpu" if map_location is None else str(map_location)
+        return load_file(model_weights, device=device)
 
     def load_instance_with_state_dict(self, instance: Any, state_dict: Dict[str, Any], strict: bool) -> None:
         """
@@ -475,34 +412,19 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
             strict (bool): Whether unexpected or unaccounted keys are an error.
 
         Raises:
-            ValueError: If a payload digest does not match, if a target module is absent, or if the
-                plain load leaves keys unaccounted for while ``strict`` is set.
+            ValueError: If a target module is absent, or if the plain load leaves keys unaccounted
+                for while ``strict`` is set.
         """
         grouped, plain = self._partition(state_dict)
-        factories = _kwargs_factories()
+        context = _context_from_json(self._restored_context)
         modules = dict(instance.named_modules())
         installed: List[str] = []
 
         for key, attributes in sorted(grouped.items()):
-            encoded_context = self._restored_contexts.get(key)
-            if encoded_context is None:
-                raise ValueError(f"The checkpoint carries a payload for '{key}' but records no flatten context.")
-
-            expected = self._restored_digests.get(key)
-            if expected is not None:
-                actual = payload_digest(attributes)
-                if actual != expected:
-                    raise ValueError(
-                        f"Payload digest mismatch for '{key}': the file records {expected} but its bytes hash to "
-                        f"{actual}. The payload was edited or truncated; refusing to execute it."
-                    )
-
             module_fqn, _, attribute_name = key.rpartition(".")
             module = modules.get(module_fqn)
             if module is None:
                 raise ValueError(f"The checkpoint quantizes '{module_fqn}', which this model does not contain.")
-
-            context = _context_from_json(encoded_context, factories)
             tensor = self._rebuild(attributes, context)
             setattr(module, attribute_name, torch.nn.Parameter(tensor, requires_grad=False))
             installed.append(key)
