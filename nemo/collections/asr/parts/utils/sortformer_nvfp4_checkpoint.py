@@ -75,7 +75,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
-from nemo.utils import logging
+from nemo.utils import logging, str_to_dtype
 
 __all__ = [
     "CHECKPOINT_FORMAT",
@@ -123,35 +123,6 @@ TORCHAO_VERSION_MISMATCH_MESSAGE = (
     "the recorded version."
 )
 
-_TORCH_DTYPE_PREFIX = "torch."
-
-
-def _dtype_to_name(dtype: torch.dtype) -> str:
-    """Serialize a torch dtype as its ``torch.``-qualified name."""
-    return str(dtype)
-
-
-def _name_to_dtype(name: str) -> torch.dtype:
-    """
-    Resolve a ``torch.``-qualified dtype name back to the dtype.
-
-    Args:
-        name (str): Name as produced by :func:`_dtype_to_name`, e.g. ``"torch.float32"``.
-
-    Returns:
-        dtype (torch.dtype): The resolved dtype.
-
-    Raises:
-        ValueError: If the name is not a dtype this build of PyTorch provides.
-    """
-    if not name.startswith(_TORCH_DTYPE_PREFIX):
-        raise ValueError(f"Not a torch dtype name: {name!r}")
-    resolved = getattr(torch, name[len(_TORCH_DTYPE_PREFIX) :], None)
-    if not isinstance(resolved, torch.dtype):
-        raise ValueError(f"torch does not provide the dtype {name!r} this checkpoint requires.")
-    return resolved
-
-
 def _installed_torchao_version() -> Optional[str]:
     """TorchAO version string, or ``None`` when TorchAO is not importable."""
     try:
@@ -184,7 +155,7 @@ def _context_to_json(context: Dict[str, Any]) -> Dict[str, Any]:
                 "there would be dropped and the restored weight would not execute the exported arithmetic."
             )
         if isinstance(value, torch.dtype):
-            encoded[key] = {"__dtype__": _dtype_to_name(value)}
+            encoded[key] = {"__dtype__": str(value)}
         elif value is None or isinstance(value, (bool, int, float, str)):
             encoded[key] = value
         elif hasattr(value, "__dict__"):
@@ -220,7 +191,7 @@ def _context_from_json(encoded: Dict[str, Any]) -> Dict[str, Any]:
     context: Dict[str, Any] = {}
     for key, value in encoded.items():
         if isinstance(value, dict) and "__dtype__" in value:
-            context[key] = _name_to_dtype(value["__dtype__"])
+            context[key] = str_to_dtype(value["__dtype__"])
         elif isinstance(value, dict) and "__class__" in value:
             class_name = value["__class__"]
             factory = _kwargs_factory(class_name)
