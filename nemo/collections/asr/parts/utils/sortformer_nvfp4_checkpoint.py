@@ -67,12 +67,14 @@ to equal exactly the reconstructed ones, so bypassing ``load_state_dict`` does n
 caller can restore one from ``model_path`` alone.
 """
 
+import dataclasses
 import json
 import os
 import tarfile
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
 from nemo.utils import logging, str_to_dtype
@@ -123,6 +125,7 @@ TORCHAO_VERSION_MISMATCH_MESSAGE = (
     "the recorded version."
 )
 
+
 def _installed_torchao_version() -> Optional[str]:
     """TorchAO version string, or ``None`` when TorchAO is not importable."""
     try:
@@ -158,10 +161,11 @@ def _context_to_json(context: Dict[str, Any]) -> Dict[str, Any]:
             encoded[key] = {"__dtype__": str(value)}
         elif value is None or isinstance(value, (bool, int, float, str)):
             encoded[key] = value
-        elif hasattr(value, "__dict__"):
-            # Dataclass-like, e.g. QuantizeTensorToNVFP4Kwargs. Its type name is recorded so the
-            # loader rebuilds the same class rather than guessing from the field names.
-            fields = dict(vars(value))
+        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+            # A dataclass, e.g. QuantizeTensorToNVFP4Kwargs. Its type name is recorded so the loader
+            # rebuilds the same class rather than guessing from the field names. Read through
+            # ``dataclasses.fields`` rather than ``vars``, which a slotted dataclass does not have.
+            fields = {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
             for field_key, field_value in fields.items():
                 if isinstance(field_value, torch.Tensor):
                     raise TypeError(
@@ -220,11 +224,6 @@ def _kwargs_factory(class_name: str) -> Optional[Any]:
     return getattr(nvfp4_tensor, class_name, None)
 
 
-def _is_quantized(tensor: Any) -> bool:
-    """Whether a state-dict value is a TorchAO tensor subclass carrying a flatten contract."""
-    return isinstance(tensor, torch.Tensor) and hasattr(tensor, "__tensor_flatten__")
-
-
 def is_nvfp4_checkpoint(path: str) -> bool:
     """
     Whether a ``.nemo`` archive carries a Sortformer NVFP4 quantization config.
@@ -243,7 +242,8 @@ def is_nvfp4_checkpoint(path: str) -> bool:
     try:
         with tarfile.open(path, "r:*") as archive:
             member = next(
-                (m for m in archive.getmembers() if m.name.lstrip("./") == QUANTIZATION_CONFIG_MEMBER), None
+                (m for m in archive.getmembers() if m.name.removeprefix("./") == QUANTIZATION_CONFIG_MEMBER),
+                None,
             )
             if member is None:
                 return False
@@ -323,7 +323,9 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
         contexts: Dict[str, Dict[str, Any]] = {}
 
         for key, value in state_dict.items():
-            if not _is_quantized(value):
+            # The flatten/unflatten pair this format is built on is exactly what makes a subclass
+            # traceable, so torch's own predicate for that is the test for a quantized weight.
+            if not is_traceable_wrapper_subclass(value):
                 tensors[key] = value.detach().cpu().contiguous() if isinstance(value, torch.Tensor) else value
                 continue
 
