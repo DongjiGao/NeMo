@@ -26,25 +26,23 @@ from examples.speaker_tasks.diarization.neural_diarizer import e2e_diarize_speec
 from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import (
     CUDA_GRAPH_COMPILE_MODE,
     CUDA_GRAPH_LENGTH_BUFFERS_ATTRIBUTE,
+    CUDA_GRAPH_MARKER_ATTRIBUTE,
+    CUDA_GRAPH_MODES,
     CUDAGRAPHS_COMPILE_BACKEND,
-    FIXED_COMPILE_ENV_VAR,
-    FIXED_COMPILE_TIME_FRAMES_ENV_VAR,
     INDUCTOR_COMPILE_BACKEND,
     STREAMING_CUDA_GRAPH_STEP_BOUNDARY,
     SUPPORTED_COMPILE_BACKENDS,
     DiarizationConfig,
     get_tensor_path,
+    install_cuda_graph_boundary,
     install_cuda_graph_step_marker,
-    install_streaming_cuda_graph_boundary,
     install_streaming_cuda_graph_length_stabilizer,
     resolve_cuda_graph_config,
+    resolve_cuda_graph_mode,
     resolve_encoder_compile_kwargs,
     resolve_streaming_cuda_graph_targets,
     stabilize_encoder_max_audio_length,
-    uses_offline_cuda_graphs,
-    uses_streaming_cuda_graphs,
     validate_compile_backend,
-    validate_fixed_shape_adapter_env,
 )
 from omegaconf import DictConfig
 from onnx.reference import ReferenceEvaluator
@@ -1337,12 +1335,6 @@ class StubEncoder(torch.nn.Module):
 
 
 class TestSortformerCudaGraphCompilation:
-    @pytest.fixture(autouse=True)
-    def _clear_fixed_shape_adapter_env(self, monkeypatch):
-        """Keep the fixed-shape adapter inactive unless a test enables it explicitly."""
-        monkeypatch.delenv(FIXED_COMPILE_ENV_VAR, raising=False)
-        monkeypatch.delenv(FIXED_COMPILE_TIME_FRAMES_ENV_VAR, raising=False)
-
     @pytest.mark.unit
     def test_cuda_graphs_are_disabled_by_default(self):
         assert DiarizationConfig().compile_cuda_graphs is False
@@ -1466,38 +1458,6 @@ class TestSortformerCudaGraphCompilation:
         cfg = DiarizationConfig(compile_encoder=True, compile_dynamic=False, streaming_mode=False)
 
         resolve_cuda_graph_config(cfg, "cpu")
-
-    @pytest.mark.unit
-    def test_absent_fixed_shape_adapter_env_is_accepted(self):
-        validate_fixed_shape_adapter_env(90432)
-
-    @pytest.mark.unit
-    @pytest.mark.parametrize("fixed_compile", ["1", "0", None])
-    def test_matching_fixed_shape_adapter_env_is_accepted(self, monkeypatch, fixed_compile):
-        if fixed_compile is not None:
-            monkeypatch.setenv(FIXED_COMPILE_ENV_VAR, fixed_compile)
-        monkeypatch.setenv(FIXED_COMPILE_TIME_FRAMES_ENV_VAR, " 90432 ")
-
-        validate_fixed_shape_adapter_env(90432)
-
-    @pytest.mark.unit
-    @pytest.mark.parametrize("time_frames", [None, "", "abc", "90432.0", "0", "-5", "11304"])
-    def test_mismatched_or_malformed_fixed_shape_adapter_env_fails_closed(self, monkeypatch, time_frames):
-        monkeypatch.setenv(FIXED_COMPILE_ENV_VAR, "1")
-        if time_frames is not None:
-            monkeypatch.setenv(FIXED_COMPILE_TIME_FRAMES_ENV_VAR, time_frames)
-
-        with pytest.raises(ValueError, match=FIXED_COMPILE_TIME_FRAMES_ENV_VAR):
-            validate_fixed_shape_adapter_env(90432)
-
-    @pytest.mark.unit
-    def test_fixed_shape_adapter_env_is_checked_by_the_config_validation(self, monkeypatch):
-        monkeypatch.setenv(FIXED_COMPILE_ENV_VAR, "1")
-        monkeypatch.setenv(FIXED_COMPILE_TIME_FRAMES_ENV_VAR, "11304")
-
-        with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
-            with pytest.raises(ValueError, match=FIXED_COMPILE_TIME_FRAMES_ENV_VAR):
-                resolve_cuda_graph_config(_cuda_graph_config(), "cuda")
 
     @pytest.mark.unit
     def test_encoder_max_audio_length_is_stabilized_once(self):
@@ -1866,12 +1826,6 @@ class StubStreamingModel(torch.nn.Module):
 
 
 class TestSortformerStreamingEncoderCudaGraphCompilation:
-    @pytest.fixture(autouse=True)
-    def _clear_fixed_shape_adapter_env(self, monkeypatch):
-        """Keep the offline fixed-shape adapter inactive so a stray environment cannot fail these tests."""
-        monkeypatch.delenv(FIXED_COMPILE_ENV_VAR, raising=False)
-        monkeypatch.delenv(FIXED_COMPILE_TIME_FRAMES_ENV_VAR, raising=False)
-
     @pytest.mark.unit
     @pytest.mark.parametrize("streaming_mode", [None, False, True])
     def test_one_flag_covers_both_graph_modes(self, streaming_mode):
@@ -1879,13 +1833,11 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
         cfg = DiarizationConfig(streaming_mode=streaming_mode)
 
         assert cfg.compile_cuda_graphs is False
-        assert (uses_offline_cuda_graphs(cfg), uses_streaming_cuda_graphs(cfg)) == (False, False)
+        assert resolve_cuda_graph_mode(cfg) is None
 
         cfg.compile_cuda_graphs = True
-        assert (uses_offline_cuda_graphs(cfg), uses_streaming_cuda_graphs(cfg)) == (
-            streaming_mode is False,
-            streaming_mode is True,
-        )
+        expected = None if streaming_mode is None else CUDA_GRAPH_MODES[streaming_mode]
+        assert resolve_cuda_graph_mode(cfg) is expected
 
     @pytest.mark.unit
     @pytest.mark.parametrize("compile_dynamic", [True, False])
@@ -1968,7 +1920,7 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
     def test_offline_graph_configuration_stays_valid(self):
         cfg = _cuda_graph_config()
 
-        assert uses_offline_cuda_graphs(cfg) and not uses_streaming_cuda_graphs(cfg)
+        assert resolve_cuda_graph_mode(cfg) is CUDA_GRAPH_MODES[False]
         with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
             resolve_cuda_graph_config(cfg, "cuda")
             resolve_cuda_graph_config(cfg, "cuda")
@@ -2259,9 +2211,9 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
             MagicMock(side_effect=lambda: events.append("mark")),
             create=True,
         ) as mark_step:
-            install_streaming_cuda_graph_boundary(_streaming_encoder_cuda_graph_config(), model)
+            install_cuda_graph_boundary(CUDA_GRAPH_MODES[True], model)
             # Repeated setup of the whole boundary stays a no-op for both wrappers.
-            install_streaming_cuda_graph_boundary(_streaming_encoder_cuda_graph_config(), model)
+            install_cuda_graph_boundary(CUDA_GRAPH_MODES[True], model)
             for _ in range(num_calls):
                 model.frontend_encoder(
                     processed_signal=torch.ones(2, 4, 3),
@@ -2275,23 +2227,19 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
         assert model.forward.__func__ is type(model).forward
 
     @pytest.mark.unit
-    @pytest.mark.parametrize(
-        "cfg_factory, expected",
-        [
-            (_streaming_encoder_cuda_graph_config, True),
-            (lambda: DiarizationConfig(compile_encoder=True), False),
-            (_cuda_graph_config, False),
-        ],
-    )
-    def test_setup_installs_the_boundary_only_for_the_streaming_graph_mode(self, cfg_factory, expected):
+    @pytest.mark.parametrize("streaming, expected", [(True, True), (False, False)])
+    def test_only_the_streaming_strategy_stabilizes_the_boundary_length(self, streaming, expected):
+        # The strategy carries where it marks and whether that boundary needs retained length storage, so the
+        # installer reads both from it instead of branching on the configuration again.
         model = StubStreamingModel()
 
         with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
-            assert install_streaming_cuda_graph_boundary(cfg_factory(), model) is expected
+            install_cuda_graph_boundary(CUDA_GRAPH_MODES[streaming], model)
 
         stabilized = hasattr(model.frontend_encoder, CUDA_GRAPH_LENGTH_BUFFERS_ATTRIBUTE)
         assert stabilized is expected
-        # The disabled and the offline graph paths keep the original bound boundary and the unmarked model forward.
+        # The offline strategy leaves the per-step boundary alone and marks the model forward instead.
         untouched_boundary = MethodType(type(model).frontend_encoder, model)
         assert (model.frontend_encoder == untouched_boundary) is not expected
-        assert model.forward.__func__ is type(model).forward
+        assert getattr(model.frontend_encoder, CUDA_GRAPH_MARKER_ATTRIBUTE, False) is expected
+        assert getattr(model.forward, CUDA_GRAPH_MARKER_ATTRIBUTE, False) is not expected
