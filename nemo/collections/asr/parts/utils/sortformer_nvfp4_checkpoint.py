@@ -139,6 +139,12 @@ def _context_to_json(context: Dict[str, Any]) -> Dict[str, Any]:
     """
     Convert a flatten context into a JSON-representable mapping.
 
+    TorchAO's own ``torchao.core.config`` codec does not cover these values and cannot be used here.
+    It is scoped to ``AOBaseConfig`` recipes: ``config_to_dict`` refuses anything else, and
+    ``config_from_dict`` resolves class names against a package-level allowlist that the context's
+    ``QuantizeTensorToNVFP4Kwargs`` is not re-exported into, so a context encoded through it cannot
+    be read back.
+
     Args:
         context (Dict[str, Any]): The context returned by ``NVFP4Tensor.__tensor_flatten__``.
 
@@ -212,10 +218,11 @@ def _context_from_json(encoded: Dict[str, Any]) -> Dict[str, Any]:
 
 def _kwargs_factory(class_name: str) -> Optional[Any]:
     """
-    Constructor for a context entry's dataclass-like value, or ``None`` if TorchAO lacks it.
+    Constructor for a context entry's dataclass value, or ``None`` if TorchAO lacks it.
 
-    Resolved from the module that defines ``NVFP4Tensor`` rather than a hardcoded path, because that
-    module is already known to be importable and TorchAO has moved these helpers between releases.
+    Resolved from the module that defines ``NVFP4Tensor``, which is already known to be importable.
+    TorchAO's ``config_from_dict`` cannot do this: it searches only package-level names, and these
+    kwargs classes are not re-exported there.
     """
     try:
         from torchao.prototype.mx_formats import nvfp4_tensor
