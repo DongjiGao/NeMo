@@ -37,13 +37,14 @@ from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech impor
     install_cuda_graph_step_marker,
     install_streaming_cuda_graph_boundary,
     install_streaming_cuda_graph_length_stabilizer,
+    resolve_cuda_graph_config,
     resolve_encoder_compile_kwargs,
     resolve_streaming_cuda_graph_targets,
     stabilize_encoder_max_audio_length,
+    uses_offline_cuda_graphs,
+    uses_streaming_cuda_graphs,
     validate_compile_backend,
-    validate_cuda_graph_config,
     validate_fixed_shape_adapter_env,
-    validate_streaming_encoder_cuda_graph_config,
 )
 from omegaconf import DictConfig
 from onnx.reference import ReferenceEvaluator
@@ -1305,11 +1306,13 @@ class RecordingForwardModel(torch.nn.Module):
 
 
 def _cuda_graph_config(**overrides) -> DiarizationConfig:
-    """Build a valid CUDA Graph configuration, optionally overriding individual fields."""
+    """Build a valid offline CUDA Graph configuration, optionally overriding individual fields.
+
+    ``compile_encoder`` and ``compile_dynamic`` are deliberately left at their defaults, because
+    :func:`resolve_cuda_graph_config` is expected to set them rather than require them.
+    """
     fields = {
         "compile_cuda_graphs": True,
-        "compile_encoder": True,
-        "compile_dynamic": False,
         "streaming_mode": False,
         "compile_cuda_graph_max_audio_length": 90432,
     }
@@ -1364,34 +1367,43 @@ class TestSortformerCudaGraphCompilation:
     @pytest.mark.parametrize(
         "overrides, device_type, error_match",
         [
-            ({"compile_encoder": False}, "cuda", "requires compile_encoder=True"),
-            ({"compile_dynamic": True}, "cuda", "requires compile_dynamic=False"),
-            ({"streaming_mode": True}, "cuda", "streaming_mode must be set explicitly to False"),
-            ({"streaming_mode": None}, "cuda", "streaming_mode must be set explicitly to False"),
+            ({"streaming_mode": None}, "cuda", "requires streaming_mode to be set explicitly"),
             ({}, "cpu", "requires a CUDA device"),
         ],
     )
     def test_invalid_cuda_graph_configurations_fail_closed(self, overrides, device_type, error_match):
         with pytest.raises(ValueError, match=error_match):
-            validate_cuda_graph_config(_cuda_graph_config(**overrides), device_type)
+            resolve_cuda_graph_config(_cuda_graph_config(**overrides), device_type)
+
+    @pytest.mark.unit
+    def test_offline_capture_sets_the_compile_settings_it_forces(self):
+        # Graphs are captured at the encoder torch.compile boundary and cannot record dynamic shapes, so neither
+        # setting has a usable alternative and requesting capture is taken as accepting both.
+        cfg = _cuda_graph_config()
+        assert (cfg.compile_encoder, cfg.compile_dynamic) == (False, True)
+
+        with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
+            resolve_cuda_graph_config(cfg, "cuda")
+
+        assert (cfg.compile_encoder, cfg.compile_dynamic) == (True, False)
 
     @pytest.mark.unit
     def test_cuda_graph_validation_requires_the_step_marker_api(self):
         with patch.object(torch.compiler, "cudagraph_mark_step_begin", None, create=True):
             with pytest.raises(RuntimeError, match="cudagraph_mark_step_begin"):
-                validate_cuda_graph_config(_cuda_graph_config(), "cuda")
+                resolve_cuda_graph_config(_cuda_graph_config(), "cuda")
 
     @pytest.mark.unit
     def test_valid_cuda_graph_configuration_is_accepted(self):
         with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
-            validate_cuda_graph_config(_cuda_graph_config(), "cuda")
+            resolve_cuda_graph_config(_cuda_graph_config(), "cuda")
 
     @pytest.mark.unit
     @pytest.mark.parametrize("compile_encoder, compile_dynamic", [(False, True), (True, True)])
     def test_disabled_cuda_graphs_skip_validation(self, compile_encoder, compile_dynamic):
         cfg = DiarizationConfig(compile_encoder=compile_encoder, compile_dynamic=compile_dynamic)
 
-        validate_cuda_graph_config(cfg, "cpu")
+        resolve_cuda_graph_config(cfg, "cpu")
 
     @pytest.mark.unit
     @pytest.mark.parametrize("scale", [2.0])
@@ -1447,13 +1459,13 @@ class TestSortformerCudaGraphCompilation:
 
         with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
             with pytest.raises(ValueError, match="compile_cuda_graph_max_audio_length to be a positive integer"):
-                validate_cuda_graph_config(cfg, "cuda")
+                resolve_cuda_graph_config(cfg, "cuda")
 
     @pytest.mark.unit
     def test_disabled_cuda_graphs_do_not_require_a_max_audio_length(self):
         cfg = DiarizationConfig(compile_encoder=True, compile_dynamic=False, streaming_mode=False)
 
-        validate_cuda_graph_config(cfg, "cpu")
+        resolve_cuda_graph_config(cfg, "cpu")
 
     @pytest.mark.unit
     def test_absent_fixed_shape_adapter_env_is_accepted(self):
@@ -1485,7 +1497,7 @@ class TestSortformerCudaGraphCompilation:
 
         with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
             with pytest.raises(ValueError, match=FIXED_COMPILE_TIME_FRAMES_ENV_VAR):
-                validate_cuda_graph_config(_cuda_graph_config(), "cuda")
+                resolve_cuda_graph_config(_cuda_graph_config(), "cuda")
 
     @pytest.mark.unit
     def test_encoder_max_audio_length_is_stabilized_once(self):
@@ -1753,7 +1765,7 @@ class TestSortformerCompileBackendSelection:
         ],
     )
     def test_cudagraphs_backend_is_rejected_outside_the_streaming_graph_mode(self, cfg_factory):
-        with pytest.raises(ValueError, match="requires compile_streaming_encoder_cuda_graphs=True"):
+        with pytest.raises(ValueError, match="requires compile_cuda_graphs=True with streaming_mode=True"):
             validate_compile_backend(cfg_factory())
 
     @pytest.mark.unit
@@ -1811,10 +1823,13 @@ class TestSortformerCompileBackendSelection:
 
 
 def _streaming_encoder_cuda_graph_config(**overrides) -> DiarizationConfig:
-    """Build a valid streaming encoder CUDA Graph configuration, optionally overriding individual fields."""
+    """Build a valid streaming CUDA Graph configuration, optionally overriding individual fields.
+
+    ``compile_encoder`` is deliberately left at its default, because :func:`resolve_cuda_graph_config` is
+    expected to set it rather than require it. ``async_pad_to_max`` is passed, because it is required.
+    """
     fields = {
-        "compile_streaming_encoder_cuda_graphs": True,
-        "compile_encoder": True,
+        "compile_cuda_graphs": True,
         "streaming_mode": True,
         "async_pad_to_max": True,
     }
@@ -1858,8 +1873,19 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
         monkeypatch.delenv(FIXED_COMPILE_TIME_FRAMES_ENV_VAR, raising=False)
 
     @pytest.mark.unit
-    def test_streaming_encoder_cuda_graphs_are_disabled_by_default(self):
-        assert DiarizationConfig().compile_streaming_encoder_cuda_graphs is False
+    @pytest.mark.parametrize("streaming_mode", [None, False, True])
+    def test_one_flag_covers_both_graph_modes(self, streaming_mode):
+        # streaming_mode alone selects the captured boundary, so there is no second flag to disagree with it.
+        cfg = DiarizationConfig(streaming_mode=streaming_mode)
+
+        assert cfg.compile_cuda_graphs is False
+        assert (uses_offline_cuda_graphs(cfg), uses_streaming_cuda_graphs(cfg)) == (False, False)
+
+        cfg.compile_cuda_graphs = True
+        assert (uses_offline_cuda_graphs(cfg), uses_streaming_cuda_graphs(cfg)) == (
+            streaming_mode is False,
+            streaming_mode is True,
+        )
 
     @pytest.mark.unit
     @pytest.mark.parametrize("compile_dynamic", [True, False])
@@ -1867,7 +1893,6 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
         cfg = DiarizationConfig(compile_encoder=True, compile_dynamic=compile_dynamic)
 
         assert cfg.compile_cuda_graphs is False
-        assert cfg.compile_streaming_encoder_cuda_graphs is False
         assert resolve_encoder_compile_kwargs(cfg) == {"dynamic": compile_dynamic}
 
     @pytest.mark.unit
@@ -1890,10 +1915,7 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
     @pytest.mark.parametrize(
         "overrides, device_type, error_match",
         [
-            ({"compile_cuda_graphs": True}, "cuda", "mutually exclusive with compile_cuda_graphs=True"),
-            ({"compile_encoder": False}, "cuda", "requires compile_encoder=True"),
-            ({"streaming_mode": False}, "cuda", "streaming_mode must be set explicitly to True"),
-            ({"streaming_mode": None}, "cuda", "streaming_mode must be set explicitly to True"),
+            ({"streaming_mode": None}, "cuda", "requires streaming_mode to be set explicitly"),
             ({"async_pad_to_max": False}, "cuda", "requires async_pad_to_max=True"),
             ({}, "cpu", "requires a CUDA device"),
         ],
@@ -1903,13 +1925,26 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
 
         with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
             with pytest.raises(ValueError, match=error_match):
-                validate_streaming_encoder_cuda_graph_config(cfg, device_type)
+                resolve_cuda_graph_config(cfg, device_type)
+
+    @pytest.mark.unit
+    def test_streaming_capture_sets_the_compile_settings_it_forces(self):
+        # Same forcing as the offline mode: capture happens at the encoder torch.compile boundary and records
+        # fixed shapes, so neither setting has a usable alternative. async_pad_to_max is demanded rather than set,
+        # because it changes what the encoder sees, and is covered by the failure cases above.
+        cfg = _streaming_encoder_cuda_graph_config()
+        assert (cfg.compile_encoder, cfg.compile_dynamic) == (False, True)
+
+        with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
+            resolve_cuda_graph_config(cfg, "cuda")
+
+        assert (cfg.compile_encoder, cfg.compile_dynamic) == (True, False)
 
     @pytest.mark.unit
     def test_streaming_graph_validation_requires_the_step_marker_api(self):
         with patch.object(torch.compiler, "cudagraph_mark_step_begin", None, create=True):
             with pytest.raises(RuntimeError, match="cudagraph_mark_step_begin"):
-                validate_streaming_encoder_cuda_graph_config(_streaming_encoder_cuda_graph_config(), "cuda")
+                resolve_cuda_graph_config(_streaming_encoder_cuda_graph_config(), "cuda")
 
     @pytest.mark.unit
     @pytest.mark.parametrize("compile_dynamic", [True, False])
@@ -1917,26 +1952,26 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
         cfg = _streaming_encoder_cuda_graph_config(compile_dynamic=compile_dynamic)
 
         with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
-            # The streaming mode pins its own capture targets, so it never requires global static shapes.
-            validate_streaming_encoder_cuda_graph_config(cfg, "cuda")
-            # The offline validation stays inert because its own flag is disabled.
-            validate_cuda_graph_config(cfg, "cuda")
+            # The streaming mode pins its own capture targets, so it never requires a globally static
+            # compile_dynamic, and resolving twice is idempotent.
+            resolve_cuda_graph_config(cfg, "cuda")
+            resolve_cuda_graph_config(cfg, "cuda")
 
     @pytest.mark.unit
     @pytest.mark.parametrize("streaming_mode", [None, False, True])
     def test_disabled_streaming_graph_mode_skips_validation(self, streaming_mode):
         cfg = DiarizationConfig(compile_encoder=True, streaming_mode=streaming_mode)
 
-        validate_streaming_encoder_cuda_graph_config(cfg, "cpu")
+        resolve_cuda_graph_config(cfg, "cpu")
 
     @pytest.mark.unit
     def test_offline_graph_configuration_stays_valid(self):
         cfg = _cuda_graph_config()
 
-        assert cfg.compile_streaming_encoder_cuda_graphs is False
+        assert uses_offline_cuda_graphs(cfg) and not uses_streaming_cuda_graphs(cfg)
         with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
-            validate_streaming_encoder_cuda_graph_config(cfg, "cuda")
-            validate_cuda_graph_config(cfg, "cuda")
+            resolve_cuda_graph_config(cfg, "cuda")
+            resolve_cuda_graph_config(cfg, "cuda")
 
     @pytest.mark.unit
     def test_checkpoint_without_a_transformer_encoder_targets_the_primary_encoder(self):

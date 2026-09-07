@@ -134,29 +134,36 @@ class DiarizationConfig:
     # Use fixed-size encoder inputs, trading extra padded computation for stable shapes. Applies to both
     # asynchronous and synchronous streaming, despite the historical `async_` prefix kept for compatibility.
     async_pad_to_max: bool = False
-    # Compile the frontend encoder and optional transformer encoder; dynamic shapes support variable input lengths.
+    # Encoder execution mode. Four configurations are supported; anything else is rejected at startup:
+    #
+    #   mode                  compile_encoder  compile_cuda_graphs  streaming_mode  also required
+    #   --------------------- ---------------- -------------------- --------------- ----------------------------
+    #   eager                 False            False                any             -
+    #   compiled              True             False                any             -
+    #   graphs, offline       (set)            True                 False           max_audio_length
+    #   graphs, streaming     (set)            True                 True            async_pad_to_max=True
+    #
+    # "(set)" means resolve_cuda_graph_config() turns it on, because capture leaves no other option.
+    #
+    # Compile the frontend encoder and optional transformer encoder.
     compile_encoder: bool = False
     # Dynamic shapes handle variable input lengths; set False for static shapes when dynamic compilation fails.
+    # Forced to False whenever CUDA Graphs are captured, since a captured graph records fixed shapes.
     compile_dynamic: bool = True
-    # Capture the compiled outer encoders as CUDA Graphs (torch.compile mode='reduce-overhead'). Opt-in and
-    # offline only; requires compile_encoder=True, compile_dynamic=False, streaming_mode=False and a CUDA device.
-    # The private FP8 FlexAttention compile boundary is deliberately left outside the captured region.
+    # Capture the compiled encoders as CUDA Graphs (torch.compile mode='reduce-overhead'). Opt-in, CUDA only, and
+    # streaming_mode selects the captured boundary: False captures the outer encoders of one model forward, True
+    # captures the primary encoder forward that frontend_encoder() calls once per streaming step plus, when the
+    # checkpoint has one, the optional transformer encoder that forward_infer() calls in the same step. The
+    # separately invoked encoder.pre_encode() and the private FP8 FlexAttention compile boundary are deliberately
+    # left outside the captured region in both cases.
     compile_cuda_graphs: bool = False
     # Frontend-encoder maximum audio length, in encoder input frames, materialized before compilation so that the
     # retained positional state is created outside the captured region and the integer guard never changes between
-    # batches. Required when compile_cuda_graphs=True and ignored otherwise.
+    # batches. Required for offline CUDA Graphs (streaming_mode=False) and ignored otherwise.
     compile_cuda_graph_max_audio_length: Optional[int] = None
-    # Capture the compiled streaming encoders as CUDA Graphs (torch.compile mode='reduce-overhead' with
-    # dynamic=False). Opt-in and streaming only; requires compile_encoder=True, an explicit streaming_mode=True,
-    # async_pad_to_max=True and a CUDA device, and is mutually exclusive with the offline compile_cuda_graphs mode.
-    # The captured boundaries are the primary encoder forward that frontend_encoder() calls once per streaming step
-    # and, when the checkpoint has one, the optional transformer encoder that forward_infer() calls in the same
-    # step. The separately invoked encoder.pre_encode() and the private FP8 FlexAttention compile boundary are
-    # deliberately left outside the captured region.
-    compile_streaming_encoder_cuda_graphs: bool = False
     # torch.compile backend used for the encoders: 'inductor' (default) keeps the existing behaviour, 'cudagraphs'
     # captures the eager CUDA kernels as CUDA Graphs without Inductor kernel rewriting and is accepted only for
-    # compile_streaming_encoder_cuda_graphs=True.
+    # streaming CUDA Graphs (compile_cuda_graphs=True with streaming_mode=True).
     compile_backend: str = "inductor"
     # Emulate production streams arriving independently; offline batches otherwise update in lockstep.
     async_desync_updates: bool = False
@@ -200,105 +207,80 @@ FIXED_COMPILE_ENV_VAR = "SORTFORMER_FIXED_COMPILE"
 FIXED_COMPILE_TIME_FRAMES_ENV_VAR = "SORTFORMER_COMPILE_TIME_FRAMES"
 
 
-def validate_cuda_graph_config(cfg: DiarizationConfig, device_type: str) -> None:
+def uses_streaming_cuda_graphs(cfg: DiarizationConfig) -> bool:
+    """Whether the CUDA Graph request captures the encoder forwards of every streaming step."""
+    return bool(cfg.compile_cuda_graphs) and cfg.streaming_mode is True
+
+
+def uses_offline_cuda_graphs(cfg: DiarizationConfig) -> bool:
+    """Whether the CUDA Graph request captures the outer encoders of one offline model forward."""
+    return bool(cfg.compile_cuda_graphs) and cfg.streaming_mode is False
+
+
+def resolve_cuda_graph_config(cfg: DiarizationConfig, device_type: str) -> None:
     """
-    Fail closed on configurations that cannot capture the outer encoders as CUDA Graphs.
+    Validate a CUDA Graph request and fill in the settings that capture leaves no choice about.
+
+    ``streaming_mode`` selects which boundary is captured rather than a second flag doing it, because the two are
+    already mutually determined: the offline path captures the outer encoders of one model forward, and the
+    streaming path captures the fixed-shape encoder forwards of every streaming step. The mode therefore has to be
+    stated rather than inherited from the checkpoint, and each path needs its own source of fixed shapes -- a
+    materialized maximum audio length offline, and ``async_pad_to_max`` while streaming.
+
+    ``compile_encoder`` and ``compile_dynamic`` are set rather than demanded: graphs are captured at the encoder
+    ``torch.compile`` boundary and a graph cannot record dynamic shapes, so no other value is usable and asking for
+    capture already accepts both. ``async_pad_to_max`` is demanded rather than set, because it changes what the
+    encoder sees and so must not be switched on to satisfy a throughput flag.
 
     Args:
-        cfg (DiarizationConfig): The configuration object containing the compilation options.
+        cfg (DiarizationConfig): The configuration object containing the compilation options. Mutated in place.
         device_type (str): Type of the device selected for inference, for example ``cuda`` or ``cpu``.
 
     Raises:
-        ValueError: If CUDA Graphs are requested without compiled static-shape offline inference on a CUDA device,
-            without a positive integer ``compile_cuda_graph_max_audio_length``, or with an active fixed-shape compile
-            adapter whose frame count disagrees with that length.
+        ValueError: If ``streaming_mode`` is not stated explicitly, the device is not CUDA, the streaming path has
+            no fixed-shape streaming inputs, the offline path has no positive integer
+            ``compile_cuda_graph_max_audio_length``, or an active fixed-shape compile adapter disagrees with that
+            length.
         RuntimeError: If the installed PyTorch build has no ``torch.compiler.cudagraph_mark_step_begin``.
     """
     if not cfg.compile_cuda_graphs:
         return
-    if not cfg.compile_encoder:
+    if cfg.streaming_mode is None:
         raise ValueError(
-            "compile_cuda_graphs=True requires compile_encoder=True: the graphs are captured by the outer encoder "
-            "torch.compile boundary."
-        )
-    if cfg.compile_dynamic:
-        raise ValueError(
-            "compile_cuda_graphs=True requires compile_dynamic=False: CUDA Graph capture needs static shapes."
-        )
-    if cfg.streaming_mode is not False:
-        raise ValueError(
-            "compile_cuda_graphs=True requires the offline forward path, so streaming_mode must be set explicitly "
-            f"to False, got streaming_mode={cfg.streaming_mode}."
+            "compile_cuda_graphs=True requires streaming_mode to be set explicitly, because it selects which "
+            "boundary is captured: streaming_mode=False captures the outer encoders of one model forward, "
+            "streaming_mode=True captures the encoder forwards of every streaming step. Inheriting the mode from "
+            "the checkpoint would leave that choice undetermined."
         )
     if device_type != "cuda":
         raise ValueError(f"compile_cuda_graphs=True requires a CUDA device, got device type '{device_type}'.")
-    max_audio_length = cfg.compile_cuda_graph_max_audio_length
-    if not isinstance(max_audio_length, int) or isinstance(max_audio_length, bool) or max_audio_length <= 0:
-        raise ValueError(
-            "compile_cuda_graphs=True requires compile_cuda_graph_max_audio_length to be a positive integer number "
-            "of encoder input frames, so that the retained positional state is materialized before capture, got "
-            f"compile_cuda_graph_max_audio_length={cfg.compile_cuda_graph_max_audio_length!r}."
-        )
     if not callable(getattr(torch.compiler, "cudagraph_mark_step_begin", None)):
         raise RuntimeError(
             "compile_cuda_graphs=True requires a callable torch.compiler.cudagraph_mark_step_begin, which this "
             "PyTorch build does not provide."
         )
-    validate_fixed_shape_adapter_env(max_audio_length)
 
+    if cfg.streaming_mode:
+        if not cfg.async_pad_to_max:
+            raise ValueError(
+                "compile_cuda_graphs=True with streaming_mode=True requires async_pad_to_max=True so that the "
+                "captured encoder inputs keep a fixed physical shape across streaming steps. It is not enabled "
+                "automatically because padding changes what the encoder sees."
+            )
+    else:
+        max_audio_length = cfg.compile_cuda_graph_max_audio_length
+        if not isinstance(max_audio_length, int) or isinstance(max_audio_length, bool) or max_audio_length <= 0:
+            raise ValueError(
+                "compile_cuda_graphs=True with streaming_mode=False requires compile_cuda_graph_max_audio_length "
+                "to be a positive integer number of encoder input frames, so that the retained positional state is "
+                f"materialized before capture, got {cfg.compile_cuda_graph_max_audio_length!r}."
+            )
+        validate_fixed_shape_adapter_env(max_audio_length)
 
-def validate_streaming_encoder_cuda_graph_config(cfg: DiarizationConfig, device_type: str) -> None:
-    """
-    Fail closed on configurations that cannot capture the streaming encoder forwards as CUDA Graphs.
-
-    This is the streaming counterpart of :func:`validate_cuda_graph_config`. It captures the encoder forwards that
-    one streaming step calls with a fixed input shape, so it pins those boundaries to static shapes itself instead
-    of requiring a globally static ``compile_dynamic``. The fixed input shape comes from ``async_pad_to_max=True``,
-    which pads the packed speaker-cache, FIFO and chunk frames to their configured capacity on every streaming step.
-
-    Args:
-        cfg (DiarizationConfig): The configuration object containing the compilation options.
-        device_type (str): Type of the device selected for inference, for example ``cuda`` or ``cpu``.
-
-    Raises:
-        ValueError: If the streaming mode is combined with the offline ``compile_cuda_graphs`` mode, or requested
-            without compiled encoders, without explicit streaming inference, without fixed-shape streaming inputs,
-            or on a non-CUDA device.
-        RuntimeError: If the installed PyTorch build has no ``torch.compiler.cudagraph_mark_step_begin``.
-    """
-    if not cfg.compile_streaming_encoder_cuda_graphs:
-        return
-    if cfg.compile_cuda_graphs:
-        raise ValueError(
-            "compile_streaming_encoder_cuda_graphs=True is mutually exclusive with compile_cuda_graphs=True: the "
-            "offline mode captures the outer encoders of one model forward and marks that forward, the streaming "
-            "mode captures the fixed-shape encoder forwards of every streaming step and marks every step. Enable "
-            "exactly one of them."
-        )
-    if not cfg.compile_encoder:
-        raise ValueError(
-            "compile_streaming_encoder_cuda_graphs=True requires compile_encoder=True: the graphs are captured by "
-            "the encoder torch.compile boundaries."
-        )
-    if cfg.streaming_mode is not True:
-        raise ValueError(
-            "compile_streaming_encoder_cuda_graphs=True requires the streaming forward path, so streaming_mode "
-            f"must be set explicitly to True, got streaming_mode={cfg.streaming_mode}."
-        )
-    if not cfg.async_pad_to_max:
-        raise ValueError(
-            "compile_streaming_encoder_cuda_graphs=True requires async_pad_to_max=True so that the captured encoder "
-            "inputs keep a fixed physical shape across streaming steps."
-        )
-    if device_type != "cuda":
-        raise ValueError(
-            f"compile_streaming_encoder_cuda_graphs=True requires a CUDA device, got device type '{device_type}'."
-        )
-    if not callable(getattr(torch.compiler, "cudagraph_mark_step_begin", None)):
-        raise RuntimeError(
-            "compile_streaming_encoder_cuda_graphs=True requires a callable "
-            "torch.compiler.cudagraph_mark_step_begin, which this PyTorch build does not provide."
-        )
+    # Forced by capture rather than requested: the graphs are captured at the encoder torch.compile boundary, and a
+    # captured graph records fixed shapes. Neither can hold another value, so neither is worth demanding.
+    cfg.compile_encoder = True
+    cfg.compile_dynamic = False
 
 
 def validate_compile_backend(cfg: DiarizationConfig) -> None:
@@ -325,16 +307,16 @@ def validate_compile_backend(cfg: DiarizationConfig) -> None:
             f"compile_backend={cfg.compile_backend!r} is not supported. Choose one of "
             f"{list(SUPPORTED_COMPILE_BACKENDS)}: '{INDUCTOR_COMPILE_BACKEND}' keeps the default kernel-rewriting "
             f"backend, '{CUDAGRAPHS_COMPILE_BACKEND}' captures the eager CUDA kernels and requires "
-            "compile_streaming_encoder_cuda_graphs=True."
+            "compile_cuda_graphs=True with streaming_mode=True."
         )
     if cfg.compile_backend == INDUCTOR_COMPILE_BACKEND:
         return
-    if not cfg.compile_streaming_encoder_cuda_graphs:
+    if not uses_streaming_cuda_graphs(cfg):
         raise ValueError(
-            f"compile_backend='{CUDAGRAPHS_COMPILE_BACKEND}' requires compile_streaming_encoder_cuda_graphs=True: it "
-            "captures the fixed-shape streaming encoder forwards without Inductor kernel rewriting, and has no "
-            "defined meaning for ordinary dynamic compilation or for the offline compile_cuda_graphs mode. Set "
-            f"compile_backend='{INDUCTOR_COMPILE_BACKEND}' for those modes."
+            f"compile_backend='{CUDAGRAPHS_COMPILE_BACKEND}' requires compile_cuda_graphs=True with "
+            "streaming_mode=True: it captures the fixed-shape streaming encoder forwards without Inductor kernel "
+            "rewriting, and has no defined meaning for ordinary dynamic compilation or for the offline graph mode. "
+            f"Set compile_backend='{INDUCTOR_COMPILE_BACKEND}' for those modes."
         )
     available_backends = torch._dynamo.list_backends()
     if CUDAGRAPHS_COMPILE_BACKEND not in available_backends:
@@ -365,9 +347,9 @@ def resolve_encoder_compile_kwargs(cfg: DiarizationConfig) -> Dict[str, Any]:
     Returns:
         compile_kwargs (Dict[str, Any]): Keyword arguments passed to ``torch.compile`` for the encoders.
     """
-    if cfg.compile_streaming_encoder_cuda_graphs and cfg.compile_backend == CUDAGRAPHS_COMPILE_BACKEND:
+    if uses_streaming_cuda_graphs(cfg) and cfg.compile_backend == CUDAGRAPHS_COMPILE_BACKEND:
         return {"dynamic": False, "backend": CUDAGRAPHS_COMPILE_BACKEND}
-    if cfg.compile_cuda_graphs or cfg.compile_streaming_encoder_cuda_graphs:
+    if cfg.compile_cuda_graphs:
         return {"dynamic": False, "mode": CUDA_GRAPH_COMPILE_MODE}
     return {"dynamic": cfg.compile_dynamic}
 
@@ -459,15 +441,14 @@ def resolve_streaming_cuda_graph_targets(model: SortformerEncLabelModel) -> Dict
     encoder = getattr(model, "encoder", None)
     if not isinstance(encoder, torch.nn.Module):
         raise ValueError(
-            "compile_streaming_encoder_cuda_graphs=True requires the restored model to expose a primary encoder "
-            "module, whose forward every streaming step calls once with a fixed input shape, got "
-            f"encoder={type(encoder).__name__}."
+            "Streaming CUDA Graphs require the restored model to expose a primary encoder module, whose forward "
+            f"every streaming step calls once with a fixed input shape, got encoder={type(encoder).__name__}."
         )
     if not callable(getattr(model, STREAMING_CUDA_GRAPH_STEP_BOUNDARY, None)):
         raise ValueError(
-            "compile_streaming_encoder_cuda_graphs=True requires a callable "
-            f"{STREAMING_CUDA_GRAPH_STEP_BOUNDARY}() boundary on the restored model, which is where every "
-            f"streaming step is marked exactly once, got {type(model).__name__}."
+            f"Streaming CUDA Graphs require a callable {STREAMING_CUDA_GRAPH_STEP_BOUNDARY}() boundary on the "
+            f"restored model, which is where every streaming step is marked exactly once, got "
+            f"{type(model).__name__}."
         )
     targets: Dict[str, torch.nn.Module] = {"encoder": encoder}
     transformer_encoder = getattr(model, "transformer_encoder", None)
@@ -615,14 +596,13 @@ def install_streaming_cuda_graph_boundary(cfg: DiarizationConfig, model: torch.n
     the new CUDA Graph iteration before anything else of that step runs, including the length copy.
 
     Args:
-        cfg (DiarizationConfig): Resolved configuration whose ``compile_streaming_encoder_cuda_graphs`` decides
-            whether the boundary is prepared at all.
+        cfg (DiarizationConfig): Resolved configuration that decides whether the boundary is prepared at all.
         model (torch.nn.Module): Restored model that owns the boundary. Repeated calls are no-ops.
 
     Returns:
         installed (bool): Whether the boundary wrappers were requested by this configuration.
     """
-    if not cfg.compile_streaming_encoder_cuda_graphs:
+    if not uses_streaming_cuda_graphs(cfg):
         return False
     install_streaming_cuda_graph_length_stabilizer(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
     install_cuda_graph_step_marker(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
@@ -804,12 +784,11 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         accelerator = 'gpu'
         map_location = torch.device(f'cuda:{cfg.cuda}')
 
-    # Reject unsupported CUDA Graph combinations before the checkpoint is restored instead of falling back silently.
-    # The streaming mode is checked first so that requesting both modes reports the mutual exclusion instead of the
-    # offline requirements the streaming configuration cannot satisfy.
-    validate_streaming_encoder_cuda_graph_config(cfg, map_location.type)
-    validate_cuda_graph_config(cfg, map_location.type)
-    # Likewise for the compile backend, so an unusable or unregistered backend never reaches compilation.
+    # Reject unsupported CUDA Graph combinations before the checkpoint is restored instead of falling back silently,
+    # and fill in the compile settings that capture leaves no choice about.
+    resolve_cuda_graph_config(cfg, map_location.type)
+    # Likewise for the compile backend, so an unusable or unregistered backend never reaches compilation. Runs after
+    # the graph request is resolved, because the 'cudagraphs' backend is only defined for the streaming graph mode.
     validate_compile_backend(cfg)
 
     if cfg.model_path.endswith(".ckpt"):
@@ -897,21 +876,21 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         backend_info = attention_backend_info(cfg.attention_backend, diar_model.device)
         logging.info(f"Attention backend details: {json.dumps(backend_info)}")
 
-    if cfg.compile_cuda_graphs:
+    if uses_offline_cuda_graphs(cfg):
         # Materialize the retained positional state before compilation so that no batch extends it from inside a
         # captured graph, which previously produced overwritten CUDA Graph outputs on the second batch.
         stabilize_encoder_max_audio_length(diar_model.encoder, cfg.compile_cuda_graph_max_audio_length)
         logging.info(
-            f"CUDA Graphs requested: applying torch.compile mode='{CUDA_GRAPH_COMPILE_MODE}' to the outer frontend "
-            "and optional transformer encoders only, leaving the private FlexAttention compile boundary unchanged. "
-            "Static shapes are required (compile_dynamic=False) and every model forward is preceded by an explicit "
+            f"Offline CUDA Graphs requested: applying torch.compile mode='{CUDA_GRAPH_COMPILE_MODE}' to the outer "
+            "frontend and optional transformer encoders only, leaving the private FlexAttention compile boundary "
+            "unchanged. Shapes are pinned static and every model forward is preceded by an explicit "
             "torch.compiler.cudagraph_mark_step_begin() marker. The frontend encoder positional state was "
             f"materialized before compilation at max_audio_length={cfg.compile_cuda_graph_max_audio_length} frames, "
             "so the integer length guard is already fixed. Whether PyTorch actually captures a graph is reported by "
             "PyTorch at runtime and is not implied by this configuration."
         )
 
-    if cfg.compile_streaming_encoder_cuda_graphs:
+    if uses_streaming_cuda_graphs(cfg):
         # Fail before inference when the required encoder or its per-step call boundary is missing, instead of
         # running the requested mode as a no-op. A checkpoint without the optional transformer encoder is accepted.
         streaming_graph_targets = resolve_streaming_cuda_graph_targets(diar_model)
@@ -945,7 +924,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     # Installed at the single per-step boundary, after compilation, and only for the streaming graph mode.
     install_streaming_cuda_graph_boundary(cfg, diar_model)
 
-    if cfg.compile_cuda_graphs:
+    if uses_offline_cuda_graphs(cfg):
         # Installed before the profiler so that the profiler wraps the marked forward and each model forward still
         # begins exactly one CUDA Graph iteration, including the direct self.forward calls made by test_batch().
         install_cuda_graph_step_marker(diar_model)
