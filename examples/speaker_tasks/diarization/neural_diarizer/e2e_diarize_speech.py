@@ -192,11 +192,11 @@ INDUCTOR_COMPILE_BACKEND = "inductor"  # Default torch.compile backend, which re
 CUDAGRAPHS_COMPILE_BACKEND = "cudagraphs"  # torch.compile backend that graph-captures the eager kernels unchanged
 SUPPORTED_COMPILE_BACKENDS = (INDUCTOR_COMPILE_BACKEND, CUDAGRAPHS_COMPILE_BACKEND)
 CUDA_GRAPH_MARKER_ATTRIBUTE = "_sortformer_cuda_graph_step_marker"
-CUDA_GRAPH_LENGTH_STABILIZER_ATTRIBUTE = "_sortformer_cuda_graph_length_stabilizer"
-# Retained per-shape length buffers of the installed stabilizer, exposed on the wrapper so that the buffers stay
-# alive exactly as long as the wrapper that reuses them.
+CUDA_GRAPH_LENGTH_PINNING_ATTRIBUTE = "_sortformer_cuda_graph_length_pinning"
+# Retained per-shape length buffers of the installed pinning wrapper, exposed on it so that the buffers stay alive
+# exactly as long as the wrapper that reuses them.
 CUDA_GRAPH_LENGTH_BUFFERS_ATTRIBUTE = "_sortformer_cuda_graph_length_buffers"
-# Keyword name of the length argument that the stabilized per-step boundary keeps in stable storage.
+# Keyword name of the length argument the pinned per-step boundary keeps at a fixed address.
 STREAMING_CUDA_GRAPH_LENGTH_ARGUMENT = "processed_signal_length"
 # Single per-streaming-step boundary that every captured encoder call passes through: the model method that calls
 # the primary encoder forward, before forward_infer() reaches the optional transformer encoder of the same step.
@@ -210,13 +210,13 @@ class CudaGraphMode:
     Args:
         streaming (bool): Whether the captured forwards are the per-streaming-step ones.
         step_boundary (str): Bound method marked once per captured iteration.
-        stabilize_length (bool): Whether that boundary needs its length argument kept in retained storage.
+        pin_static_length (bool): Whether that boundary needs its length argument kept in retained storage.
         required_field (str): Config field this strategy cannot run without, demanded rather than derived.
     """
 
     streaming: bool
     step_boundary: str
-    stabilize_length: bool
+    pin_static_length: bool
     required_field: str
 
 
@@ -227,13 +227,13 @@ CUDA_GRAPH_MODES = {
     False: CudaGraphMode(
         streaming=False,
         step_boundary="forward",
-        stabilize_length=False,
+        pin_static_length=False,
         required_field="compile_cuda_graph_max_audio_length",
     ),
     True: CudaGraphMode(
         streaming=True,
         step_boundary=STREAMING_CUDA_GRAPH_STEP_BOUNDARY,
-        stabilize_length=True,
+        pin_static_length=True,
         required_field="async_pad_to_max",
     ),
 }
@@ -492,7 +492,7 @@ def install_cuda_graph_step_marker(model: torch.nn.Module, method_name: str = "f
     return marked_method
 
 
-def install_streaming_cuda_graph_length_stabilizer(
+def install_cuda_graph_length_pinning(
     model: torch.nn.Module, method_name: str = STREAMING_CUDA_GRAPH_STEP_BOUNDARY
 ) -> Callable:
     """
@@ -513,23 +513,23 @@ def install_streaming_cuda_graph_length_stabilizer(
 
     Args:
         model (torch.nn.Module): Model that owns the per-step boundary. Repeated calls are no-ops.
-        method_name (str): Name of the bound boundary method to stabilize. Defaults to the streaming boundary.
+        method_name (str): Name of the bound boundary method to pin. Defaults to the streaming boundary.
 
     Returns:
-        stabilized_method (Callable): The installed method, or the existing one when already installed.
+        pinned_method (Callable): The installed method, or the existing one when already installed.
 
     Raises:
-        ValueError: If the object has no callable method of that name to stabilize.
+        ValueError: If the object has no callable method of that name to pin.
     """
-    stabilizer_attribute = f"{CUDA_GRAPH_LENGTH_STABILIZER_ATTRIBUTE}_{method_name}"
+    pinning_attribute = f"{CUDA_GRAPH_LENGTH_PINNING_ATTRIBUTE}_{method_name}"
     original_method = getattr(model, method_name, None)
     if not callable(original_method):
         raise ValueError(
-            f"CUDA Graph length stabilization requires a callable {method_name}() on {type(model).__name__}, got "
+            f"CUDA Graph length pinning requires a callable {method_name}() on {type(model).__name__}, got "
             f"{type(original_method).__name__}."
         )
-    already_installed = getattr(model, stabilizer_attribute, False) or getattr(
-        original_method, CUDA_GRAPH_LENGTH_STABILIZER_ATTRIBUTE, False
+    already_installed = getattr(model, pinning_attribute, False) or getattr(
+        original_method, CUDA_GRAPH_LENGTH_PINNING_ATTRIBUTE, False
     )
     if already_installed:
         return original_method
@@ -537,7 +537,7 @@ def install_streaming_cuda_graph_length_stabilizer(
     # Keyed by tensor metadata rather than by call order, so that a recurring shape reuses its own retained buffer.
     length_buffers: Dict[Tuple, torch.Tensor] = {}
 
-    def stabilized_length(length: torch.Tensor) -> torch.Tensor:
+    def pinned_length(length: torch.Tensor) -> torch.Tensor:
         key = (tuple(length.shape), length.dtype, length.device)
         buffer = length_buffers.get(key)
         if buffer is None:
@@ -555,40 +555,40 @@ def install_streaming_cuda_graph_length_stabilizer(
         return tuple(buffer.clone() if item is buffer else item for item in result)
 
     @functools.wraps(original_method)
-    def stabilized_method(*args, **kwargs):
+    def pinned_method(*args, **kwargs):
         buffer = None
         if STREAMING_CUDA_GRAPH_LENGTH_ARGUMENT in kwargs:
             length = kwargs[STREAMING_CUDA_GRAPH_LENGTH_ARGUMENT]
             if isinstance(length, torch.Tensor):
-                buffer = stabilized_length(length)
+                buffer = pinned_length(length)
                 kwargs = dict(kwargs)
                 kwargs[STREAMING_CUDA_GRAPH_LENGTH_ARGUMENT] = buffer
         elif len(args) > 1 and isinstance(args[1], torch.Tensor):
-            buffer = stabilized_length(args[1])
+            buffer = pinned_length(args[1])
             args = (args[0], buffer) + args[2:]
         return detached_result(original_method(*args, **kwargs), buffer)
 
-    setattr(stabilized_method, CUDA_GRAPH_LENGTH_STABILIZER_ATTRIBUTE, True)
-    setattr(stabilized_method, CUDA_GRAPH_LENGTH_BUFFERS_ATTRIBUTE, length_buffers)
-    setattr(model, method_name, stabilized_method)
-    setattr(model, stabilizer_attribute, True)
-    return stabilized_method
+    setattr(pinned_method, CUDA_GRAPH_LENGTH_PINNING_ATTRIBUTE, True)
+    setattr(pinned_method, CUDA_GRAPH_LENGTH_BUFFERS_ATTRIBUTE, length_buffers)
+    setattr(model, method_name, pinned_method)
+    setattr(model, pinning_attribute, True)
+    return pinned_method
 
 
 def install_cuda_graph_boundary(mode: CudaGraphMode, model: torch.nn.Module) -> None:
     """
     Install the per-iteration boundary wrappers one capture strategy needs.
 
-    Called after the encoders are compiled. Where a length stabilizer is needed it is installed first, so that the
+    Called after the encoders are compiled. Where a length pinning wrapper is needed it is installed first, so that the
     step marker wraps it and every captured iteration begins before anything else of that iteration runs,
     including the length copy.
 
     Args:
-        mode (CudaGraphMode): Selected capture strategy, whose boundary and stabilization needs are read from it.
+        mode (CudaGraphMode): Selected capture strategy, whose boundary and pinning needs are read from it.
         model (torch.nn.Module): Restored model that owns the boundary. Repeated calls are no-ops.
     """
-    if mode.stabilize_length:
-        install_streaming_cuda_graph_length_stabilizer(model, method_name=mode.step_boundary)
+    if mode.pin_static_length:
+        install_cuda_graph_length_pinning(model, method_name=mode.step_boundary)
     install_cuda_graph_step_marker(model, method_name=mode.step_boundary)
 
 

@@ -35,8 +35,8 @@ from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech impor
     DiarizationConfig,
     get_tensor_path,
     install_cuda_graph_boundary,
+    install_cuda_graph_length_pinning,
     install_cuda_graph_step_marker,
-    install_streaming_cuda_graph_length_stabilizer,
     resolve_cuda_graph_config,
     resolve_cuda_graph_mode,
     resolve_encoder_compile_kwargs,
@@ -2088,7 +2088,7 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
         processed_signal = torch.ones(2, 4, 3)
         caller_lengths = [torch.tensor([4, 3]), torch.tensor([4, 2]), torch.tensor([3, 1])]
 
-        install_streaming_cuda_graph_length_stabilizer(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+        install_cuda_graph_length_pinning(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
         for caller_length in caller_lengths:
             if call_style == "keyword":
                 model.frontend_encoder(
@@ -2116,7 +2116,7 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
     def test_each_call_sees_its_own_newest_length_values(self):
         model = StubStreamingModel()
         observed = []
-        install_streaming_cuda_graph_length_stabilizer(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+        install_cuda_graph_length_pinning(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
         boundary = model.frontend_encoder
 
         def recording_boundary(*args, **kwargs):
@@ -2138,7 +2138,7 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
     def test_a_returned_length_is_not_the_retained_buffer(self):
         # The stub boundary hands its length argument straight back, as the encoder does for pre-encoded inputs.
         model = StubStreamingModel()
-        install_streaming_cuda_graph_length_stabilizer(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+        install_cuda_graph_length_pinning(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
 
         _, first_length = model.frontend_encoder(
             processed_signal=torch.ones(2, 4, 3),
@@ -2159,7 +2159,7 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
     def test_alternating_supported_shapes_reuse_one_buffer_each(self):
         # A final partial batch alternates with the full batch, and each shape must recur into its own buffer.
         model = StubStreamingModel()
-        install_streaming_cuda_graph_length_stabilizer(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+        install_cuda_graph_length_pinning(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
         pointers_by_shape = {}
 
         for batch_size in (4, 4, 2, 4, 2, 2):
@@ -2176,26 +2176,24 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
         assert {tuple(buffer.shape) for buffer in buffers.values()} == {(4,), (2,)}
 
     @pytest.mark.unit
-    def test_length_stabilizer_installation_is_idempotent(self):
+    def test_length_pinning_installation_is_idempotent(self):
         model = StubStreamingModel()
 
-        first = install_streaming_cuda_graph_length_stabilizer(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
-        second = install_streaming_cuda_graph_length_stabilizer(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+        first = install_cuda_graph_length_pinning(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+        second = install_cuda_graph_length_pinning(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
 
         assert first is second is model.frontend_encoder
-        # The stabilizer never touches the outer model forward.
+        # The pinning wrapper never touches the outer model forward.
         assert model.forward.__func__ is type(model).forward
 
     @pytest.mark.unit
-    def test_length_stabilization_requires_the_named_boundary(self):
+    def test_length_pinning_requires_the_named_boundary(self):
         with pytest.raises(ValueError, match=f"callable {STREAMING_CUDA_GRAPH_STEP_BOUNDARY}"):
-            install_streaming_cuda_graph_length_stabilizer(
-                SimpleNamespace(), method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY
-            )
+            install_cuda_graph_length_pinning(SimpleNamespace(), method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
 
     @pytest.mark.unit
     @pytest.mark.parametrize("num_calls", [3])
-    def test_marker_stays_once_per_step_and_precedes_the_stabilized_boundary(self, num_calls):
+    def test_marker_stays_once_per_step_and_precedes_the_pinned_boundary(self, num_calls):
         model = StubStreamingModel(transformer_encoder=StubTransformerEncoder())
         events = []
         boundary = type(model).frontend_encoder
@@ -2228,7 +2226,7 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
 
     @pytest.mark.unit
     @pytest.mark.parametrize("streaming, expected", [(True, True), (False, False)])
-    def test_only_the_streaming_strategy_stabilizes_the_boundary_length(self, streaming, expected):
+    def test_only_the_streaming_strategy_pins_the_boundary_length(self, streaming, expected):
         # The strategy carries where it marks and whether that boundary needs retained length storage, so the
         # installer reads both from it instead of branching on the configuration again.
         model = StubStreamingModel()
@@ -2236,8 +2234,8 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
         with patch.object(torch.compiler, "cudagraph_mark_step_begin", MagicMock(), create=True):
             install_cuda_graph_boundary(CUDA_GRAPH_MODES[streaming], model)
 
-        stabilized = hasattr(model.frontend_encoder, CUDA_GRAPH_LENGTH_BUFFERS_ATTRIBUTE)
-        assert stabilized is expected
+        pinned = hasattr(model.frontend_encoder, CUDA_GRAPH_LENGTH_BUFFERS_ATTRIBUTE)
+        assert pinned is expected
         # The offline strategy leaves the per-step boundary alone and marks the model forward instead.
         untouched_boundary = MethodType(type(model).frontend_encoder, model)
         assert (model.frontend_encoder == untouched_boundary) is not expected
