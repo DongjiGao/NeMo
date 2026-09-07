@@ -25,16 +25,26 @@ Alongside NeMo's usual ``model_config.yaml``, the archive holds two members:
 
 ``model_weights.safetensors``
     Unquantized weights unchanged. Each quantized weight is decomposed with
-    ``NVFP4Tensor.__tensor_flatten__`` into four tensors -- the packed FP4 ``qdata``, the
-    per-16-element-block E4M3 ``scale``, the ``per_tensor_scale`` weight global scale and the
-    ``act_per_tensor_scale`` static activation scale -- stored under ``<parameter>::<attribute>``
-    keys. The separator identifies which entries are payload, so no list of quantized weights is
-    stored anywhere.
+    ``NVFP4Tensor.__tensor_flatten__`` into four tensors, stored under the suffixes
+    ModelOpt-produced checkpoints use so that a reader familiar with those can tell what each entry
+    is: the packed FP4 ``qdata`` as ``weight``, the per-16-element-block E4M3 ``scale`` as
+    ``weight_scale``, the weight global scale as ``weight_scale_2`` and the static activation scale
+    as ``input_scale``.
 
-``quantization_config.json``
-    The flatten context needed to rebuild an ``NVFP4Tensor``, plus provenance. Keeping it a separate
-    member rather than safetensors metadata makes it readable without a binary parse, and marks the
-    archive as this format.
+``hf_quant_config.json``
+    ModelOpt's config shape -- ``producer``, and ``quantization`` with ``quant_algo``, ``group_size``
+    and ``quantized_layers`` -- plus a ``sortformer_nvfp4`` section holding the flatten context
+    needed to rebuild an ``NVFP4Tensor`` and the export provenance. Keeping the config a separate
+    member rather than safetensors metadata makes it readable without a binary parse.
+
+``quantized_layers`` is load-bearing rather than decorative. Because ``qdata`` is stored under the
+bare ``weight`` suffix, a quantized weight is named exactly like a plain one and the quantized set
+cannot be recovered from the keys.
+
+The file name is shared with ModelOpt-produced checkpoints, so the ``sortformer_nvfp4`` section --
+not the file name -- is what identifies an archive as this format. The payloads are not
+interchangeable: the scale layout differs, and this connector refuses a config without that section
+rather than misreading one.
 
 The context is stored once, not per weight: this recipe quantizes every target identically, so all
 93 contexts of a produced checkpoint were byte-identical. Export refuses a model whose weights
@@ -70,7 +80,7 @@ from nemo.utils import logging
 __all__ = [
     "CHECKPOINT_FORMAT",
     "CHECKPOINT_FORMAT_VERSION",
-    "PAYLOAD_SEPARATOR",
+    "CONFIG_SECTION",
     "QUANTIZATION_CONFIG_MEMBER",
     "SortformerNVFP4SaveRestoreConnector",
     "is_nvfp4_checkpoint",
@@ -82,14 +92,30 @@ __all__ = [
 CHECKPOINT_FORMAT = "sortformer_nvfp4"
 CHECKPOINT_FORMAT_VERSION = 1
 
-# Archive member holding the quantization config. Its presence is what marks an archive as this
-# format.
-QUANTIZATION_CONFIG_MEMBER = "quantization_config.json"
+# Archive member holding the quantization config, named as ModelOpt-produced checkpoints name theirs.
+QUANTIZATION_CONFIG_MEMBER = "hf_quant_config.json"
 
-# Separates a parameter's state-dict key from the flattened attribute it carries. Chosen because it
-# cannot occur in a module FQN, so splitting is unambiguous and a plain BF16 key is never mistaken
-# for part of a quantized payload.
-PAYLOAD_SEPARATOR = "::"
+# Config section carrying what is specific to this format. The file name is shared with ModelOpt, so
+# this key -- not the file name -- is what identifies an archive as ours; a genuine ModelOpt artifact
+# has no such section and must not be mistaken for one of these.
+CONFIG_SECTION = "sortformer_nvfp4"
+
+# Quantization algorithm label, matching the value ModelOpt records for the same format.
+QUANT_ALGO = "NVFP4"
+# Weights per E4M3 block scale. ModelOpt calls this group_size; TorchAO calls it block_size.
+GROUP_SIZE = 16
+
+# TorchAO flatten attribute -> tensor suffix, using the names ModelOpt-produced checkpoints use, so a
+# reader familiar with those can tell what each entry is. ``qdata`` maps to the bare ``weight``
+# suffix, which means a quantized weight and a plain one are named alike and the quantized set has to
+# be read from the config rather than inferred from the keys.
+ATTRIBUTE_SUFFIXES = {
+    "qdata": "weight",
+    "scale": "weight_scale",
+    "per_tensor_scale": "weight_scale_2",
+    "act_per_tensor_scale": "input_scale",
+}
+SUFFIX_ATTRIBUTES = {suffix: attribute for attribute, suffix in ATTRIBUTE_SUFFIXES.items()}
 
 TORCHAO_VERSION_MISMATCH_MESSAGE = (
     "The checkpoint records TorchAO {recorded} but TorchAO {installed} is installed. The stored context is "
@@ -230,23 +256,34 @@ def _is_quantized(tensor: Any) -> bool:
 
 def is_nvfp4_checkpoint(path: str) -> bool:
     """
-    Whether a ``.nemo`` archive carries an NVFP4 quantization config.
+    Whether a ``.nemo`` archive carries a Sortformer NVFP4 quantization config.
 
-    Decided from the archive's table of contents, which does not extract any member. A path that is
-    not a readable tar is reported as ``False`` rather than raising, so the ordinary restore path
-    still produces its own error message for a genuinely broken file.
+    The config member's name is shared with ModelOpt-produced checkpoints, so its presence alone is
+    not enough: the file is read and required to declare :data:`CONFIG_SECTION`. A path that is not a
+    readable tar, or whose config is not parseable, is reported as ``False`` rather than raising, so
+    the ordinary restore path still produces its own error message for a genuinely broken file.
 
     Args:
         path (str): Path to a ``.nemo`` archive.
 
     Returns:
-        is_nvfp4 (bool): ``True`` when the archive contains :data:`QUANTIZATION_CONFIG_MEMBER`.
+        is_nvfp4 (bool): ``True`` when the archive declares this format.
     """
     try:
         with tarfile.open(path, "r:*") as archive:
-            return any(name.lstrip("./") == QUANTIZATION_CONFIG_MEMBER for name in archive.getnames())
-    except (OSError, tarfile.TarError):
+            member = next(
+                (m for m in archive.getmembers() if m.name.lstrip("./") == QUANTIZATION_CONFIG_MEMBER), None
+            )
+            if member is None:
+                return False
+            handle = archive.extractfile(member)
+            if handle is None:
+                return False
+            config = json.load(handle)
+    except (OSError, tarfile.TarError, ValueError, UnicodeDecodeError):
         return False
+    section = config.get(CONFIG_SECTION)
+    return isinstance(section, dict) and section.get("format") == CHECKPOINT_FORMAT
 
 
 def resolve_nvfp4_save_restore_connector(path: str) -> Optional["SortformerNVFP4SaveRestoreConnector"]:
@@ -292,6 +329,7 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
         self._export_precision = export_precision
         self._source_checkpoint_sha256 = source_checkpoint_sha256
         self._restored_context: Dict[str, Any] = {}
+        self._quantized_layers: List[str] = []
 
     def _save_state_dict_to_disk(self, state_dict: Dict[str, Any], filepath: str) -> None:
         """
@@ -319,9 +357,17 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
                 continue
 
             names, context = value.__tensor_flatten__()
+            unnamed = sorted(set(names) - set(ATTRIBUTE_SUFFIXES))
+            if unnamed:
+                raise ValueError(
+                    f"'{key}' flattens to attributes {unnamed} that this format has no tensor name for. Storing it "
+                    "without them would lose part of the payload."
+                )
+            module_fqn, _, _ = key.rpartition(".")
             for name in names:
-                tensors[f"{key}{PAYLOAD_SEPARATOR}{name}"] = getattr(value, name).detach().cpu().contiguous()
-            contexts[key] = _context_to_json(context)
+                stored = f"{module_fqn}.{ATTRIBUTE_SUFFIXES[name]}"
+                tensors[stored] = getattr(value, name).detach().cpu().contiguous()
+            contexts[module_fqn] = _context_to_json(context)
 
         if not contexts:
             raise ValueError("No quantized weights found; use the ordinary connector for an unquantized model.")
@@ -333,15 +379,27 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
                 f"version {CHECKPOINT_FORMAT_VERSION} stores one shared context and cannot represent this model."
             )
 
+        # ModelOpt's hf_quant_config.json shape, so a reader who knows that convention can see which
+        # layers are quantized and how. quantized_layers is required rather than decorative here:
+        # ``qdata`` is stored under the bare ``weight`` suffix, so a quantized weight is named exactly
+        # like a plain one and the set cannot be recovered from the keys.
         config = {
-            "format": CHECKPOINT_FORMAT,
-            "format_version": CHECKPOINT_FORMAT_VERSION,
-            "producer": {
+            "producer": {"name": "nemo-sortformer", "version": str(CHECKPOINT_FORMAT_VERSION)},
+            "quantization": {
+                "quant_algo": QUANT_ALGO,
+                "group_size": GROUP_SIZE,
+                "quantized_layers": {
+                    fqn: {"quant_algo": QUANT_ALGO, "group_size": GROUP_SIZE} for fqn in sorted(contexts)
+                },
+            },
+            CONFIG_SECTION: {
+                "format": CHECKPOINT_FORMAT,
+                "format_version": CHECKPOINT_FORMAT_VERSION,
                 "torchao_version": _installed_torchao_version(),
                 "export_precision": self._export_precision,
                 "source_checkpoint_sha256": self._source_checkpoint_sha256,
+                "context": json.loads(distinct.pop()),
             },
-            "context": json.loads(distinct.pop()),
         }
         config_path = os.path.join(os.path.dirname(filepath), QUANTIZATION_CONFIG_MEMBER)
         with open(config_path, "w", encoding="utf-8") as handle:
@@ -375,20 +433,24 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
         with open(config_path, encoding="utf-8") as handle:
             config = json.load(handle)
 
-        if config.get("format") != CHECKPOINT_FORMAT:
+        section = config.get(CONFIG_SECTION)
+        if not isinstance(section, dict) or section.get("format") != CHECKPOINT_FORMAT:
             raise ValueError(
-                f"{config_path} records format {config.get('format')!r}, not {CHECKPOINT_FORMAT!r}. This connector "
-                "will not guess at the layout of an unknown container."
+                f"{config_path} has no '{CONFIG_SECTION}' section declaring format {CHECKPOINT_FORMAT!r}. The file "
+                "name is shared with ModelOpt-produced checkpoints, which this connector cannot read."
             )
-        if config.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+        if section.get("format_version") != CHECKPOINT_FORMAT_VERSION:
             raise ValueError(
-                f"{config_path} records format version {config.get('format_version')!r}, but this build reads "
+                f"{config_path} records format version {section.get('format_version')!r}, but this build reads "
                 f"version {CHECKPOINT_FORMAT_VERSION}."
             )
 
-        self._restored_context = config["context"]
+        self._restored_context = section["context"]
+        self._quantized_layers = sorted((config.get("quantization") or {}).get("quantized_layers") or {})
+        if not self._quantized_layers:
+            raise ValueError(f"{config_path} lists no quantized layers, so no payload could be reconstructed.")
 
-        recorded = (config.get("producer") or {}).get("torchao_version")
+        recorded = section.get("torchao_version")
         installed = _installed_torchao_version()
         if recorded and recorded != installed:
             logging.warning(TORCHAO_VERSION_MISMATCH_MESSAGE.format(recorded=recorded, installed=installed))
@@ -440,17 +502,41 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
         logging.info(f"Restored {len(installed)} quantized and {len(plain)} plain weights.")
         instance._set_model_restore_state(is_being_restored=False)
 
-    @staticmethod
-    def _partition(state_dict: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]:
-        """Split a loaded state dict into quantized attribute groups and plain tensors."""
+    def _partition(self, state_dict: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, torch.Tensor]], Dict[str, Any]]:
+        """
+        Split a loaded state dict into quantized attribute groups and plain tensors.
+
+        Grouping is driven by the config's quantized-layer list rather than by the key names: a
+        quantized weight is stored under the bare ``weight`` suffix, exactly like a plain one, so the
+        keys alone cannot say which is which.
+
+        Args:
+            state_dict (Dict[str, Any]): Tensors as loaded from safetensors.
+
+        Returns:
+            grouped (Dict[str, Dict[str, torch.Tensor]]): Parameter key -> flatten attribute -> tensor.
+            plain (Dict[str, Any]): Every entry that is not part of a quantized payload.
+
+        Raises:
+            ValueError: If a listed layer is missing part of its payload.
+        """
         grouped: Dict[str, Dict[str, torch.Tensor]] = {}
-        plain: Dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            if PAYLOAD_SEPARATOR in key:
-                parameter_key, _, attribute = key.partition(PAYLOAD_SEPARATOR)
-                grouped.setdefault(parameter_key, {})[attribute] = value
-            else:
-                plain[key] = value
+        consumed = set()
+        for module_fqn in self._quantized_layers:
+            attributes: Dict[str, torch.Tensor] = {}
+            for attribute, suffix in ATTRIBUTE_SUFFIXES.items():
+                key = f"{module_fqn}.{suffix}"
+                if key in state_dict:
+                    attributes[attribute] = state_dict[key]
+                    consumed.add(key)
+            if "qdata" not in attributes or "scale" not in attributes:
+                raise ValueError(
+                    f"The config lists '{module_fqn}' as quantized, but its payload is incomplete: found "
+                    f"{sorted(attributes)}."
+                )
+            grouped[f"{module_fqn}.weight"] = attributes
+
+        plain = {key: value for key, value in state_dict.items() if key not in consumed}
         return grouped, plain
 
     @staticmethod
