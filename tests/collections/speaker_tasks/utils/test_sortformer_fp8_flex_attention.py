@@ -179,7 +179,7 @@ class TestBackendSelection:
     @pytest.mark.unit
     @pytest.mark.parametrize("backend", ["fp8", "FP8_FLEX", "fp8-flex", "fp8_flex ", "flex_fp8", "fp8flex"])
     def test_misspelled_backend_raises(self, backend):
-        with pytest.raises(ValueError, match="is not supported"):
+        with pytest.raises(ValueError, match="is not a valid AttentionBackend"):
             validate_attention_backend(backend)
 
     @pytest.mark.unit
@@ -216,7 +216,7 @@ class TestModelWiring:
     @pytest.mark.unit
     def test_misspelled_backend_raises_before_touching_the_model(self):
         model = _DummyModel(encoder=_DummyEncoder())
-        with pytest.raises(ValueError, match="is not supported"):
+        with pytest.raises(ValueError, match="is not a valid AttentionBackend"):
             configure_attention_backend(model, "fp8")
         assert model.encoder.backend == FLEX_BACKEND
 

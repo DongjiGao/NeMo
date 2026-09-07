@@ -687,9 +687,9 @@ class TestFp8FlexAttentionBackend:
 
     @pytest.mark.unit
     def test_misspelled_backend_raises(self):
-        with pytest.raises(ValueError, match="is not supported"):
+        with pytest.raises(ValueError, match="is not a valid AttentionBackend"):
             self._rope_encoder(attention_backend="fp8")
-        with pytest.raises(ValueError, match="is not supported"):
+        with pytest.raises(ValueError, match="is not a valid AttentionBackend"):
             self._rope_encoder().set_attention_backend("fp8-flex")
 
     @pytest.mark.unit

@@ -247,7 +247,8 @@ def is_nvfp4_checkpoint(path: str) -> bool:
         is_nvfp4 (bool): ``True`` when the archive declares this format.
     """
     try:
-        with tarfile.open(path, "r:*") as archive:
+        # The base connector's opener, which falls back to a gzipped header for older checkpoints.
+        with SaveRestoreConnector._tar_open(path) as archive:
             member = next(
                 (m for m in archive.getmembers() if m.name.removeprefix("./") == QUANTIZATION_CONFIG_MEMBER),
                 None,

@@ -33,6 +33,7 @@ from nemo.collections.asr.parts.utils.sortformer_fp8_flex_attention import (
     FP8_FLEX_BACKEND,
     fp8_flex_backend_info,
 )
+from nemo.utils.enum import PrettyStrEnum
 
 if TYPE_CHECKING:
     from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
 __all__ = [
     "FLEX_BACKEND",
     "SUPPORTED_ATTENTION_BACKENDS",
+    "AttentionBackend",
     "attention_backend_cache_identity",
     "attention_backend_info",
     "configure_attention_backend",
@@ -47,7 +49,18 @@ __all__ = [
 ]
 
 FLEX_BACKEND = "flex"
-SUPPORTED_ATTENTION_BACKENDS = (FLEX_BACKEND, FP8_FLEX_BACKEND)
+
+
+class AttentionBackend(PrettyStrEnum):
+    """Selectable attention kernels. Construction validates, listing the choices on a bad value."""
+
+    FLEX = FLEX_BACKEND
+    FP8_FLEX = FP8_FLEX_BACKEND
+
+
+# Derived from the enum so the two cannot drift. Kept as plain strings because callers compare the
+# selection against the backend constants, and ``PrettyStrEnum`` is not a ``str`` subclass.
+SUPPORTED_ATTENTION_BACKENDS = tuple(str(member) for member in AttentionBackend)
 
 
 def validate_attention_backend(backend: Optional[str]) -> str:
@@ -60,17 +73,11 @@ def validate_attention_backend(backend: Optional[str]) -> str:
         backend (str): One of :data:`SUPPORTED_ATTENTION_BACKENDS`.
 
     Raises:
-        ValueError: If the backend is not a string or is not supported.
+        ValueError: If the backend is not a supported name.
     """
     if backend is None:
         return FLEX_BACKEND
-    if not isinstance(backend, str):
-        raise ValueError(f"attention_backend must be a string, got {type(backend).__name__}.")
-    if backend not in SUPPORTED_ATTENTION_BACKENDS:
-        raise ValueError(
-            f"attention_backend='{backend}' is not supported. Supported backends: {SUPPORTED_ATTENTION_BACKENDS}."
-        )
-    return backend
+    return str(AttentionBackend(backend))
 
 
 def configure_attention_backend(diar_model: "SortformerEncLabelModel", backend: Optional[str]) -> Dict[str, str]:
