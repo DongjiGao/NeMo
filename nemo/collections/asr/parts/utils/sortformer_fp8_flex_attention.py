@@ -15,42 +15,50 @@
 """
 Opt-in FP8 FlexAttention (Triton) inference backend for the NeMo ``TransformerEncoder``.
 
-Selecting ``"fp8_flex"`` keeps the encoder's FlexAttention semantics -- the same per-sample key-padding
-block mask (``kv_idx < lengths[b]``) built once by ``TransformerEncoder.forward_internal`` and shared by
-every layer -- and only changes the numeric format the kernel runs in: the post-QK-norm, post-RoPE BF16
-Q/K/V tensors are cast to ``torch.float8_e4m3fn`` in the layouts PyTorch's FP8 FlexAttention kernel requires
-(Q/K row-major, V column-major along the time axis), FlexAttention is invoked with its Triton backend
-explicitly selected, and the result is converted back to BF16 before the unchanged output projection.
+Select with ``attention_backend="fp8_flex"``.
 
-The attention kernel is PyTorch's own FlexAttention/Triton lowering. This module adds no Triton, CUDA,
-CUTLASS or FlashAttention kernel of its own and no new dependency; the only numeric step is a direct E4M3
-cast with FlexAttention's default ``1/sqrt(D)`` score scale -- no dynamic amax pass and no static
-calibration contract. Final DER is the accuracy decision for that choice, so no scaling scheme is smuggled
-in here.
+What changes
+------------
+- Numeric format only: BF16 Q/K/V (post-QK-norm, post-RoPE) cast to ``torch.float8_e4m3fn``, back to BF16
+  before the unchanged output projection.
+- Mask semantics identical: the ``kv_idx < lengths[b]`` key-padding mask that
+  ``TransformerEncoder.forward_internal`` builds once and shares across layers.
+- Scaling: none. Direct cast at the default ``1/sqrt(D)`` score scale. DER is the only evidence for it.
+- Layout: V column-major along time, Q/K row-major. A plain cast does not produce that.
 
-What this module *does* add is a compilation boundary. The cast/layout work plus the FlexAttention call are
-compiled once, on their own, as the private root :func:`_fp8_flex_attention_boundary`
-(``fullgraph=True, dynamic=False``), and are reached from the encoder through a single
-``torch.library.custom_op`` (:data:`FP8_FLEX_CUSTOM_OP_NAME`). The operator is opaque to the *outer* encoder
-compiler, so the 31 encoder layers no longer inline 31 copies of the FP8 attention region into the outer
-graph; it is not opaque to PyTorch, which still lowers the attention itself. Because a custom operator takes
-only tensors and scalars, every piece of per-batch state crosses that boundary explicitly: the eight
-``BlockMask`` tensor fields, the two sequence lengths, the two block sizes, and the ``(B,)`` per-sample valid
-key lengths. The ``BlockMask`` python wrapper -- including the ``kv_idx < valid_lengths[b]`` padding
-``mask_mod``, which keeps a non-block-aligned final valid key exact -- is rebuilt inside the compiled root
-from exactly those arguments. No global mask, no thread-local state, no closure-identity trick, no cache
-keyed on a python object, and no data-dependent device-to-host read in the hot path.
+Why this is not three lines
+---------------------------
+``flex_attention(q.to(fp8), k.to(fp8), v.to(fp8), block_mask=mask)`` does not work; each reason forces the
+next.
 
-The backend is one common implementation for the Blackwell compute-capability families 10.x, 11.x and 12.x
-(SM100/SM103, SM110, SM120). There is no device-name check, no minor-version dispatch and no
-architecture-specific tuning branch. Everything else -- other devices, other dtypes, relative-position score
-modification, causal/block-sparse modes, autograd/training use, a missing or malformed block mask, malformed
-lengths -- fails closed with an actionable error, and a compiler or runtime failure on an admitted device
-surfaces to the caller instead of silently falling back to BF16 FlexAttention.
+1. ``kernel_options={"BACKEND": "TRITON"}`` applies only on the *compiled* path, and the default FP8
+   lowering (FLASH) fails an output-dtype assertion on SM120. Hence compiled, with ``fullgraph=True`` (a
+   graph break would silently drop the selection) and ``dynamic=False``.
+2. An inner ``torch.compile`` is flattened by the outer encoder compile, discarding both settings and
+   inlining the region per layer. Hence a ``torch.library.custom_op``, whose runtime implementation runs
+   outside the outer graph -- the only place the inner compile takes effect.
+3. An operator carries only tensors and scalars, so ``BlockMask`` cannot cross it. Hence decomposed into
+   eight tensor fields, two sequence lengths and two block sizes, and rebuilt past the boundary with
+   ``mask_mod`` recreated as ``kv_idx < valid_lengths[b]``, exact for a non-block-aligned final valid key.
 
-``FLASH`` is never selected as the FlexAttention backend for this path: on SM120 the FP8 FLASH lowering
-fails an output-dtype assertion, so the only accepted option contract is the explicit
-``{"BACKEND": "TRITON"}`` selection.
+File order, which is also the runtime path
+------------------------------------------
+- :func:`fp8_flex_attention` -- public entry: validate, decompose the mask. No arithmetic.
+- :func:`_make_key_padding_mask_mod` -- the padding predicate.
+- :func:`_fp8_flex_attention_boundary` -- cast, layout, rebuild mask, one ``flex_attention`` call.
+- ``_fp8_flex_attention_compiled`` -- ``torch.compile`` of that boundary. Module-level, so every layer
+  shares one artifact; the layers are shape-homogeneous, so one shape serves all.
+- :func:`_fp8_flex_attention_op` -- the opaque operator, registered under the different name
+  :data:`FP8_FLEX_CUSTOM_OP_NAME`, hence ``torch.ops.nemo_sortformer.fp8_flex_attention`` at call sites.
+- :func:`_fp8_flex_attention_meta` -- its fake implementation, required because tracing cannot infer an
+  opaque operator's output shape.
+
+Support envelope
+----------------
+Blackwell compute capability 10.x, 11.x and 12.x (SM100/SM103, SM110, SM120), one implementation with no
+per-architecture branch. Raises on anything else: other devices or dtypes, relative-position score
+modification, causal or block-sparse masks, training or autograd use, a malformed mask or lengths. A failure
+on a supported device surfaces to the caller and never falls back to BF16.
 """
 
 from typing import Any, Dict, Optional
