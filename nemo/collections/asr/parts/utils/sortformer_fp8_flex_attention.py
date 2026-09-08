@@ -245,118 +245,13 @@ def fp8_flex_attention(
     )
 
 
-def fp8_flex_backend_info(device: Optional[torch.device] = None) -> Dict[str, Any]:
-    """Collect the backend facts worth logging for reproducibility.
+def _make_key_padding_mask_mod(valid_lengths: torch.Tensor):
+    """Rebuild the encoder's ``kv_idx < lengths[b]`` key-padding predicate from an explicit tensor."""
 
-    Never raises and never imports an optional dependency; unavailable facts are reported as ``None`` so this
-    can be logged before any FP8 attention call has run.
+    def key_padding_mask(b, h, q_idx, kv_idx):
+        return kv_idx < valid_lengths[b]
 
-    Args:
-        device: CUDA device to report on. Defaults to the current device when CUDA is available.
-
-    Returns:
-        info (Dict[str, Any]): Torch/CUDA/device facts plus the FP8 format, the kernel-selection contract and
-        the custom-operator boundary. ``attention_kernel`` names PyTorch's own FlexAttention/Triton lowering:
-        the operator is a compilation boundary, not a hand-written GPU kernel.
-    """
-    info: Dict[str, Any] = {
-        "backend": FP8_FLEX_BACKEND,
-        "fp8_dtype": str(FP8_DTYPE),
-        "flex_kernel_options": dict(FLEX_KERNEL_OPTIONS),
-        "supported_input_dtypes": [str(dtype) for dtype in SUPPORTED_INPUT_DTYPES],
-        "supported_capability_majors": list(SUPPORTED_CAPABILITY_MAJORS),
-        "inference_only": True,
-        "custom_op": FP8_FLEX_CUSTOM_OP_NAME,
-        "custom_op_role": "compilation boundary opaque to the outer encoder compiler",
-        "attention_kernel": "torch.nn.attention.flex_attention (Triton backend)",
-        "custom_attention_kernel": False,
-        "torch_version": torch.__version__,
-        "cuda_version": torch.version.cuda,
-        "cuda_available": torch.cuda.is_available(),
-        "device_name": None,
-        "compute_capability": None,
-    }
-    if torch.cuda.is_available():
-        try:
-            index = device.index if isinstance(device, torch.device) and device.index is not None else None
-            info["device_name"] = torch.cuda.get_device_name(index)
-            info["compute_capability"] = ".".join(str(part) for part in torch.cuda.get_device_capability(index))
-        except RuntimeError:  # pragma: no cover - depends on the runtime CUDA state
-            pass
-    return info
-
-
-@torch.library.custom_op(FP8_FLEX_CUSTOM_OP_NAME, mutates_args=())
-def _fp8_flex_attention_op(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    valid_lengths: torch.Tensor,
-    kv_num_blocks: torch.Tensor,
-    kv_indices: torch.Tensor,
-    full_kv_num_blocks: Optional[torch.Tensor],
-    full_kv_indices: Optional[torch.Tensor],
-    q_num_blocks: Optional[torch.Tensor],
-    q_indices: Optional[torch.Tensor],
-    full_q_num_blocks: Optional[torch.Tensor],
-    full_q_indices: Optional[torch.Tensor],
-    q_len: int,
-    kv_len: int,
-    q_block_size: int,
-    kv_block_size: int,
-) -> torch.Tensor:
-    """Runtime implementation: one call into the separately compiled FP8 FlexAttention boundary.
-
-    Registered as a custom operator so the outer encoder graph sees a single opaque node per layer instead
-    of inlining the cast/layout/attention region 31 times. Dispatch itself costs about 0.06 ms per layer at
-    the production shape, and the operator's output is bit-identical to calling the compiled root directly.
-    """
-    _validate_fp8_flex_device(query)
-    return _fp8_flex_attention_compiled(
-        query,
-        key,
-        value,
-        valid_lengths,
-        kv_num_blocks,
-        kv_indices,
-        full_kv_num_blocks,
-        full_kv_indices,
-        q_num_blocks,
-        q_indices,
-        full_q_num_blocks,
-        full_q_indices,
-        q_len,
-        kv_len,
-        q_block_size,
-        kv_block_size,
-    )
-
-
-@_fp8_flex_attention_op.register_fake
-def _fp8_flex_attention_meta(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    valid_lengths: torch.Tensor,
-    kv_num_blocks: torch.Tensor,
-    kv_indices: torch.Tensor,
-    full_kv_num_blocks: Optional[torch.Tensor],
-    full_kv_indices: Optional[torch.Tensor],
-    q_num_blocks: Optional[torch.Tensor],
-    q_indices: Optional[torch.Tensor],
-    full_q_num_blocks: Optional[torch.Tensor],
-    full_q_indices: Optional[torch.Tensor],
-    q_len: int,
-    kv_len: int,
-    q_block_size: int,
-    kv_block_size: int,
-) -> torch.Tensor:
-    """Shape/dtype/device/layout of the real output: a contiguous ``(B, H, T, D)`` tensor like ``query``.
-
-    ``query`` is BF16 by contract and the boundary converts the FP8 accumulation back to that dtype, so the
-    real output metadata is exactly ``query``'s. No autograd formula is registered: this is inference-only.
-    """
-    return query.new_empty(query.shape)
+    return key_padding_mask
 
 
 def _fp8_flex_attention_boundary(
@@ -431,13 +326,77 @@ def _fp8_flex_attention_boundary(
 _fp8_flex_attention_compiled = torch.compile(_fp8_flex_attention_boundary, fullgraph=True, dynamic=False)
 
 
-def _make_key_padding_mask_mod(valid_lengths: torch.Tensor):
-    """Rebuild the encoder's ``kv_idx < lengths[b]`` key-padding predicate from an explicit tensor."""
+@torch.library.custom_op(FP8_FLEX_CUSTOM_OP_NAME, mutates_args=())
+def _fp8_flex_attention_op(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    kv_num_blocks: torch.Tensor,
+    kv_indices: torch.Tensor,
+    full_kv_num_blocks: Optional[torch.Tensor],
+    full_kv_indices: Optional[torch.Tensor],
+    q_num_blocks: Optional[torch.Tensor],
+    q_indices: Optional[torch.Tensor],
+    full_q_num_blocks: Optional[torch.Tensor],
+    full_q_indices: Optional[torch.Tensor],
+    q_len: int,
+    kv_len: int,
+    q_block_size: int,
+    kv_block_size: int,
+) -> torch.Tensor:
+    """Runtime implementation: one call into the separately compiled FP8 FlexAttention boundary.
 
-    def key_padding_mask(b, h, q_idx, kv_idx):
-        return kv_idx < valid_lengths[b]
+    Registered as a custom operator so the outer encoder graph sees a single opaque node per layer instead
+    of inlining the cast/layout/attention region 31 times. Dispatch itself costs about 0.06 ms per layer at
+    the production shape, and the operator's output is bit-identical to calling the compiled root directly.
+    """
+    _validate_fp8_flex_device(query)
+    return _fp8_flex_attention_compiled(
+        query,
+        key,
+        value,
+        valid_lengths,
+        kv_num_blocks,
+        kv_indices,
+        full_kv_num_blocks,
+        full_kv_indices,
+        q_num_blocks,
+        q_indices,
+        full_q_num_blocks,
+        full_q_indices,
+        q_len,
+        kv_len,
+        q_block_size,
+        kv_block_size,
+    )
 
-    return key_padding_mask
+
+@_fp8_flex_attention_op.register_fake
+def _fp8_flex_attention_meta(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    kv_num_blocks: torch.Tensor,
+    kv_indices: torch.Tensor,
+    full_kv_num_blocks: Optional[torch.Tensor],
+    full_kv_indices: Optional[torch.Tensor],
+    q_num_blocks: Optional[torch.Tensor],
+    q_indices: Optional[torch.Tensor],
+    full_q_num_blocks: Optional[torch.Tensor],
+    full_q_indices: Optional[torch.Tensor],
+    q_len: int,
+    kv_len: int,
+    q_block_size: int,
+    kv_block_size: int,
+) -> torch.Tensor:
+    """Shape/dtype/device/layout of the real output: a contiguous ``(B, H, T, D)`` tensor like ``query``.
+
+    ``query`` is BF16 by contract and the boundary converts the FP8 accumulation back to that dtype, so the
+    real output metadata is exactly ``query``'s. No autograd formula is registered: this is inference-only.
+    """
+    return query.new_empty(query.shape)
 
 
 def _validate_fp8_flex_inputs(
@@ -605,3 +564,44 @@ def _validate_fp8_flex_device(query: torch.Tensor) -> None:
             f"{SUPPORTED_CAPABILITY_MAJORS}, got {major}.{minor} on "
             f"'{torch.cuda.get_device_name(query.device)}'. Use attention_backend='flex'."
         )
+
+
+def fp8_flex_backend_info(device: Optional[torch.device] = None) -> Dict[str, Any]:
+    """Collect the backend facts worth logging for reproducibility.
+
+    Never raises and never imports an optional dependency; unavailable facts are reported as ``None`` so this
+    can be logged before any FP8 attention call has run.
+
+    Args:
+        device: CUDA device to report on. Defaults to the current device when CUDA is available.
+
+    Returns:
+        info (Dict[str, Any]): Torch/CUDA/device facts plus the FP8 format, the kernel-selection contract and
+        the custom-operator boundary. ``attention_kernel`` names PyTorch's own FlexAttention/Triton lowering:
+        the operator is a compilation boundary, not a hand-written GPU kernel.
+    """
+    info: Dict[str, Any] = {
+        "backend": FP8_FLEX_BACKEND,
+        "fp8_dtype": str(FP8_DTYPE),
+        "flex_kernel_options": dict(FLEX_KERNEL_OPTIONS),
+        "supported_input_dtypes": [str(dtype) for dtype in SUPPORTED_INPUT_DTYPES],
+        "supported_capability_majors": list(SUPPORTED_CAPABILITY_MAJORS),
+        "inference_only": True,
+        "custom_op": FP8_FLEX_CUSTOM_OP_NAME,
+        "custom_op_role": "compilation boundary opaque to the outer encoder compiler",
+        "attention_kernel": "torch.nn.attention.flex_attention (Triton backend)",
+        "custom_attention_kernel": False,
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "cuda_available": torch.cuda.is_available(),
+        "device_name": None,
+        "compute_capability": None,
+    }
+    if torch.cuda.is_available():
+        try:
+            index = device.index if isinstance(device, torch.device) and device.index is not None else None
+            info["device_name"] = torch.cuda.get_device_name(index)
+            info["compute_capability"] = ".".join(str(part) for part in torch.cuda.get_device_capability(index))
+        except RuntimeError:  # pragma: no cover - depends on the runtime CUDA state
+            pass
+    return info
