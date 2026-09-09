@@ -31,13 +31,21 @@ from nemo.collections.asr.parts.utils.sortformer_utils import (
 )
 
 
-def _make_profiler(warmup_calls, forward_times, preprocessor_times, section_times=None, section_calls=None):
+def _make_profiler(
+    warmup_calls,
+    forward_times,
+    preprocessor_times,
+    section_times=None,
+    section_calls=None,
+    audio_durations=None,
+):
     """Build a profiler with pre-recorded per-call timings, bypassing an actual model forward pass."""
     profiler = InferenceProfiler(SimpleNamespace(device=torch.device("cpu")), warmup_calls=warmup_calls)
     profiler.forward_times = list(forward_times)
     profiler.preprocessor_times = list(preprocessor_times)
     profiler.section_times = dict(section_times or {})
     profiler.section_calls = dict(section_calls or {})
+    profiler.audio_durations = list(audio_durations or [])
     return profiler
 
 
@@ -551,9 +559,9 @@ def test_profiler_rejects_invalid_warmup_calls(warmup_calls, error_match):
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "warmup_calls, forward_times, preprocessor_times, audio_duration, expected_warning",
-    [(1, (2.0, 1.0), (0.5, 0.25), 10.0, "no measured_audio_duration was given")],
+    [(1, (2.0, 1.0), (0.5, 0.25), 10.0, "durations were recorded for 0 of 2 calls")],
 )
-def test_log_summary_warns_when_warmup_excluded_without_measured_duration(
+def test_log_summary_warns_when_warmup_excluded_without_per_call_durations(
     caplog, warmup_calls, forward_times, preprocessor_times, audio_duration, expected_warning
 ):
     profiler = _make_profiler(warmup_calls, forward_times, preprocessor_times)
@@ -563,3 +571,112 @@ def test_log_summary_warns_when_warmup_excluded_without_measured_duration(
 
     assert expected_warning in caplog.text
     assert "audio=10.00s, model_forward=1.000s" in caplog.text
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "warmup_calls, forward_times, preprocessor_times, audio_durations, audio_duration, expected_summary",
+    [
+        # The warmup call covers 40 s of the 100 s manifest, so the numerator must be the remaining 60 s
+        # rather than the manifest total, without needing measured_audio_duration.
+        (
+            1,
+            (10.0, 1.5, 0.5),
+            (2.0, 0.5, 0.5),
+            (40.0, 35.0, 25.0),
+            100.0,
+            "audio=60.00s, model_forward=2.000s (RTF=0.033333, 30.00x realtime)",
+        )
+    ],
+)
+def test_log_summary_uses_per_call_durations_when_no_override_is_given(
+    caplog,
+    warmup_calls,
+    forward_times,
+    preprocessor_times,
+    audio_durations,
+    audio_duration,
+    expected_summary,
+):
+    profiler = _make_profiler(
+        warmup_calls, forward_times, preprocessor_times, audio_durations=audio_durations
+    )
+
+    with caplog.at_level(logging.INFO):
+        profiler.log_summary(audio_duration)
+
+    assert f"Inference profile: {expected_summary}" in caplog.text
+    assert "durations were recorded for" not in caplog.text
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "warmup_calls, audio_durations, measured_audio_duration, expected_audio",
+    [(1, (40.0, 35.0, 25.0), 12.5, "audio=12.50s"), (1, (40.0, 35.0, 25.0), None, "audio=60.00s")],
+    ids=["override-wins", "no-override-uses-per-call"],
+)
+def test_log_summary_prefers_an_explicit_measured_duration_over_per_call_durations(
+    caplog, warmup_calls, audio_durations, measured_audio_duration, expected_audio
+):
+    profiler = _make_profiler(warmup_calls, (10.0, 1.5, 0.5), (2.0, 0.5, 0.5), audio_durations=audio_durations)
+
+    with caplog.at_level(logging.INFO):
+        profiler.log_summary(100.0, measured_audio_duration=measured_audio_duration)
+
+    assert expected_audio in caplog.text
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "sample_rate, lengths, expected_duration",
+    [(16000, (16000, 8000), 1.5), (8000, (8000, 8000), 2.0)],
+    ids=["16khz", "8khz"],
+)
+def test_record_audio_duration_sums_unpadded_lengths(sample_rate, lengths, expected_duration):
+    model = SimpleNamespace(
+        device=torch.device("cpu"),
+        preprocessor=SimpleNamespace(_cfg=OmegaConf.create({"sample_rate": sample_rate})),
+    )
+    profiler = InferenceProfiler(model)
+
+    # Padding the signal to a common width must not change the recorded duration; only the lengths count.
+    profiler._record_audio_duration(
+        audio_signal=torch.zeros(len(lengths), max(lengths)),
+        audio_signal_length=torch.tensor(lengths),
+    )
+
+    assert profiler.audio_durations == [pytest.approx(expected_duration)]
+
+
+@pytest.mark.unit
+def test_record_audio_duration_accepts_positional_arguments():
+    model = SimpleNamespace(
+        device=torch.device("cpu"),
+        preprocessor=SimpleNamespace(_cfg=OmegaConf.create({"sample_rate": 16000})),
+    )
+    profiler = InferenceProfiler(model)
+
+    profiler._record_audio_duration(torch.zeros(2, 16000), torch.tensor([16000, 16000]))
+
+    assert profiler.audio_durations == [pytest.approx(2.0)]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "model, kwargs",
+    [
+        (SimpleNamespace(device=torch.device("cpu")), {}),
+        (SimpleNamespace(device=torch.device("cpu")), {"audio_signal": torch.zeros(2, 16000)}),
+        (
+            SimpleNamespace(device=torch.device("cpu"), preprocessor=SimpleNamespace()),
+            {"audio_signal_length": torch.tensor([16000])},
+        ),
+    ],
+    ids=["no-arguments", "lengths-missing", "sample-rate-unavailable"],
+)
+def test_record_audio_duration_records_nothing_it_cannot_derive(model, kwargs):
+    profiler = InferenceProfiler(model)
+
+    profiler._record_audio_duration(**kwargs)
+
+    assert profiler.audio_durations == []

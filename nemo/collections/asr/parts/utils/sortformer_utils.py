@@ -117,6 +117,8 @@ class InferenceProfiler:
         # Per-call durations are kept so that warmup exclusion is exact rather than an average-based estimate.
         self.forward_times: List[float] = []
         self.preprocessor_times: List[float] = []
+        # Audio seconds per call, so the reported RTF divides by exactly the audio the measured calls saw.
+        self.audio_durations: List[float] = []
         self.section_times: Dict[str, float] = {}
         self.section_calls: Dict[str, int] = {}
         self._cuda_events = {}
@@ -200,6 +202,47 @@ class InferenceProfiler:
         original_method = getattr(instance, method_name)
         setattr(instance, method_name, self._section_wrapper(section, original_method))
 
+    def _resolve_summary_duration(self, audio_duration: float, measured_audio_duration: Optional[float]) -> float:
+        """
+        Pick the audio duration to divide the measured time by.
+
+        An explicit override wins. Otherwise the per-call durations are used when one was recorded for every
+        forward call, which keeps the numerator matched to the measured calls no matter which rows the warmup
+        calls consumed. Only if recording failed does this fall back to the whole manifest, which overstates
+        the covered audio whenever warmup calls were dropped.
+        """
+        if measured_audio_duration is not None:
+            return measured_audio_duration
+        if len(self.audio_durations) == self.forward_calls and self.forward_calls > 0:
+            return sum(self.audio_durations[self.warmup_calls :])
+        if self.warmup_calls > 0:
+            logging.warning(
+                f"warmup_calls={self.warmup_calls} excludes leading model-forward calls, but per-call audio "
+                f"durations were recorded for {len(self.audio_durations)} of {self.forward_calls} calls, so the "
+                "reported RTF covers the full manifest duration while the measured time does not."
+            )
+        return audio_duration
+
+    def _record_audio_duration(self, *args, **kwargs):
+        """
+        Record the unpadded audio duration of one batch, keyed to the same call index as forward_times.
+
+        process_signal runs once per model-forward call and receives the true per-sample lengths, before
+        any pad-to-max, so summing them gives the audio that call actually covered. Recording it per call
+        is what lets the summary divide by only the measured calls' audio when warmup calls are dropped.
+        """
+        lengths = kwargs.get("audio_signal_length")
+        if lengths is None and len(args) > 1:
+            lengths = args[1]
+        if lengths is None:
+            return
+        try:
+            sample_rate = self.model.preprocessor._cfg.sample_rate
+            self.audio_durations.append(float(lengths.sum()) / sample_rate)
+        except (AttributeError, TypeError, ZeroDivisionError):
+            # Leave the list short rather than guess; log_summary falls back to the manifest duration.
+            pass
+
     def install(self):
         """Install profiling wrappers by monkey-patching model methods; repeated calls are no-ops."""
         if self._installed:
@@ -238,6 +281,7 @@ class InferenceProfiler:
             finally:
                 self._synchronize()
                 self.preprocessor_times.append(time.perf_counter() - start)
+                self._record_audio_duration(*args, **kwargs)
 
         def timed_forward(*args, **kwargs):
             self._synchronize()
@@ -257,9 +301,11 @@ class InferenceProfiler:
         Log accumulated inference timing measurements, excluding the configured warmup calls.
 
         Args:
-            audio_duration (float): Duration of processed audio in seconds.
-            measured_audio_duration (Optional[float]): Duration of the audio covered by the measured (non-warmup)
-                model-forward calls, in seconds. If ``None``, ``audio_duration`` is used.
+            audio_duration (float): Duration of the whole manifest's audio in seconds, used only as a fallback.
+            measured_audio_duration (Optional[float]): Explicit override for the audio covered by the measured
+                (non-warmup) calls, in seconds. Normally left ``None``: the profiler records the true per-call
+                duration itself, which stays correct when presorting or the batch size changes which rows the
+                warmup calls consume.
         """
         self._synchronize()
         self._flush_cuda_events()
@@ -273,13 +319,7 @@ class InferenceProfiler:
         forward_time = sum(self.forward_times[self.warmup_calls :])
         preprocessor_time = sum(self.preprocessor_times[self.warmup_calls :])
         measured_calls = max(0, self.forward_calls - self.warmup_calls)
-        summary_duration = audio_duration if measured_audio_duration is None else measured_audio_duration
-        if self.warmup_calls > 0 and measured_audio_duration is None:
-            logging.warning(
-                f"warmup_calls={self.warmup_calls} excludes leading model-forward calls, but no "
-                "measured_audio_duration was given, so the reported RTF covers the full manifest duration "
-                "while the measured time does not."
-            )
+        summary_duration = self._resolve_summary_duration(audio_duration, measured_audio_duration)
         if summary_duration <= 0 or forward_time <= 0:
             logging.warning(
                 f"Cannot summarize inference profile with audio_duration={summary_duration} "
