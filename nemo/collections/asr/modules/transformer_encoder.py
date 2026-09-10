@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import math
+import os
 import random
 from dataclasses import dataclass
 from functools import lru_cache
@@ -43,6 +45,79 @@ from nemo.utils import logging
 from nemo.utils.decorators import experimental
 
 flex_attention_compiled = torch.compile(flex_attention, dynamic=True)
+
+# ---------------------------------------------------------------------------
+# Optional encoder profiling. Entirely inert unless NEMO_ENC_PROF names an
+# output path prefix; each process writes "<prefix>.<pid>.json" at exit, which
+# keeps the vLLM parent and EngineCore child from clobbering each other.
+# ---------------------------------------------------------------------------
+_ENC_PROF_PATH = os.environ.get("NEMO_ENC_PROF")
+_ENC_PROF_CAP = 1 << 16
+# Optional low-precision encoder. Applied lazily on the first forward because the
+# checkpoint weights are not present yet at __init__ time. Requires enc_nvfp4 on
+# PYTHONPATH (projects/inference_quantization/scripts).
+_ENC_QUANT = os.environ.get("NEMO_ENC_QUANT")
+# Per-call records are kept rather than a running total because the first call
+# pays flex_attention's torch.compile cost, and vLLM's startup memory profiling
+# also invokes the encoder on dummy audio. Wall-clock stamps let those be
+# separated from the measured pass after the fact.
+_enc_prof_pending: list = []  # (wall_start, start_ev, end_ev, batch, seq_len, slot)
+_enc_prof_done: list = []  # (wall_start, gpu_ms, batch, seq_len, slot)
+_enc_prof_valid_buf: Optional[torch.Tensor] = None
+_enc_prof_slot = 0
+
+
+def _enc_prof_drain(blocking: bool = False) -> None:
+    """Move completed CUDA event pairs from pending to done.
+
+    ``Event.elapsed_time`` is only valid once both events have completed, so a
+    non-blocking drain skips pairs still in flight. Reading them eagerly would
+    stall the host on GPU work and distort the timings we are measuring.
+    """
+    if blocking and _enc_prof_pending:
+        torch.cuda.synchronize()
+    still_pending = []
+    for rec in _enc_prof_pending:
+        wall_start, start_ev, end_ev, batch, seq_len, slot = rec
+        if not blocking and not end_ev.query():
+            still_pending.append(rec)
+            continue
+        _enc_prof_done.append((wall_start, start_ev.elapsed_time(end_ev), batch, seq_len, slot))
+    _enc_prof_pending[:] = still_pending
+
+
+def _enc_prof_write() -> None:
+    """Dump per-call encoder timings.
+
+    Registered via ``atexit`` and also called periodically, because the encoder
+    lives in vLLM's EngineCore child process, which may be torn down hard enough
+    that exit handlers never run.
+    """
+    _enc_prof_drain(blocking=True)
+    if not _enc_prof_done:
+        return
+    # One device-to-host copy for all valid-frame counts. Reading them per call
+    # would sync the stream against unrelated LLM work queued behind us.
+    valid = _enc_prof_valid_buf.tolist() if _enc_prof_valid_buf is not None else []
+    rows = [
+        {
+            "t": round(wall_start, 6),
+            "gpu_ms": gpu_ms,
+            "batch": batch,
+            "seq_len": seq_len,
+            "valid_frames": valid[slot] if 0 <= slot < len(valid) else None,
+        }
+        for wall_start, gpu_ms, batch, seq_len, slot in _enc_prof_done
+    ]
+    rows.sort(key=lambda r: r["t"])
+    with open(f"{_ENC_PROF_PATH}.{os.getpid()}.json", "w") as fh:
+        json.dump({"pid": os.getpid(), "calls": len(rows), "records": rows}, fh)
+
+
+if _ENC_PROF_PATH:
+    import atexit
+
+    atexit.register(_enc_prof_write)
 
 
 @dataclass
@@ -950,7 +1025,70 @@ class TransformerEncoder(nn.Module):
             self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
         return self.forward_internal(audio_signal, length, bypass_pre_encode=bypass_pre_encode)
 
+    def _maybe_quantize(self) -> None:
+        """Swap encoder Linears for a low-precision implementation, once.
+
+        Deferred to the first forward so the loaded weights are quantized rather
+        than the randomly initialized ones. Skipped while a CUDA graph is being
+        captured, since replacing modules and allocating there would corrupt the
+        capture; a later eager forward picks it up instead.
+        """
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+        self._enc_quant_done = True
+        mode = _ENC_QUANT.lower()
+        if mode not in ("nvfp4", "calib"):
+            raise ValueError(f"NEMO_ENC_QUANT='{_ENC_QUANT}' is not supported; expected 'nvfp4' or 'calib'.")
+
+        kwargs = {}
+        patterns = os.environ.get("NEMO_ENC_QUANT_PATTERNS")
+        if patterns:
+            kwargs["patterns"] = tuple(p.strip() for p in patterns.split(",") if p.strip())
+
+        if mode == "calib":
+            # Collect activation amax in BF16 and dump at exit, so a later run can
+            # use static input scales. Writes per-pid like the profiler does.
+            import atexit
+
+            from enc_nvfp4 import ActivationAmaxCollector
+
+            out = os.environ.get("NEMO_ENC_QUANT_CALIB_OUT")
+            if not out:
+                raise ValueError("NEMO_ENC_QUANT=calib requires NEMO_ENC_QUANT_CALIB_OUT")
+            path = f"{out}.{os.getpid()}.json"
+            collector = ActivationAmaxCollector(self, save_path=path, **kwargs)
+            atexit.register(collector.save, path)
+            return
+
+        from enc_nvfp4 import load_scales, quantize_encoder
+
+        scales_path = os.environ.get("NEMO_ENC_QUANT_SCALES")
+        if scales_path:
+            kwargs["scales"] = load_scales(scales_path)
+            kwargs["scale_margin"] = float(os.environ.get("NEMO_ENC_QUANT_SCALE_MARGIN", "1.0"))
+        exclude_re = os.environ.get("NEMO_ENC_QUANT_EXCLUDE_RE")
+        if exclude_re:
+            kwargs["exclude_re"] = exclude_re
+        fp8_re = os.environ.get("NEMO_ENC_QUANT_FP8_RE")
+        if fp8_re:
+            kwargs["fp8_re"] = fp8_re
+        fp8_amax_above = os.environ.get("NEMO_ENC_QUANT_FP8_AMAX_ABOVE")
+        if fp8_amax_above:
+            kwargs["fp8_amax_above"] = float(fp8_amax_above)
+        quantize_encoder(self, **kwargs)
+
     def forward_internal(self, audio_signal, length, bypass_pre_encode=False):
+        if _ENC_QUANT and not getattr(self, "_enc_quant_done", False):
+            self._maybe_quantize()
+
+        prof_start = None
+        if _ENC_PROF_PATH and audio_signal.is_cuda:
+            import time as _time
+
+            prof_wall = _time.time()
+            prof_start = torch.cuda.Event(enable_timing=True)
+            prof_start.record()
+
         if length is None:
             length = audio_signal.new_full(
                 (audio_signal.size(0),),
@@ -1004,6 +1142,25 @@ class TransformerEncoder(nn.Module):
             x = self.out_proj(x)
         x = x.transpose(1, 2)  # (B, T, D) -> (B, D, T)
         length = length.to(dtype=torch.int64)
+
+        if prof_start is not None:
+            global _enc_prof_valid_buf, _enc_prof_slot
+            end_ev = torch.cuda.Event(enable_timing=True)
+            end_ev.record()
+            slot = -1
+            if _enc_prof_slot < _ENC_PROF_CAP:
+                if _enc_prof_valid_buf is None:
+                    _enc_prof_valid_buf = torch.zeros(_ENC_PROF_CAP, dtype=torch.int64, device=length.device)
+                slot = _enc_prof_slot
+                _enc_prof_valid_buf[slot] = length.sum()
+                _enc_prof_slot += 1
+            _enc_prof_pending.append((prof_wall, prof_start, end_ev, B, T, slot))
+            _enc_prof_drain()
+            # Checkpoint every 500 calls. The blocking drain inside costs one
+            # stream sync, which is negligible amortized over that many calls.
+            if _enc_prof_slot % 500 == 0:
+                _enc_prof_write()
+
         return x, length
 
     def _build_mask_mod(self, length):
