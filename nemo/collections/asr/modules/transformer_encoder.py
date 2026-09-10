@@ -1037,8 +1037,36 @@ class TransformerEncoder(nn.Module):
             return
         self._enc_quant_done = True
         mode = _ENC_QUANT.lower()
-        if mode not in ("nvfp4", "calib"):
-            raise ValueError(f"NEMO_ENC_QUANT='{_ENC_QUANT}' is not supported; expected 'nvfp4' or 'calib'.")
+        if mode not in ("nvfp4", "calib", "probe"):
+            raise ValueError(f"NEMO_ENC_QUANT='{_ENC_QUANT}' is not supported; expected 'nvfp4', 'calib' or 'probe'.")
+
+        if mode == "probe":
+            # Report which instances reach this hook, without touching weights.
+            #
+            # Needed because HR8's checkpoint sets diarization_model_cfg.encoder
+            # to nemo.collections.asr.modules.TransformerEncoder, and the package
+            # __init__ re-exports that name from THIS file -- so the Sortformer
+            # diarizer's encoder is the same class and self-quantizes here. The
+            # DIARIZER_MARKER guard in enc_nvfp4 cannot catch it: that guard scans
+            # self.named_modules() for a diarization_model subtree, which is only
+            # visible from a parent, not from inside the diarizer's own encoder.
+            # Quantizing it would be silent and severe, since its output is fused
+            # additively into the ASR features and corrupts every frame.
+            import torch.nn as _nn
+
+            n_lin = sum(
+                1
+                for n, m in self.named_modules()
+                if isinstance(m, _nn.Linear)
+                and any(p in n for p in ("attn.w_qkv", "attn.out_proj", "ffn.net.0", "ffn.net.3"))
+            )
+            print(
+                f"[enc-probe] pid={os.getpid()} id={id(self):#x} layers={len(getattr(self, 'layers', []))} "
+                f"d_model={getattr(self, 'd_model', None)} pattern_linears={n_lin} "
+                f"tagged_asr={getattr(self, '_enc_quant_is_asr', None)}",
+                flush=True,
+            )
+            return
 
         kwargs = {}
         patterns = os.environ.get("NEMO_ENC_QUANT_PATTERNS")
