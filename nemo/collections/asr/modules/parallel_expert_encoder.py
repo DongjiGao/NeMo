@@ -582,6 +582,28 @@ class ParallelExpertEncoder(nn.Module):
             persistent=False,
         )
         self._apply_freezing()
+        self._tag_quantization_scope()
+
+    def _tag_quantization_scope(self) -> None:
+        """Mark which branch the encoder quantization hook may touch.
+
+        ``diarization_model_cfg.encoder`` resolves through
+        ``nemo.collections.asr.modules`` to the very same ``TransformerEncoder``
+        that the ASR branch uses, so the env-gated hook inside that class fires on
+        both -- 124 diarizer matrices alongside the 128 we actually want. The hook
+        cannot tell them apart on its own: it runs with ``self`` bound to one of
+        the two leaves, and ``named_modules()`` only walks downward, so from inside
+        the diarizer its own ``diarization_model`` parent is invisible.
+
+        This is the only scope that knows which is which, so it tags from here. The
+        diarizer must stay BF16 because its output is fused additively into the ASR
+        features, making any damage a per-frame degradation rather than an isolated
+        layer error -- silent, and easy to misattribute to the ASR encoder.
+        """
+        self.asr_encoder._enc_quant_is_asr = True
+        for module in self.diarization_model.modules():
+            if isinstance(module, TransformerEncoder):
+                module._enc_quant_skip = True
 
     def _apply_freezing(self) -> None:
         if self.freeze_diar:

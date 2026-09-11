@@ -1040,6 +1040,13 @@ class TransformerEncoder(nn.Module):
         if mode not in ("nvfp4", "calib", "probe"):
             raise ValueError(f"NEMO_ENC_QUANT='{_ENC_QUANT}' is not supported; expected 'nvfp4', 'calib' or 'probe'.")
 
+        skip = bool(getattr(self, "_enc_quant_skip", False))
+        if skip and mode != "probe":
+            # Tagged by ParallelExpertEncoder as the Sortformer branch, which is the
+            # same class as the ASR encoder and would otherwise self-quantize here.
+            print(f"[enc-quant] skipping {type(self).__name__} id={id(self):#x}: tagged as non-ASR", flush=True)
+            return
+
         if mode == "probe":
             # Report which instances reach this hook, without touching weights.
             #
@@ -1063,7 +1070,8 @@ class TransformerEncoder(nn.Module):
             print(
                 f"[enc-probe] pid={os.getpid()} id={id(self):#x} layers={len(getattr(self, 'layers', []))} "
                 f"d_model={getattr(self, 'd_model', None)} pattern_linears={n_lin} "
-                f"tagged_asr={getattr(self, '_enc_quant_is_asr', None)}",
+                f"tagged_asr={getattr(self, '_enc_quant_is_asr', False)} skip={skip} "
+                f"-> would_quantize={not skip}",
                 flush=True,
             )
             return
@@ -1103,7 +1111,23 @@ class TransformerEncoder(nn.Module):
         fp8_amax_above = os.environ.get("NEMO_ENC_QUANT_FP8_AMAX_ABOVE")
         if fp8_amax_above:
             kwargs["fp8_amax_above"] = float(fp8_amax_above)
-        quantize_encoder(self, **kwargs)
+        replaced = quantize_encoder(self, **kwargs)
+        print(
+            f"[enc-quant] {type(self).__name__} id={id(self):#x} asr={getattr(self, '_enc_quant_is_asr', False)} "
+            f"replaced={replaced} matrices",
+            flush=True,
+        )
+        # Belt and braces on top of the tagging. Scope errors here are silent --
+        # a wrong count still runs and still produces a WER, just not the one the
+        # recipe describes -- so pin the count when it is known (128 for the HR8
+        # ASR encoder) and fail loudly rather than reporting a contaminated result.
+        expect = os.environ.get("NEMO_ENC_QUANT_EXPECT")
+        if expect and int(expect) != replaced:
+            raise RuntimeError(
+                f"NEMO_ENC_QUANT_EXPECT={expect} but {replaced} matrices were replaced on "
+                f"{type(self).__name__} id={id(self):#x}. Quantization scope is wrong; refusing "
+                "to produce a result that would be attributed to the wrong module."
+            )
 
     def forward_internal(self, audio_signal, length, bypass_pre_encode=False):
         if _ENC_QUANT and not getattr(self, "_enc_quant_done", False):
