@@ -127,6 +127,11 @@ def _apply_encoder_quantization(perception: nn.Module, quant_cfg: dict | None) -
     """
     if not quant_cfg:
         return
+    if quant_cfg.get("weights_prequantized"):
+        # The checkpoint already holds FP8 weights, so the first-forward swap must
+        # not run; _prepare_prequantized_encoder builds the modules before the load
+        # instead.
+        return
 
     targets = [m for m in perception.modules() if getattr(m, "_enc_quant_is_asr", False)]
     if not targets:
@@ -146,6 +151,79 @@ def _apply_encoder_quantization(perception: nn.Module, quant_cfg: dict | None) -
         recipe.get("scale_margin", 1.0),
         len(targets),
     )
+
+
+def _prepare_prequantized_encoder(perception: nn.Module, quant_cfg: dict | None) -> int:
+    """Replace ASR-encoder Linears with FP8 modules that ``load_state_dict`` can fill.
+
+    For a checkpoint whose encoder weights are already FP8, the modules must exist
+    in their final form before the load: the state dict carries ``weight`` as
+    float8_e4m3fn plus a ``weight_scale`` that an ``nn.Linear`` has nowhere to put,
+    and the loader treats any unexpected or missing key as a hard error.
+
+    Call this *after* the perception module is cast to bfloat16 and *before* the
+    load. The cast is dtype-blind and would turn the fp8 buffers back into
+    bfloat16 if the modules already existed.
+
+    Returns the number of Linears replaced.
+    """
+    if not quant_cfg or not quant_cfg.get("weights_prequantized"):
+        return 0
+
+    import torch
+
+    from enc_nvfp4 import FP8Linear
+
+    targets = [m for m in perception.modules() if getattr(m, "_enc_quant_is_asr", False)]
+    if not targets:
+        raise ValueError(
+            "checkpoint carries prequantized encoder weights but no encoder is tagged as the "
+            "ASR branch, so there is no safe module to attach them to."
+        )
+
+    patterns = tuple(quant_cfg.get("patterns") or ())
+    if not patterns:
+        raise ValueError("encoder_quantization.patterns is required to locate the FP8 Linears")
+    amax = quant_cfg.get("activation_amax") or {}
+    margin = float(quant_cfg.get("scale_margin", 1.0))
+
+    replaced = 0
+    for encoder in targets:
+        for name, module in list(encoder.named_modules()):
+            if not isinstance(module, nn.Linear) or not any(name.endswith(p) for p in patterns):
+                continue
+            parent = encoder.get_submodule(name.rsplit(".", 1)[0]) if "." in name else encoder
+            scale = None
+            if name in amax:
+                # Divisor convention, matching the weights: xq = x / scale.
+                scale = torch.tensor(max(float(amax[name]) * margin / 448.0, 1e-12))
+            setattr(
+                parent,
+                name.rsplit(".", 1)[-1],
+                FP8Linear.from_prequantized(
+                    module.in_features,
+                    module.out_features,
+                    bias=module.bias is not None,
+                    static_input_scale=scale,
+                    bias_dtype=module.bias.dtype if module.bias is not None else torch.bfloat16,
+                    device=module.weight.device,
+                ),
+            )
+            replaced += 1
+
+    expect = quant_cfg.get("expect_replaced")
+    if expect and int(expect) != replaced:
+        raise RuntimeError(
+            f"encoder_quantization.expect_replaced={expect} but {replaced} Linears were prepared. "
+            "Refusing to load: a wrong scope here either fails on key mismatch or, worse, "
+            "quantizes the diarizer whose output is fused into the ASR features."
+        )
+    logging.info(
+        "Prequantized encoder: %d FP8 Linears prepared for load, %d static act scales",
+        replaced,
+        sum(1 for n in amax),
+    )
+    return replaced
 
 
 def _maybe_mount_pe_encoder(

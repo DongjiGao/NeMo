@@ -59,6 +59,7 @@ from nemo.collections.speechlm2.vllm.salm.audio import (
     NeMoSpeechLMProcessingInfo,
     _apply_encoder_quantization,
     _load_nemo_perception,
+    _prepare_prequantized_encoder,
     _maybe_mount_independent_speaker_encoder,
     _maybe_mount_pe_encoder,
 )
@@ -251,6 +252,12 @@ class NeMoSpeechLMForConditionalGeneration(
 
     def _load_perception_weights(self, perception_weights: dict[str, torch.Tensor]) -> set[str]:
         self.perception = self.perception.to(_PERCEPTION_DTYPE)
+        # Between the cast and the load on purpose. The cast is dtype-blind and
+        # would turn fp8 buffers back into bfloat16, while the load needs the fp8
+        # parameters to already exist or it reports weight_scale as unexpected.
+        _prepare_prequantized_encoder(
+            self.perception, getattr(self.config, "encoder_quantization", None)
+        )
         incompatible = self.perception.load_state_dict(perception_weights, strict=False)
 
         from nemo.collections.speechlm2.modules.perception import IndependentDualEncoder
