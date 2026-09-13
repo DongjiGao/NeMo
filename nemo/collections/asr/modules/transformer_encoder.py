@@ -1032,11 +1032,24 @@ class TransformerEncoder(nn.Module):
         than the randomly initialized ones. Skipped while a CUDA graph is being
         captured, since replacing modules and allocating there would corrupt the
         capture; a later eager forward picks it up instead.
+
+        Two ways to reach here. ``NEMO_ENC_QUANT`` and friends drive experiments,
+        where the recipe is chosen per run. ``self._enc_quant_cfg`` carries a
+        recipe that travelled with the checkpoint, set by the serving stack from
+        the ``encoder_quantization`` block in ``config.json``; that is how a
+        quantized checkpoint reproduces its own numbers without the caller having
+        to know any environment variables.
+
+        The environment wins on every key it sets, so an experiment can still
+        override a checkpoint that ships a recipe.
         """
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             return
         self._enc_quant_done = True
-        mode = _ENC_QUANT.lower()
+        ckpt_cfg = getattr(self, "_enc_quant_cfg", None) or {}
+        # A checkpoint-resident recipe only ever means "quantize"; calib and probe
+        # are diagnostics and stay environment-only.
+        mode = (_ENC_QUANT or "nvfp4").lower()
         if mode not in ("nvfp4", "calib", "probe"):
             raise ValueError(f"NEMO_ENC_QUANT='{_ENC_QUANT}' is not supported; expected 'nvfp4', 'calib' or 'probe'.")
 
@@ -1077,6 +1090,8 @@ class TransformerEncoder(nn.Module):
             return
 
         kwargs = {}
+        if ckpt_cfg.get("patterns"):
+            kwargs["patterns"] = tuple(ckpt_cfg["patterns"])
         patterns = os.environ.get("NEMO_ENC_QUANT_PATTERNS")
         if patterns:
             kwargs["patterns"] = tuple(p.strip() for p in patterns.split(",") if p.strip())
@@ -1098,6 +1113,12 @@ class TransformerEncoder(nn.Module):
 
         from enc_nvfp4 import load_scales, quantize_encoder
 
+        # Amax lives inline in the checkpoint config rather than as a sidecar file,
+        # because this module has no way to learn the checkpoint directory: it is
+        # built from a config dict, not a path. 128 floats is a few KB of JSON.
+        if ckpt_cfg.get("activation_amax"):
+            kwargs["scales"] = dict(ckpt_cfg["activation_amax"])
+            kwargs["scale_margin"] = float(ckpt_cfg.get("scale_margin", 1.0))
         scales_path = os.environ.get("NEMO_ENC_QUANT_SCALES")
         if scales_path:
             kwargs["scales"] = load_scales(scales_path)
@@ -1105,6 +1126,10 @@ class TransformerEncoder(nn.Module):
         exclude_re = os.environ.get("NEMO_ENC_QUANT_EXCLUDE_RE")
         if exclude_re:
             kwargs["exclude_re"] = exclude_re
+        elif ckpt_cfg.get("exclude_re"):
+            kwargs["exclude_re"] = ckpt_cfg["exclude_re"]
+        if ckpt_cfg.get("fp8_re"):
+            kwargs["fp8_re"] = ckpt_cfg["fp8_re"]
         fp8_re = os.environ.get("NEMO_ENC_QUANT_FP8_RE")
         if fp8_re:
             kwargs["fp8_re"] = fp8_re
@@ -1121,7 +1146,7 @@ class TransformerEncoder(nn.Module):
         # a wrong count still runs and still produces a WER, just not the one the
         # recipe describes -- so pin the count when it is known (128 for the HR8
         # ASR encoder) and fail loudly rather than reporting a contaminated result.
-        expect = os.environ.get("NEMO_ENC_QUANT_EXPECT")
+        expect = os.environ.get("NEMO_ENC_QUANT_EXPECT") or ckpt_cfg.get("expect_replaced")
         if expect and int(expect) != replaced:
             raise RuntimeError(
                 f"NEMO_ENC_QUANT_EXPECT={expect} but {replaced} matrices were replaced on "
@@ -1130,7 +1155,9 @@ class TransformerEncoder(nn.Module):
             )
 
     def forward_internal(self, audio_signal, length, bypass_pre_encode=False):
-        if _ENC_QUANT and not getattr(self, "_enc_quant_done", False):
+        if (_ENC_QUANT or getattr(self, "_enc_quant_cfg", None)) and not getattr(
+            self, "_enc_quant_done", False
+        ):
             self._maybe_quantize()
 
         prof_start = None

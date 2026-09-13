@@ -57,6 +57,7 @@ from nemo.collections.speechlm2.vllm.salm.audio import (
     NeMoSpeechLMDummyInputsBuilder,
     NeMoSpeechLMMultiModalProcessor,
     NeMoSpeechLMProcessingInfo,
+    _apply_encoder_quantization,
     _load_nemo_perception,
     _maybe_mount_independent_speaker_encoder,
     _maybe_mount_pe_encoder,
@@ -145,6 +146,11 @@ class NeMoSpeechLMForConditionalGeneration(
                     getattr(config, "pe_encoder_overrides", None),
                 )
                 self._uses_pe_encoder = _is_parallel_expert_encoder(getattr(self.perception, "encoder", None))
+
+            # After mounting, so the tag that marks the ASR branch already exists.
+            # The swap itself is deferred to the first forward, which is what lets
+            # this run before weights are loaded.
+            _apply_encoder_quantization(self.perception, getattr(config, "encoder_quantization", None))
 
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
 

@@ -27,6 +27,8 @@ Public surface used by the rest of the package:
   rendering and the processor expands inline.
 * ``_load_nemo_perception``, ``_ensure_special_tokens``, ``_pad_to_vocab_size``
   -- small helpers reused at model init and weight load time.
+* ``_apply_encoder_quantization`` -- forwards a checkpoint-resident encoder
+  quantization recipe to the ASR encoder for its first-forward Linear swap.
 * ``NeMoSpeechLMAudioInputs`` -- vLLM ``TensorSchema`` describing the parsed
   audio tensors that flow into ``embed_multimodal``.
 * ``NeMoSpeechLMProcessingInfo`` / ``NeMoSpeechLMMultiModalProcessor`` /
@@ -108,6 +110,42 @@ def _load_nemo_perception(perception_cfg: dict) -> nn.Module:
     perception = AudioPerceptionModule(cfg)
     perception.eval()
     return perception
+
+
+def _apply_encoder_quantization(perception: nn.Module, quant_cfg: dict | None) -> None:
+    """Hand a checkpoint-resident encoder quantization recipe to the ASR encoder.
+
+    The encoder swaps its own Linears on the first forward, but it cannot read the
+    recipe itself: it is built from a config dict and never learns the checkpoint
+    directory. So the ``encoder_quantization`` block from ``config.json`` is
+    attached here as an attribute for that swap to pick up.
+
+    Only the instance ``ParallelExpertEncoder`` tagged as the ASR branch is
+    targeted. That tag is load-bearing, not defensive: the Sortformer diarizer is
+    an instance of the same class, and its output is fused additively into the ASR
+    features, so quantizing it corrupts every frame.
+    """
+    if not quant_cfg:
+        return
+
+    targets = [m for m in perception.modules() if getattr(m, "_enc_quant_is_asr", False)]
+    if not targets:
+        raise ValueError(
+            "config.json requests encoder_quantization but no encoder is tagged as the ASR "
+            "branch. Refusing to guess which module to quantize, since the diarizer shares "
+            "the encoder class and quantizing it would corrupt the ASR features."
+        )
+
+    recipe = dict(quant_cfg)
+    for module in targets:
+        module._enc_quant_cfg = recipe
+    logging.info(
+        "Encoder quantization from checkpoint: format=%s activations=%s margin=%s -> %d encoder(s)",
+        recipe.get("format", "?"),
+        recipe.get("activation_scale", "?"),
+        recipe.get("scale_margin", 1.0),
+        len(targets),
+    )
 
 
 def _maybe_mount_pe_encoder(
