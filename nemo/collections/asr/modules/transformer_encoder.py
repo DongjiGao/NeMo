@@ -57,6 +57,13 @@ _ENC_PROF_CAP = 1 << 16
 # checkpoint weights are not present yet at __init__ time. Requires enc_nvfp4 on
 # PYTHONPATH (projects/inference_quantization/scripts).
 _ENC_QUANT = os.environ.get("NEMO_ENC_QUANT")
+# Which branch(es) the swap may touch. ParallelExpertEncoder holds an ASR encoder
+# and a Sortformer diarizer of this same class, and tags the latter so it does not
+# self-quantize. "asr" (default) keeps that intent; "diar" and "both" reopen it on
+# purpose, to measure what the diarizer branch is worth. Experiment-only: a
+# checkpoint-resident recipe is only ever attached to the ASR branch.
+_ENC_QUANT_BRANCH = os.environ.get("NEMO_ENC_QUANT_BRANCH", "asr").lower()
+_ENC_QUANT_ELIGIBLE = {"asr": {"asr"}, "diar": {"diar"}, "both": {"asr", "diar"}}
 # Per-call records are kept rather than a running total because the first call
 # pays flex_attention's torch.compile cost, and vLLM's startup memory profiling
 # also invokes the encoder on dummy audio. Wall-clock stamps let those be
@@ -1053,11 +1060,20 @@ class TransformerEncoder(nn.Module):
         if mode not in ("nvfp4", "calib", "probe"):
             raise ValueError(f"NEMO_ENC_QUANT='{_ENC_QUANT}' is not supported; expected 'nvfp4', 'calib' or 'probe'.")
 
-        skip = bool(getattr(self, "_enc_quant_skip", False))
+        is_diar = bool(getattr(self, "_enc_quant_skip", False))
+        branch = "diar" if is_diar else "asr"
+        if _ENC_QUANT_BRANCH not in _ENC_QUANT_ELIGIBLE:
+            raise ValueError(
+                f"NEMO_ENC_QUANT_BRANCH='{_ENC_QUANT_BRANCH}' is not supported; "
+                f"expected one of {sorted(_ENC_QUANT_ELIGIBLE)}."
+            )
+        skip = branch not in _ENC_QUANT_ELIGIBLE[_ENC_QUANT_BRANCH]
         if skip and mode != "probe":
-            # Tagged by ParallelExpertEncoder as the Sortformer branch, which is the
-            # same class as the ASR encoder and would otherwise self-quantize here.
-            print(f"[enc-quant] skipping {type(self).__name__} id={id(self):#x}: tagged as non-ASR", flush=True)
+            print(
+                f"[enc-quant] skipping {type(self).__name__} id={id(self):#x}: {branch} branch, "
+                f"NEMO_ENC_QUANT_BRANCH={_ENC_QUANT_BRANCH}",
+                flush=True,
+            )
             return
 
         if mode == "probe":
@@ -1138,19 +1154,25 @@ class TransformerEncoder(nn.Module):
             kwargs["fp8_amax_above"] = float(fp8_amax_above)
         replaced = quantize_encoder(self, **kwargs)
         print(
-            f"[enc-quant] {type(self).__name__} id={id(self):#x} asr={getattr(self, '_enc_quant_is_asr', False)} "
+            f"[enc-quant] {type(self).__name__} id={id(self):#x} branch={branch} "
             f"replaced={replaced} matrices",
             flush=True,
         )
         # Belt and braces on top of the tagging. Scope errors here are silent --
         # a wrong count still runs and still produces a WER, just not the one the
-        # recipe describes -- so pin the count when it is known (128 for the HR8
-        # ASR encoder) and fail loudly rather than reporting a contaminated result.
-        expect = os.environ.get("NEMO_ENC_QUANT_EXPECT") or ckpt_cfg.get("expect_replaced")
+        # recipe describes -- so pin the count when it is known and fail loudly
+        # rather than reporting a contaminated result. The two branches differ
+        # (128 ASR vs 124 diarizer), which is what makes a swap detectable.
+        if is_diar:
+            expect = os.environ.get("NEMO_ENC_QUANT_EXPECT_DIAR")
+            expect_var = "NEMO_ENC_QUANT_EXPECT_DIAR"
+        else:
+            expect = os.environ.get("NEMO_ENC_QUANT_EXPECT") or ckpt_cfg.get("expect_replaced")
+            expect_var = "NEMO_ENC_QUANT_EXPECT"
         if expect and int(expect) != replaced:
             raise RuntimeError(
-                f"NEMO_ENC_QUANT_EXPECT={expect} but {replaced} matrices were replaced on "
-                f"{type(self).__name__} id={id(self):#x}. Quantization scope is wrong; refusing "
+                f"{expect_var}={expect} but {replaced} matrices were replaced on the {branch} branch "
+                f"({type(self).__name__} id={id(self):#x}). Quantization scope is wrong; refusing "
                 "to produce a result that would be attributed to the wrong module."
             )
 
