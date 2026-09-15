@@ -111,10 +111,16 @@ def _valid_lengths(lengths, device, seq_len=SEQ_LEN):
 
 
 def _qkv(device, dtype=torch.bfloat16, seq_len=SEQ_LEN, head_dim=HEAD_DIM, seed=0):
-    """``(B, H, T, D)`` Q/K/V exactly as ``forward_from_qkv`` hands them to the backend."""
-    torch.manual_seed(seed)
+    """
+    ``(B, H, T, D)`` Q/K/V exactly as ``forward_from_qkv`` hands them to the backend.
+
+    Draws from a local generator rather than seeding the global RNG: a neighbouring test asserts
+    batch invariance to within 1e-6 on unseeded random input, so shifting the global stream changes
+    which input it draws and can push that assertion over its tolerance.
+    """
+    generator = torch.Generator(device=device).manual_seed(seed)
     shape = (BATCH, NUM_HEADS, seq_len, head_dim)
-    return tuple(torch.randn(shape, device=device, dtype=dtype) for _ in range(3))
+    return tuple(torch.randn(shape, device=device, dtype=dtype, generator=generator) for _ in range(3))
 
 
 def _op_args(query, key, value, block_mask, valid_lengths):
