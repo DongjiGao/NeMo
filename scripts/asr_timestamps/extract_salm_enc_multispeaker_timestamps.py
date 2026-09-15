@@ -37,7 +37,7 @@ if str(SPEECH_ROOT) not in sys.path:
 
 from nemo.collections.asr.modules import AudioToMelSpectrogramPreprocessor
 from nemo.collections.asr.modules.parallel_expert_encoder import (
-    PEETransformerCTCTimestampExtractor,
+    MultiSpeakerSOTWordTimestampAligner,
     ParallelExpertEncoderPT,
     TransformerCTCDecoder,
 )
@@ -124,10 +124,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         metavar="N",
-        help=(
-            "Maximum number of selected manifest records to run in one padded PEE/CTC/DP batch "
-            "(default: 1)."
-        ),
+        help=("Maximum number of selected manifest records to run in one padded PEE/CTC/DP batch " "(default: 1)."),
     )
     parser.add_argument(
         "--audio-file",
@@ -159,65 +156,12 @@ def parse_args() -> argparse.Namespace:
         help=f"Matching SentencePiece model (default: {DEFAULT_TOKENIZER}).",
     )
     parser.add_argument(
-        "--alignment-mode",
-        choices=("parallel", "serialized"),
-        default="serialized",
-        help=(
-            "Follow the t-SOT word order on one CTC path (default: serialized). In parallel mode, "
-            "t-SOT speaker tags remain authoritative: too few active Sortformer streams automatically use serialized CTC."
-        ),
-    )
-    parser.add_argument(
-        "--speaker-assignment-mode",
-        choices=("optimal", "identity"),
-        default="optimal",
-        help="Map t-SOT speaker tags to Sortformer columns (default: optimal).",
-    )
-    parser.add_argument(
         "--speaker-logprob-weight",
         type=float,
         default=0.25,
-        help="Weight for the Sortformer log-sigmoid prior in CTC DP (default: 0.25; 1.0 multiplies by max(activity, epsilon)).",
-    )
-    parser.add_argument(
-        "--parallel-speaker-gate-threshold",
-        type=float,
-        default=0.5,
         help=(
-            "Sortformer threshold that selects padded active CTC regions in parallel mode "
-            "(default: 0.5). Frames outside those regions are excluded; use a negative value for the full CTC timeline."
-        ),
-    )
-    parser.add_argument(
-        "--parallel-speaker-gate-min-threshold",
-        type=float,
-        default=0.20,
-        help=(
-            "Lowest automatic active-region retry threshold (default: 0.20). "
-            "A failed speaker retries at lower gates, then the recording uses serialized t-SOT CTC."
-        ),
-    )
-    parser.add_argument(
-        "--parallel-active-region-padding-seconds",
-        type=float,
-        default=0.16,
-        help="Context added to both sides of each Sortformer-active region before parallel CTC alignment (default: 0.16).",
-    )
-    parser.add_argument(
-        "--parallel-active-region-merge-gap-seconds",
-        type=float,
-        default=0.40,
-        help="Merge padded speaker regions whose remaining gap is no more than this many seconds (default: 0.40).",
-    )
-    parser.add_argument(
-        "--coarse-alignment-band-size",
-        type=int,
-        default=0,
-        metavar="N",
-        help=(
-            "Optional approximate coarse-to-fine CTC Viterbi target-state radius. The fine pass searches at "
-            "most 2*N+1 blank-expanded CTC states around a coarse path; an infeasible or edge-hugging path "
-            "falls back to dense DP (default: 0, disabled)."
+            "Weight for the Sortformer log-sigmoid prior in CTC DP "
+            "(default: 0.25; 1.0 multiplies by max(activity, epsilon))."
         ),
     )
     parser.add_argument(
@@ -421,11 +365,7 @@ def validate_tokenizer(tokenizer: SentencePieceTokenizer, decoder_config: Mappin
         )
     actual_vocabulary = tokenizer.ids_to_tokens(list(range(len(vocabulary))))
     mismatch = next(
-        (
-            index
-            for index, (actual, expected) in enumerate(zip(actual_vocabulary, vocabulary))
-            if actual != expected
-        ),
+        (index for index, (actual, expected) in enumerate(zip(actual_vocabulary, vocabulary)) if actual != expected),
         None,
     )
     if mismatch is not None:
@@ -438,20 +378,24 @@ def validate_tokenizer(tokenizer: SentencePieceTokenizer, decoder_config: Mappin
 def build_preprocessor(device: torch.device) -> AudioToMelSpectrogramPreprocessor:
     # PEE normalizes ASR and Sortformer mel features internally, so the shared
     # front-end deliberately returns unnormalized log-mels.
-    return AudioToMelSpectrogramPreprocessor(
-        sample_rate=16000,
-        normalize=None,
-        window_size=0.025,
-        window_stride=0.01,
-        window="hann",
-        features=128,
-        n_fft=512,
-        log=True,
-        frame_splicing=1,
-        dither=0.0,
-        pad_to=0,
-        pad_value=0.0,
-    ).to(device).eval()
+    return (
+        AudioToMelSpectrogramPreprocessor(
+            sample_rate=16000,
+            normalize=None,
+            window_size=0.025,
+            window_stride=0.01,
+            window="hann",
+            features=128,
+            n_fft=512,
+            log=True,
+            frame_splicing=1,
+            dither=0.0,
+            pad_to=0,
+            pad_value=0.0,
+        )
+        .to(device)
+        .eval()
+    )
 
 
 def _load_waveform_samples(path: Path) -> tuple[torch.Tensor, float]:
@@ -464,9 +408,7 @@ def _load_waveform_samples(path: Path) -> tuple[torch.Tensor, float]:
     return waveform, waveform.numel() / float(sample_rate)
 
 
-def load_waveforms(
-    paths: list[Path], device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor, list[float]]:
+def load_waveforms(paths: list[Path], device: torch.device) -> tuple[torch.Tensor, torch.Tensor, list[float]]:
     """Read, mono-mix, and right-pad several 16 kHz recordings for one model batch."""
     if not paths:
         raise ValueError("At least one audio path is required.")
@@ -551,9 +493,7 @@ def _time_interval(start_value: Any, end_value: Any, description: str) -> tuple[
 def _session_id(audio_path: Path, requested_session_id: str | None) -> str:
     session_id = requested_session_id.strip() if requested_session_id else audio_path.stem
     if not session_id or len(session_id.split()) != 1:
-        raise ValueError(
-            "Session ID must be one non-empty token; use --session-id to override the WAV stem."
-        )
+        raise ValueError("Session ID must be one non-empty token; use --session-id to override the WAV stem.")
     return session_id
 
 
@@ -621,13 +561,10 @@ def _merged_timestamp_word_segments(
         current_words: list[dict[str, Any]] = []
         current_end: float | None = None
         for word in words:
-            if (
-                current_words
-                and (
-                    word["turn_index"] != current_words[-1]["turn_index"]
-                    or merge_threshold < 0.0
-                    or word["start"] - current_end > merge_threshold
-                )
+            if current_words and (
+                word["turn_index"] != current_words[-1]["turn_index"]
+                or merge_threshold < 0.0
+                or word["start"] - current_end > merge_threshold
             ):
                 merged_segments.append((speaker_tag, current_words))
                 current_words = []
@@ -685,7 +622,7 @@ def build_ctm_lines(speaker_word_timestamps: Mapping[str, Any], merge_threshold:
             gecko_segment_id += 1
             previous_semantic_segment_id = semantic_segment_id
         gecko_utterance_id = f"spk{speaker_tag}_{gecko_segment_id:05d}_audio"
-        lines.append(f"{gecko_utterance_id} 1 {start:08.2f} {end - start:.2f} {word} -1.00")
+        lines.append(f"{gecko_utterance_id} 1 {start:.2f} {end - start:.2f} {word} -1.00")
     return lines
 
 
@@ -747,10 +684,7 @@ def build_rttm_lines(
     for speaker_tag, words in _merged_timestamp_word_segments(speaker_word_timestamps, merge_threshold):
         start = words[0]["start"]
         end = max(word["end"] for word in words)
-        lines.append(
-            f"SPEAKER {session_id} 1 {start:.3f} {end - start:.3f} "
-            f"<NA> <NA> spk:{speaker_tag} <NA> <NA>"
-        )
+        lines.append(f"SPEAKER {session_id} 1 {start:.3f} {end - start:.3f} " f"<NA> <NA> spk:{speaker_tag} <NA> <NA>")
     return lines
 
 
@@ -785,8 +719,7 @@ def _validate_output_paths(*paths: Path | None) -> None:
 
 def _record_output_stem(session_id: str, manifest_record_index: int | None) -> str:
     safe_session_id = "".join(
-        character if character.isalnum() or character in {"-", "_", "."} else "_"
-        for character in session_id
+        character if character.isalnum() or character in {"-", "_", "."} else "_" for character in session_id
     ).strip(".")
     if not safe_session_id:
         safe_session_id = "session"
@@ -868,21 +801,6 @@ def main() -> int:
         raise RuntimeError(f"--device={device} was requested, but CUDA is unavailable.")
     if device.type == "cpu" and args.model_dtype != "fp32":
         raise ValueError("CPU inference requires --model-dtype fp32.")
-    if args.parallel_speaker_gate_threshold < 0.0:
-        parallel_gate_threshold = None
-    elif args.parallel_speaker_gate_threshold > 1.0:
-        raise ValueError("--parallel-speaker-gate-threshold must be between zero and one, or negative to disable.")
-    else:
-        parallel_gate_threshold = args.parallel_speaker_gate_threshold
-    if not 0.0 <= args.parallel_speaker_gate_min_threshold <= 1.0:
-        raise ValueError("--parallel-speaker-gate-min-threshold must be between zero and one.")
-    if args.parallel_active_region_padding_seconds < 0.0:
-        raise ValueError("--parallel-active-region-padding-seconds must be non-negative.")
-    if args.parallel_active_region_merge_gap_seconds < 0.0:
-        raise ValueError("--parallel-active-region-merge-gap-seconds must be non-negative.")
-    if args.coarse_alignment_band_size < 0:
-        raise ValueError("--coarse-alignment-band-size must be non-negative.")
-    coarse_alignment_band_size = args.coarse_alignment_band_size or None
     dtype = torch.bfloat16 if args.model_dtype == "bf16" else torch.float32
 
     print(f"Loading PEE: {pee_path}", file=sys.stderr, flush=True)
@@ -895,18 +813,11 @@ def main() -> int:
     validate_tokenizer(tokenizer, decoder_config)
     preprocessor = build_preprocessor(device)
 
-    extractor = PEETransformerCTCTimestampExtractor(
+    extractor = MultiSpeakerSOTWordTimestampAligner(
         encoder=pee,
         ctc_decoder=decoder,
         tokenizer=tokenizer,
-        alignment_mode=args.alignment_mode,
-        speaker_assignment_mode=args.speaker_assignment_mode,
         speaker_logprob_weight=args.speaker_logprob_weight,
-        parallel_speaker_gate_threshold=parallel_gate_threshold,
-        parallel_speaker_gate_min_threshold=args.parallel_speaker_gate_min_threshold,
-        parallel_active_region_padding_seconds=args.parallel_active_region_padding_seconds,
-        parallel_active_region_merge_gap_seconds=args.parallel_active_region_merge_gap_seconds,
-        coarse_alignment_band_size=coarse_alignment_band_size,
     )
 
     completed: list[tuple[int | None, Path, float, str, Mapping[str, Any], dict[str, Any]]] = []

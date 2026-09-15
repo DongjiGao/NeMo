@@ -6,7 +6,10 @@ from pathlib import Path
 
 
 _TIMESTAMP_SCRIPT = (
-    Path(__file__).resolve().parents[3] / "examples" / "asr" / "extract_pee_transformer_ctc_timestamps.py"
+    Path(__file__).resolve().parents[3]
+    / "scripts"
+    / "asr_timestamps"
+    / "extract_salm_enc_multispeaker_timestamps.py"
 )
 _SPEC = importlib.util.spec_from_file_location("pee_transformer_ctc_timestamp_cli", _TIMESTAMP_SCRIPT)
 assert _SPEC is not None and _SPEC.loader is not None
@@ -39,6 +42,7 @@ def test_build_ctm_lines_emits_gecko_speaker_segment_ids():
 
     assert all(len(row) == 6 for row in fields)
     assert [row[1] for row in fields] == ["1"] * len(fields)
+    assert [row[2] for row in fields] == ["0.00", "0.11", "0.20", "0.27", "0.50", "0.70"]
     assert [row[4] for row in fields] == ["hello", "there", "yeah", "again", "after", "later"]
     assert [row[5] for row in fields] == ["-1.00"] * len(fields)
     assert [row[0] for row in fields] == [
