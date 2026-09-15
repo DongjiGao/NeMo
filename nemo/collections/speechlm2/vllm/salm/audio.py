@@ -172,7 +172,7 @@ def _prepare_prequantized_encoder(perception: nn.Module, quant_cfg: dict | None)
 
     import torch
 
-    from enc_nvfp4 import FP8Linear
+    from nemo.collections.asr.parts.submodules.enc_nvfp4 import FP8Linear
 
     targets = [m for m in perception.modules() if getattr(m, "_enc_quant_is_asr", False)]
     if not targets:

@@ -54,8 +54,8 @@ flex_attention_compiled = torch.compile(flex_attention, dynamic=True)
 _ENC_PROF_PATH = os.environ.get("NEMO_ENC_PROF")
 _ENC_PROF_CAP = 1 << 16
 # Optional low-precision encoder. Applied lazily on the first forward because the
-# checkpoint weights are not present yet at __init__ time. Requires enc_nvfp4 on
-# PYTHONPATH (projects/inference_quantization/scripts).
+# checkpoint weights are not present yet at __init__ time. The kernels live in
+# nemo.collections.asr.parts.submodules.enc_nvfp4.
 _ENC_QUANT = os.environ.get("NEMO_ENC_QUANT")
 # Which branch(es) the swap may touch. ParallelExpertEncoder holds an ASR encoder
 # and a Sortformer diarizer of this same class, and tags the latter so it does not
@@ -1117,7 +1117,7 @@ class TransformerEncoder(nn.Module):
             # use static input scales. Writes per-pid like the profiler does.
             import atexit
 
-            from enc_nvfp4 import ActivationAmaxCollector
+            from nemo.collections.asr.parts.submodules.enc_nvfp4 import ActivationAmaxCollector
 
             out = os.environ.get("NEMO_ENC_QUANT_CALIB_OUT")
             if not out:
@@ -1127,7 +1127,7 @@ class TransformerEncoder(nn.Module):
             atexit.register(collector.save, path)
             return
 
-        from enc_nvfp4 import load_scales, quantize_encoder
+        from nemo.collections.asr.parts.submodules.enc_nvfp4 import load_scales, quantize_encoder
 
         # Amax lives inline in the checkpoint config rather than as a sidecar file,
         # because this module has no way to learn the checkpoint directory: it is
