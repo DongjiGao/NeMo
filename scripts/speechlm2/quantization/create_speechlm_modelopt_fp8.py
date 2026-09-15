@@ -23,28 +23,31 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 
-DEFAULT_SOURCE = Path(
-    "/data/dongjig/results/speechlm-2026h1/"
-    "2404-lr1e-4-omnidata-multiling-4node/eval-step-40000"
-)
-DEFAULT_OUTPUT = Path(
-    "/data/dongjig/results/quantization/"
-    "speechlm_nemotronh_modelopt_fp8_eval-step-40000"
-)
-DEFAULT_MODELOPT_REPO = Path("/home/dongjig/Model-Optimizer")
-
-
 def parse_args() -> argparse.Namespace:
+    # No path defaults on purpose. These used to point at one specific checkpoint
+    # on one machine, so omitting --source did not fail, it silently quantized a
+    # different and much older model.
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--source", type=Path, required=True, help="SpeechLM checkpoint")
+    parser.add_argument("--output", type=Path, required=True, help="FP8 checkpoint to write")
     parser.add_argument(
         "--llm-name",
         default=None,
         help="HF LLM backbone id. Defaults to config.json pretrained_llm.",
     )
-    parser.add_argument("--hf-home", type=Path, default=Path("/data/dongjig/.cache/huggingface"))
-    parser.add_argument("--modelopt-repo", type=Path, default=DEFAULT_MODELOPT_REPO)
+    parser.add_argument(
+        "--hf-home",
+        type=Path,
+        default=None,
+        help="defaults to the ambient HF_HOME, then ~/.cache/huggingface",
+    )
+    parser.add_argument(
+        "--modelopt-repo",
+        type=Path,
+        required=True,
+        help="NVIDIA Model-Optimizer checkout; only the example script is taken "
+        "from it, modelopt itself is imported from the environment",
+    )
     parser.add_argument("--llm-export-dir", type=Path, default=None)
     parser.add_argument("--skip-llm-export", action="store_true")
     parser.add_argument("--calib-size", type=int, default=128)
@@ -143,7 +146,8 @@ def run_official_hf_ptq(args: argparse.Namespace, llm_name: str, export_dir: Pat
     print("Command:")
     print(" ".join(cmd))
     env = os.environ.copy()
-    env["HF_HOME"] = str(args.hf_home)
+    if args.hf_home is not None:
+        env["HF_HOME"] = str(args.hf_home)
     # The checkout's modelopt must shadow any installed one. example_utils.py here
     # imports modelopt.torch.utils.image_processor, which the quantdev container's
     # installed 0.44 does not have; without this the run dies at import. cwd is the
@@ -263,7 +267,8 @@ def write_speechlm_config(source: Path, output: Path, llm_config: dict) -> None:
 
 def main() -> None:
     args = parse_args()
-    os.environ["HF_HOME"] = str(args.hf_home)
+    if args.hf_home is not None:
+        os.environ["HF_HOME"] = str(args.hf_home)
 
     source = args.source.resolve()
     output = args.output.resolve()

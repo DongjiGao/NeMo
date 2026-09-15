@@ -14,26 +14,27 @@ from safetensors.torch import save_file
 from transformers import AutoConfig, AutoTokenizer
 
 
-DEFAULT_SOURCE = Path(
-    "/data/dongjig/results/speechlm-2026h1/"
-    "2404-lr1e-4-omnidata-multiling-4node/eval-step-40000"
-)
-DEFAULT_OUTPUT = Path(
-    "/data/dongjig/results/quantization/"
-    "speechlm_nemotronh_finetuned_llm_hf_eval-step-40000"
-)
-DEFAULT_SIDECAR_SOURCE = Path(
-    "/data/dongjig/results/quantization/"
-    "nemotronh_llm_modelopt_fp8_official_361f7e391_tf455_20260509_194900"
-)
-
-
 def parse_args() -> argparse.Namespace:
+    # No path defaults on purpose. These used to point at one specific checkpoint
+    # on one machine, so omitting --source did not fail, it silently exported a
+    # different and much older model; the --sidecar-source default outlived the
+    # directory it named and could not have worked at all.
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--sidecar-source", type=Path, default=DEFAULT_SIDECAR_SOURCE)
-    parser.add_argument("--hf-home", type=Path, default=Path("/data/dongjig/.cache/huggingface"))
+    parser.add_argument("--source", type=Path, required=True, help="SpeechLM checkpoint")
+    parser.add_argument("--output", type=Path, required=True, help="HF LLM checkpoint to write")
+    parser.add_argument(
+        "--sidecar-source",
+        type=Path,
+        required=True,
+        help="directory holding the NemotronH config.json (usually "
+        "<source>/llm_backbone) plus tokenizer.json from the SpeechLM root",
+    )
+    parser.add_argument(
+        "--hf-home",
+        type=Path,
+        default=None,
+        help="defaults to the ambient HF_HOME, then ~/.cache/huggingface",
+    )
     parser.add_argument("--max-shard-size-gb", type=float, default=8.0)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -179,7 +180,8 @@ def save_sharded(weights, output: Path, max_shard_size: int) -> dict:
 
 def main() -> None:
     args = parse_args()
-    os.environ["HF_HOME"] = str(args.hf_home)
+    if args.hf_home is not None:
+        os.environ["HF_HOME"] = str(args.hf_home)
 
     source = args.source.resolve()
     output = args.output.resolve()

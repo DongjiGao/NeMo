@@ -25,8 +25,10 @@ def _register_nemo_plugin() -> None:
         register()
     except Exception as exc:
         raise RuntimeError(
-            "Failed to register NeMo SpeechLM vLLM plugin. "
-            "Set PYTHONPATH=/home/dongjig/NeMo_merge and use the vLLM env."
+            "Failed to register NeMo SpeechLM vLLM plugin. It is registered via "
+            "the nemo_speechlm entry point "
+            "(nemo.collections.speechlm2.vllm.salm:register), so NeMo must be "
+            "importable in the same environment as vLLM."
         ) from exc
 
 
@@ -562,7 +564,9 @@ def main() -> None:
 
     print(f"Scoring contract: {SCORING_CONTRACT}\n  normalizer: {scorer_source}")
 
-    os.environ.setdefault("HF_HOME", "/data/dongjig/.cache/huggingface")
+    # Leave HF_HOME to the caller. This used to setdefault a path from one
+    # machine, which on any other box silently pointed the cache at a directory
+    # that does not exist.
     path_rewrites = parse_path_rewrites(args.path_rewrite)
     manifest_start = time.perf_counter()
     items, total_audio_sec = load_manifest(args.manifest, args.limit, path_rewrites)
