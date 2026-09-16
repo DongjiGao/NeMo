@@ -257,6 +257,16 @@ def _read_bundle_members(nemo_path: str) -> tuple[DictConfig, dict[str, torch.Te
 class ParallelExpertEncoderPT(ModelPT):
     """ModelPT shell for saving and restoring a PE ``.nemo`` archive."""
 
+    @classmethod
+    def list_available_models(cls) -> List[PretrainedModelInfo]:
+        return []
+
+    def setup_training_data(self, train_data_config: Union[DictConfig, dict]):
+        pass
+
+    def setup_validation_data(self, val_data_config: Union[DictConfig, dict]):
+        pass
+
     def __init__(self, cfg: DictConfig, trainer: Optional[Trainer] = None):
         """Initialize a serializable Parallel Expert Encoder wrapper.
 
@@ -457,6 +467,7 @@ class ParallelExpertEncoderPT(ModelPT):
         template_cfg.speaker_feature_config_version = _SPEAKER_FEATURE_CONFIG_VERSION
         template_cfg.speaker_feature_mode = encoder.speaker_feature_mode
         template_cfg.speaker_activity_threshold = encoder.speaker_activity_threshold
+        template_cfg.frame_shift_seconds = encoder.frame_shift_seconds
         template_cfg.chunk_size_seconds = encoder.chunk_size_seconds
         template_cfg.sync_max_audio_length = encoder.sync_max_audio_length
         template_cfg.ctc_timestamp_model_path = encoder.ctc_timestamp_model_path
@@ -521,6 +532,8 @@ class ParallelExpertEncoder(nn.Module):
             speaker_feature_mode (Optional[str]): Continuous or thresholded speaker-feature mode.
             speaker_activity_threshold (Optional[float]): Activity threshold for thresholded fusion.
             spk_kernel_scale (float): Scale applied to the sinusoidal speaker infusion.
+            frame_shift_seconds (float): Duration represented by one input feature frame.
+            chunk_size_seconds (Optional[float]): Optional independent-branch chunk duration.
             sync_max_audio_length (bool): Whether child encoders synchronize maximum sequence lengths.
             ctc_timestamp_model_path (Optional[str]): Local CTC timestamp adapter path.
         """
