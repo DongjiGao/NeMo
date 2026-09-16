@@ -457,7 +457,7 @@ def test_configure_streaming_mode_rejects_non_boolean(checkpoint_streaming_mode,
             {"streaming_step": 1.0, "pre_encode": 0.4},
             {"streaming_step": 2, "pre_encode": 2},
             10.0,
-            "audio=10.00s, model_forward=2.000s (RTF=0.200000, 5.00x realtime), "
+            "audio=10.00s (manifest), model_forward=2.000s (RTF=0.200000, 5.00x realtime), "
             "preprocessor=0.500s (25.00%, RTF=0.050000), main_inference=1.500s (75.00%, RTF=0.150000), calls=2",
         )
     ],
@@ -495,7 +495,7 @@ def test_log_summary_without_warmup_measures_every_call(
             {"streaming_step": 3, "pre_encode": 3},
             100.0,
             60.0,
-            "audio=60.00s, model_forward=2.000s (RTF=0.033333, 30.00x realtime), "
+            "audio=60.00s (override), model_forward=2.000s (RTF=0.033333, 30.00x realtime), "
             "preprocessor=1.000s (50.00%, RTF=0.016667), main_inference=1.000s (50.00%, RTF=0.016667), "
             "calls=2, warmup_calls=1",
         )
@@ -573,7 +573,7 @@ def test_log_summary_warns_when_warmup_excluded_without_per_call_durations(
         profiler.log_summary(audio_duration)
 
     assert expected_warning in caplog.text
-    assert "audio=10.00s, model_forward=1.000s" in caplog.text
+    assert "audio=10.00s (manifest), model_forward=1.000s" in caplog.text
 
 
 @pytest.mark.unit
@@ -588,7 +588,7 @@ def test_log_summary_warns_when_warmup_excluded_without_per_call_durations(
             (2.0, 0.5, 0.5),
             (40.0, 35.0, 25.0),
             100.0,
-            "audio=60.00s, model_forward=2.000s (RTF=0.033333, 30.00x realtime)",
+            "audio=60.00s (derived), model_forward=2.000s (RTF=0.033333, 30.00x realtime)",
         )
     ],
 )
@@ -613,7 +613,10 @@ def test_log_summary_uses_per_call_durations_when_no_override_is_given(
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "warmup_calls, audio_durations, measured_audio_duration, expected_audio",
-    [(1, (40.0, 35.0, 25.0), 12.5, "audio=12.50s"), (1, (40.0, 35.0, 25.0), None, "audio=60.00s")],
+    [
+        (1, (40.0, 35.0, 25.0), 12.5, "audio=12.50s (override)"),
+        (1, (40.0, 35.0, 25.0), None, "audio=60.00s (derived)"),
+    ],
     ids=["override-wins", "no-override-uses-per-call"],
 )
 def test_log_summary_prefers_an_explicit_measured_duration_over_per_call_durations(

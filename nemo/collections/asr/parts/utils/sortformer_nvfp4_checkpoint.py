@@ -363,8 +363,8 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
                     f"{CHECKPOINT_FORMAT_VERSION} addresses quantized payloads by module and can only "
                     "represent a parameter named 'weight'."
                 )
-            if module_fqn in contexts:
-                raise ValueError(f"'{module_fqn}' holds more than one quantized tensor, which this format cannot key.")
+            # No duplicate-module check is needed: the leaf is required to be 'weight' just above, so the key
+            # is exactly f"{module_fqn}.weight" and state-dict keys are unique.
             for name in names:
                 attribute = getattr(value, name)
                 # NVFP4Tensor derives its logical shape from qdata's stride order

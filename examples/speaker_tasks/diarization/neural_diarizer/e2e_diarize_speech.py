@@ -61,7 +61,9 @@ from nemo.collections.asr.parts.utils.sortformer_attention_backends import (
     attention_backend_cache_identity,
     attention_backend_info,
     configure_attention_backend,
+    validate_attention_backend,
 )
+from nemo.collections.asr.parts.utils.sortformer_fp8_flex_attention import FP8_FLEX_BACKEND
 from nemo.collections.asr.parts.utils.sortformer_nvfp4_checkpoint import resolve_nvfp4_save_restore_connector
 from nemo.collections.asr.parts.utils.sortformer_utils import (
     InferenceProfiler,
@@ -309,6 +311,60 @@ def resolve_cuda_graph_config(cfg: DiarizationConfig, device_type: str) -> None:
     # captured graph records fixed shapes. Neither can hold another value, so neither is worth demanding.
     cfg.compile_encoder = True
     cfg.compile_dynamic = False
+
+
+def warn_about_inert_compile_settings(cfg: DiarizationConfig) -> None:
+    """
+    Say so when a compile setting cannot take effect, instead of leaving it silently inert.
+
+    Neither case is an error -- the run is valid and the setting simply does nothing -- but both look from
+    the outside like the setting was honoured, which is how a throughput or accuracy number gets attributed
+    to a configuration that never ran.
+
+    Args:
+        cfg (DiarizationConfig): The configuration object containing the compilation options.
+    """
+    if cfg.compile_cuda_graph_max_audio_length is not None and not (
+        cfg.compile_cuda_graphs and cfg.streaming_mode is False
+    ):
+        logging.warning(
+            f"compile_cuda_graph_max_audio_length={cfg.compile_cuda_graph_max_audio_length} is ignored: it "
+            "materializes the frontend encoder's positional state for offline CUDA Graphs, which needs "
+            "compile_cuda_graphs=True with streaming_mode=False. The encoder positional state is not pinned."
+        )
+    if not cfg.compile_dynamic and not cfg.compile_encoder and not cfg.compile_cuda_graphs:
+        logging.warning(
+            "compile_dynamic=False is ignored because nothing is compiled; it only applies when "
+            "compile_encoder=True or compile_cuda_graphs=True."
+        )
+
+
+def validate_attention_backend_shapes(cfg: DiarizationConfig) -> None:
+    """
+    Reject an attention backend that needs pinned input shapes when nothing pins them.
+
+    The FP8 backend compiles its private boundary with ``fullgraph=True, dynamic=False``, so it specializes
+    on every distinct padded time dimension and the ninth one raises rather than falling back. Only
+    ``async_pad_to_max=True`` on the streaming path holds that dimension constant --
+    ``compile_cuda_graph_max_audio_length`` pins the retained positional state, not the input width. Caught
+    here so the failure is a startup error naming the cause, rather than a Dynamo exception partway through
+    a long evaluation.
+
+    Args:
+        cfg (DiarizationConfig): The configuration object carrying the backend and padding options.
+
+    Raises:
+        ValueError: If ``fp8_flex`` is requested without a fixed time dimension.
+    """
+    if validate_attention_backend(cfg.attention_backend) != FP8_FLEX_BACKEND:
+        return
+    if not (cfg.streaming_mode and cfg.async_pad_to_max):
+        raise ValueError(
+            f"attention_backend='{FP8_FLEX_BACKEND}' requires a fixed padded time dimension, which only "
+            "streaming_mode=True with async_pad_to_max=True provides. Its compiled boundary specializes on "
+            "each distinct input length and raises once the recompile limit is reached, so a variable-length "
+            "run fails partway instead of degrading. Use attention_backend='flex' for variable lengths."
+        )
 
 
 def validate_compile_backend(cfg: DiarizationConfig) -> None:
@@ -788,6 +844,10 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     # Likewise for the compile backend, so an unusable or unregistered backend never reaches compilation. Runs after
     # the graph request is resolved, because the 'cudagraphs' backend is only defined for the streaming graph mode.
     validate_compile_backend(cfg)
+    # Both read the settings resolve_cuda_graph_config() just finalized, and both run before the checkpoint is
+    # restored so a rejected combination costs nothing.
+    validate_attention_backend_shapes(cfg)
+    warn_about_inert_compile_settings(cfg)
 
     if cfg.model_path.endswith(".ckpt"):
         diar_model = SortformerEncLabelModel.load_from_checkpoint(

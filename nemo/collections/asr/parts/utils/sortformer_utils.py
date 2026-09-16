@@ -19,7 +19,7 @@ import time
 from functools import wraps
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 from omegaconf import open_dict
@@ -202,26 +202,33 @@ class InferenceProfiler:
         original_method = getattr(instance, method_name)
         setattr(instance, method_name, self._section_wrapper(section, original_method))
 
-    def _resolve_summary_duration(self, audio_duration: float, measured_audio_duration: Optional[float]) -> float:
+    def _resolve_summary_duration(
+        self, audio_duration: float, measured_audio_duration: Optional[float]
+    ) -> Tuple[float, str]:
         """
-        Pick the audio duration to divide the measured time by.
+        Pick the audio duration to divide the measured time by, and name where it came from.
 
         An explicit override wins. Otherwise the per-call durations are used when one was recorded for every
         forward call, which keeps the numerator matched to the measured calls no matter which rows the warmup
         calls consumed. Only if recording failed does this fall back to the whole manifest, which overstates
         the covered audio whenever warmup calls were dropped.
+
+        Returns:
+            resolved (Tuple[float, str]): The duration, and one of ``"override"``, ``"derived"`` or
+            ``"manifest"``. The source is reported in the summary so a logged RTF can be attributed to a
+            protocol rather than guessed at; the three are not comparable with each other.
         """
         if measured_audio_duration is not None:
-            return measured_audio_duration
+            return measured_audio_duration, "override"
         if len(self.audio_durations) == self.forward_calls and self.forward_calls > 0:
-            return sum(self.audio_durations[self.warmup_calls :])
+            return sum(self.audio_durations[self.warmup_calls :]), "derived"
         if self.warmup_calls > 0:
             logging.warning(
                 f"warmup_calls={self.warmup_calls} excludes leading model-forward calls, but per-call audio "
                 f"durations were recorded for {len(self.audio_durations)} of {self.forward_calls} calls, so the "
                 "reported RTF covers the full manifest duration while the measured time does not."
             )
-        return audio_duration
+        return audio_duration, "manifest"
 
     def _record_audio_duration(self, *args, **kwargs):
         """
@@ -319,7 +326,7 @@ class InferenceProfiler:
         forward_time = sum(self.forward_times[self.warmup_calls :])
         preprocessor_time = sum(self.preprocessor_times[self.warmup_calls :])
         measured_calls = max(0, self.forward_calls - self.warmup_calls)
-        summary_duration = self._resolve_summary_duration(audio_duration, measured_audio_duration)
+        summary_duration, duration_source = self._resolve_summary_duration(audio_duration, measured_audio_duration)
         if summary_duration <= 0 or forward_time <= 0:
             logging.warning(
                 f"Cannot summarize inference profile with audio_duration={summary_duration} "
@@ -333,7 +340,7 @@ class InferenceProfiler:
         warmup_suffix = f", warmup_calls={self.warmup_calls}" if self.warmup_calls > 0 else ""
         logging.info(
             "Inference profile: "
-            f"audio={summary_duration:.2f}s, model_forward={forward_time:.3f}s "
+            f"audio={summary_duration:.2f}s ({duration_source}), model_forward={forward_time:.3f}s "
             f"(RTF={forward_time / summary_duration:.6f}, {summary_duration / forward_time:.2f}x realtime), "
             f"preprocessor={preprocessor_time:.3f}s ({preprocessor_percent:.2f}%, "
             f"RTF={preprocessor_time / summary_duration:.6f}), "
