@@ -2192,6 +2192,31 @@ class TestSortformerStreamingEncoderCudaGraphCompilation:
             install_cuda_graph_length_pinning(SimpleNamespace(), method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
 
     @pytest.mark.unit
+    def test_length_pinning_refuses_to_install_under_an_existing_marker(self):
+        # The marker has to wrap the pinning, so that mark_step_begin() runs before the length copy. The
+        # reverse order would let step N+1 write the retained buffer while cudagraph trees still consider
+        # the run to be generation N, which degrades into re-recording rather than raising.
+        model = StubStreamingModel()
+        install_cuda_graph_step_marker(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+
+        with pytest.raises(ValueError, match="already carries a CUDA Graph step marker"):
+            install_cuda_graph_length_pinning(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+
+    @pytest.mark.unit
+    def test_the_supported_install_order_stays_idempotent(self):
+        # Guards the check above against over-firing: after a correct install the marker sits on the
+        # outermost method, so a repeat of either installer must remain a no-op rather than raise.
+        model = StubStreamingModel()
+        install_cuda_graph_length_pinning(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+        install_cuda_graph_step_marker(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+        installed = model.frontend_encoder
+
+        install_cuda_graph_length_pinning(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+        install_cuda_graph_step_marker(model, method_name=STREAMING_CUDA_GRAPH_STEP_BOUNDARY)
+
+        assert model.frontend_encoder is installed
+
+    @pytest.mark.unit
     @pytest.mark.parametrize("num_calls", [3])
     def test_marker_stays_once_per_step_and_precedes_the_pinned_boundary(self, num_calls):
         model = StubStreamingModel(transformer_encoder=StubTransformerEncoder())

@@ -534,10 +534,23 @@ def install_cuda_graph_length_pinning(
     if already_installed:
         return original_method
 
+    # Checked only after the idempotency return above, because a correctly installed pair leaves the marker
+    # on the outermost method and a repeat call must stay a no-op. Reaching here with a marker already in
+    # place means the two are being installed in the wrong order: the copy into the retained buffer would
+    # then run before mark_step_begin(), so step N+1 writes the buffer while cudagraph trees still consider
+    # the run to be generation N. That degrades silently into re-recording, so refuse it.
+    marker_attribute = f"{CUDA_GRAPH_MARKER_ATTRIBUTE}_{method_name}"
+    if getattr(model, marker_attribute, False) or getattr(original_method, CUDA_GRAPH_MARKER_ATTRIBUTE, False):
+        raise ValueError(
+            f"{method_name}() already carries a CUDA Graph step marker, so length pinning cannot be installed "
+            "underneath it. Install the pinning first and let the marker wrap it, as install_cuda_graph_boundary() "
+            "does."
+        )
+
     # Keyed by tensor metadata rather than by call order, so that a recurring shape reuses its own retained buffer.
     length_buffers: Dict[Tuple, torch.Tensor] = {}
 
-    def pinned_length(length: torch.Tensor) -> torch.Tensor:
+    def retained_length_buffer(length: torch.Tensor) -> torch.Tensor:
         key = (tuple(length.shape), length.dtype, length.device)
         buffer = length_buffers.get(key)
         if buffer is None:
@@ -547,9 +560,10 @@ def install_cuda_graph_length_pinning(
             buffer.copy_(length)
         return buffer
 
-    def detached_result(result: Any, buffer: Optional[torch.Tensor]) -> Any:
+    def unaliased_result(result: Any, buffer: Optional[torch.Tensor]) -> Any:
         # The encoder forward may hand the untouched length straight back, and a caller that keeps that tensor
-        # across steps must not observe the next step overwriting the retained buffer in place.
+        # across steps must not observe the next step overwriting the retained buffer in place. Copies rather
+        # than detaches: the point is that nothing returned still aliases the buffer.
         if buffer is None or not isinstance(result, tuple):
             return result
         return tuple(buffer.clone() if item is buffer else item for item in result)
@@ -560,13 +574,13 @@ def install_cuda_graph_length_pinning(
         if STREAMING_CUDA_GRAPH_LENGTH_ARGUMENT in kwargs:
             length = kwargs[STREAMING_CUDA_GRAPH_LENGTH_ARGUMENT]
             if isinstance(length, torch.Tensor):
-                buffer = pinned_length(length)
+                buffer = retained_length_buffer(length)
                 kwargs = dict(kwargs)
                 kwargs[STREAMING_CUDA_GRAPH_LENGTH_ARGUMENT] = buffer
         elif len(args) > 1 and isinstance(args[1], torch.Tensor):
-            buffer = pinned_length(args[1])
+            buffer = retained_length_buffer(args[1])
             args = (args[0], buffer) + args[2:]
-        return detached_result(original_method(*args, **kwargs), buffer)
+        return unaliased_result(original_method(*args, **kwargs), buffer)
 
     setattr(pinned_method, CUDA_GRAPH_LENGTH_PINNING_ATTRIBUTE, True)
     setattr(pinned_method, CUDA_GRAPH_LENGTH_BUFFERS_ATTRIBUTE, length_buffers)
@@ -581,7 +595,8 @@ def install_cuda_graph_boundary(mode: CudaGraphMode, model: torch.nn.Module) -> 
 
     Called after the encoders are compiled. Where a length pinning wrapper is needed it is installed first, so that the
     step marker wraps it and every captured iteration begins before anything else of that iteration runs,
-    including the length copy.
+    including the length copy. That order is enforced by
+    :func:`install_cuda_graph_length_pinning`, which refuses to install underneath an existing marker.
 
     Args:
         mode (CudaGraphMode): Selected capture strategy, whose boundary and pinning needs are read from it.
