@@ -1586,7 +1586,9 @@ class TestStreamingTransformerEncoder:
             outs = []
             for c in range(n_chunks):
                 step = chunk * sub
-                chunk_lens = torch.tensor([max(0, min(step, int(l) - c * step)) for l in lengths], dtype=torch.int64)
+                chunk_lens = torch.tensor(
+                    [max(0, min(step, int(length) - c * step)) for length in lengths], dtype=torch.int64
+                )
                 out, _, clc, clt, clcl = enc.cache_aware_stream_step(
                     processed_signal=x[:, :, c * step : (c + 1) * step],
                     processed_signal_length=chunk_lens,
