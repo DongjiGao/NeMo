@@ -157,6 +157,9 @@ def test_get_prediction_cache_metadata(
         "strong_boost_rate": strong_boost_rate,
         "weak_boost_rate": weak_boost_rate,
         "scores_boost_latest": scores_boost_latest,
+        # None for the default uncompiled configuration, so a cache written before the encoder execution
+        # mode was keyed still compares equal.
+        "encoder_execution": None,
     }
 
 
@@ -598,9 +601,7 @@ def test_log_summary_uses_per_call_durations_when_no_override_is_given(
     audio_duration,
     expected_summary,
 ):
-    profiler = _make_profiler(
-        warmup_calls, forward_times, preprocessor_times, audio_durations=audio_durations
-    )
+    profiler = _make_profiler(warmup_calls, forward_times, preprocessor_times, audio_durations=audio_durations)
 
     with caplog.at_level(logging.INFO):
         profiler.log_summary(audio_duration)

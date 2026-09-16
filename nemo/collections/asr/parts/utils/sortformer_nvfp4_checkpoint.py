@@ -261,6 +261,10 @@ def is_nvfp4_checkpoint(path: str) -> bool:
             config = json.load(handle)
     except (OSError, tarfile.TarError, ValueError, UnicodeDecodeError):
         return False
+    # Inside the isinstance guard because valid JSON need not be an object: this runs on every .nemo
+    # path, so an unrelated archive carrying a JSON array here must fall through, not raise.
+    if not isinstance(config, dict):
+        return False
     section = config.get(CONFIG_SECTION)
     return isinstance(section, dict) and section.get("format") == CHECKPOINT_FORMAT
 
@@ -309,6 +313,7 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
         self._source_checkpoint_sha256 = source_checkpoint_sha256
         self._restored_context: Dict[str, Any] = {}
         self._quantized_layers: List[str] = []
+        self._expected_attributes: set = set()
 
     def _save_state_dict_to_disk(self, state_dict: Dict[str, Any], filepath: str) -> None:
         """
@@ -329,6 +334,10 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
 
         tensors: Dict[str, torch.Tensor] = {}
         contexts: Dict[str, Dict[str, Any]] = {}
+        # Which attributes each weight actually flattened to. Recorded because TorchAO omits the
+        # optional scales entirely when they are None, so without this the restore path cannot tell a
+        # weight that legitimately had no global scale from one whose entry went missing.
+        exported_attributes: set = set()
 
         for key, value in state_dict.items():
             # The flatten/unflatten pair this format is built on is exactly what makes a subclass
@@ -344,11 +353,32 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
                     f"'{key}' flattens to attributes {unnamed} that this format has no tensor name for. Storing it "
                     "without them would lose part of the payload."
                 )
-            module_fqn, _, _ = key.rpartition(".")
+            module_fqn, _, leaf = key.rpartition(".")
+            # The restore path rebuilds the key as f"{module_fqn}.weight" and assigns to ``weight``, so a
+            # quantized tensor under any other leaf name would be written over the module's real weight
+            # and land on the wrong parameter on load.
+            if leaf != "weight":
+                raise ValueError(
+                    f"'{key}' is a quantized tensor named '{leaf}'. Format version "
+                    f"{CHECKPOINT_FORMAT_VERSION} addresses quantized payloads by module and can only "
+                    "represent a parameter named 'weight'."
+                )
+            if module_fqn in contexts:
+                raise ValueError(f"'{module_fqn}' holds more than one quantized tensor, which this format cannot key.")
             for name in names:
-                stored = f"{module_fqn}.{ATTRIBUTE_SUFFIXES[name]}"
-                tensors[stored] = getattr(value, name).detach().cpu().contiguous()
+                attribute = getattr(value, name)
+                # NVFP4Tensor derives its logical shape from qdata's stride order
+                # (``stride(-2) > stride(-1)``), which .contiguous() below would rewrite while leaving
+                # size() alone -- restoring a differently shaped weight. safetensors cannot store a
+                # non-contiguous tensor, so refuse rather than silently normalize.
+                if name == "qdata" and attribute.dim() >= 2 and attribute.stride(-2) <= attribute.stride(-1):
+                    raise ValueError(
+                        f"'{key}' has transposed qdata strides {tuple(attribute.stride())}, whose logical shape "
+                        "cannot survive the contiguous copy this format stores. Quantize the untransposed weight."
+                    )
+                tensors[f"{module_fqn}.{ATTRIBUTE_SUFFIXES[name]}"] = attribute.detach().cpu().contiguous()
             contexts[module_fqn] = _context_to_json(context)
+            exported_attributes.add(tuple(sorted(names)))
 
         if not contexts:
             raise ValueError("No quantized weights found; use the ordinary connector for an unquantized model.")
@@ -358,6 +388,12 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
             raise ValueError(
                 f"The {len(contexts)} quantized weights carry {len(distinct)} different flatten contexts. Format "
                 f"version {CHECKPOINT_FORMAT_VERSION} stores one shared context and cannot represent this model."
+            )
+        if len(exported_attributes) != 1:
+            raise ValueError(
+                f"The {len(contexts)} quantized weights flattened to {len(exported_attributes)} different attribute "
+                f"sets {sorted(exported_attributes)}. Format version {CHECKPOINT_FORMAT_VERSION} records one shared "
+                "set so the restore path can verify a payload is complete."
             )
 
         # ModelOpt's hf_quant_config.json shape, so a reader who knows that convention can see which
@@ -380,6 +416,7 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
                 "export_precision": self._export_precision,
                 "source_checkpoint_sha256": self._source_checkpoint_sha256,
                 "context": json.loads(distinct.pop()),
+                "attributes": list(exported_attributes.pop()),
             },
         }
         config_path = os.path.join(os.path.dirname(filepath), QUANTIZATION_CONFIG_MEMBER)
@@ -431,6 +468,24 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
         if not self._quantized_layers:
             raise ValueError(f"{config_path} lists no quantized layers, so no payload could be reconstructed.")
 
+        # Additive field: archives written before it exists stay readable, but their payloads can only be
+        # checked for the two mandatory tensors, so a dropped optional scale would restore as None.
+        attributes = section.get("attributes")
+        if isinstance(attributes, list) and attributes:
+            self._expected_attributes = set(attributes)
+            unnamed = sorted(self._expected_attributes - set(ATTRIBUTE_SUFFIXES))
+            if unnamed:
+                raise ValueError(
+                    f"{config_path} records attributes {unnamed} that this format has no tensor name for."
+                )
+        else:
+            self._expected_attributes = set()
+            logging.warning(
+                f"{config_path} records no attribute list, so payload completeness cannot be verified: a missing "
+                "optional scale would be restored as None and change the dequantized weight. Re-export with this "
+                "build to record it."
+            )
+
         recorded = section.get("torchao_version")
         installed = _installed_torchao_version()
         if recorded and recorded != installed:
@@ -473,11 +528,21 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
             installed.append(key)
 
         missing, unexpected = instance.load_state_dict(plain, strict=False)
-        unaccounted_missing = sorted(set(missing) - set(installed))
-        if strict and (unaccounted_missing or unexpected):
+        # Every quantized key must have been assigned above, and the archive must contain nothing the
+        # model does not want. Those are invariants of this format rather than caller preferences, so
+        # they hold even for strict=False -- otherwise a strict=False restore validates nothing and a
+        # correctly shaped but wrong tensor lands silently. Only genuinely unaccounted keys are
+        # strict-gated, matching load_state_dict's own contract.
+        not_assigned = sorted(set(installed) - set(missing))
+        if not_assigned or unexpected:
             raise ValueError(
-                "Restoring the NVFP4 checkpoint left keys unaccounted for. "
-                f"missing={unaccounted_missing} unexpected={sorted(unexpected)}"
+                "The NVFP4 payload does not match this model. "
+                f"quantized_keys_not_expected_by_model={not_assigned} unexpected={sorted(unexpected)}"
+            )
+        unaccounted_missing = sorted(set(missing) - set(installed))
+        if strict and unaccounted_missing:
+            raise ValueError(
+                f"Restoring the NVFP4 checkpoint left keys unaccounted for. missing={unaccounted_missing}"
             )
 
         logging.info(f"Restored {len(installed)} quantized and {len(plain)} plain weights.")
@@ -510,10 +575,19 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
                 if key in state_dict:
                     attributes[attribute] = state_dict[key]
                     consumed.add(key)
-            if "qdata" not in attributes or "scale" not in attributes:
+            # Exact match against the recorded set where one exists, not just the two mandatory names:
+            # TorchAO restores an absent optional scale as None, and a weight dequantized without its
+            # global scale is wrong by the amax ratio with no error raised anywhere.
+            expected = self._expected_attributes or {"qdata", "scale"}
+            if not expected <= set(attributes):
                 raise ValueError(
-                    f"The config lists '{module_fqn}' as quantized, but its payload is incomplete: found "
-                    f"{sorted(attributes)}."
+                    f"The config lists '{module_fqn}' as quantized with attributes {sorted(expected)}, but its "
+                    f"payload is missing {sorted(expected - set(attributes))}."
+                )
+            if self._expected_attributes and set(attributes) != self._expected_attributes:
+                raise ValueError(
+                    f"'{module_fqn}' carries unrecorded attributes "
+                    f"{sorted(set(attributes) - self._expected_attributes)}."
                 )
             grouped[f"{module_fqn}.weight"] = attributes
 
@@ -542,4 +616,23 @@ class SortformerNVFP4SaveRestoreConnector(SaveRestoreConnector):
                 "Restoring an NVFP4 Sortformer checkpoint requires TorchAO's NVFP4Tensor. Install a TorchAO build "
                 "that provides torchao.prototype.mx_formats.nvfp4_tensor."
             ) from error
+
+        # __tensor_unflatten__ indexes the context by the names the installed class declares, and ignores
+        # any key it does not recognize. So a context written by a different TorchAO either raises a bare
+        # KeyError for a name we never stored, or silently falls back to a class default for a name we did
+        # -- which is the layout-drift hazard this format stores the context explicitly to avoid. The
+        # recorded version string only warns, so the key set is what has to be enforced.
+        expected = set(getattr(NVFP4Tensor, "tensor_attribute_names", ())) | set(
+            getattr(NVFP4Tensor, "optional_tensor_attribute_names", ())
+        )
+        if expected:
+            unknown = sorted(set(context) - expected)
+            absent = sorted(expected - set(context))
+            if unknown or absent:
+                raise ValueError(
+                    "The stored flatten context does not match the installed TorchAO's NVFP4Tensor: "
+                    f"unknown={unknown} absent={absent}. Install the TorchAO version recorded in "
+                    f"{QUANTIZATION_CONFIG_MEMBER}; reconstructing across this difference would change numerics "
+                    "silently."
+                )
         return NVFP4Tensor.__tensor_unflatten__(attributes, context, None, None)

@@ -475,10 +475,12 @@ class TestValidLengthContract:
             fp8_flex_attention(q, k, v, block_mask, lengths)
 
     @pytest.mark.unit
-    def test_out_of_range_lengths_are_rejected(self):
-        q, k, v, block_mask = self._cpu_inputs()
+    def test_out_of_range_lengths_are_rejected_by_the_producer(self):
+        # Asserted on prepare_fp8_flex_valid_lengths rather than on fp8_flex_attention: the value range
+        # needs a device-to-host read, so it is checked once per forward by the producer instead of once
+        # per layer, which on a 31-layer encoder would be 62 synchronizations on the eager hot path.
         with pytest.raises(ValueError, match=r"must lie in \[0, 128\]"):
-            fp8_flex_attention(q, k, v, block_mask, torch.tensor([SEQ_LEN + 1, 41, 7], dtype=torch.int32))
+            prepare_fp8_flex_valid_lengths(torch.tensor([SEQ_LEN + 1, 41, 7], dtype=torch.int64), SEQ_LEN)
 
     @pytest.mark.unit
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")

@@ -522,6 +522,15 @@ class MultiHeadAttention(nn.Module):
         if k_mod is not None:
             k = k_mod
 
+        # Fail rather than quietly run BF16 here: this path has no FP8 branch, and the block mask it
+        # builds is rectangular (num_cur, num_kv), which the FP8 backend rejects anyway. Staying silent
+        # would let attention_backend_info() and the prediction-cache key both report fp8_flex while the
+        # numbers came from the default backend.
+        if self.attention_backend == FP8_FLEX_BACKEND:
+            raise ValueError(
+                f"attention_backend='{FP8_FLEX_BACKEND}' does not support the cache-aware streaming path "
+                "(forward_streaming). Use attention_backend='flex' for cache-aware streaming."
+            )
         attn_fn = flex_attention_compiled if q.is_cuda else flex_attention
         out = attn_fn(q, k, v, block_mask=block_mask, score_mod=score_mod)
         out = out.transpose(1, 2).contiguous().view(B, num_cur, self.d_model)
@@ -712,7 +721,9 @@ class TransformerEncoder(nn.Module):
             dropout_pre_encoder = drop_rate
         attention_backend = validate_attention_backend(attention_backend)
         if attention_backend == FP8_FLEX_BACKEND:
-            validate_fp8_flex_attention_config(attn_mode, self_attention_model)
+            # type(self) is the concrete subclass even here, so a subclass that hides its real attn_mode
+            # from this validation is still caught by the mask-hook check.
+            self._validate_fp8_flex_support(attn_mode, self_attention_model)
 
         cfg = TransformerEncoderConfig(
             feat_in=feat_in,
@@ -822,11 +833,37 @@ class TransformerEncoder(nn.Module):
         """
         backend = validate_attention_backend(backend)
         if backend == FP8_FLEX_BACKEND:
-            validate_fp8_flex_attention_config(self.attn_mode, self.self_attention_model)
+            self._validate_fp8_flex_support(self.attn_mode, self.self_attention_model)
         for layer in self.layers:
             layer.attn.set_attention_backend(backend)
         self.attention_backend = backend
         return backend
+
+    def _validate_fp8_flex_support(self, attn_mode: str, self_attention_model: str) -> None:
+        """
+        Reject an FP8 FlexAttention request this encoder's masking cannot survive.
+
+        ``attn_mode`` alone is not sufficient. The FP8 operator carries only tensors and ints across its
+        ``torch.library.custom_op`` boundary, so it cannot carry the caller's ``mask_mod`` closure and
+        rebuilds it as the key-padding predicate. That substitution is only lossless when the encoder's
+        mask *is* key padding. ``_build_mask_mod`` is the hook a subclass overrides to inject sliding
+        window or chunked-limited masking, and a subclass may also pass ``attn_mode="full"`` to this base
+        before assigning its real mode -- so the hook's identity is the property to test, not the mode.
+
+        Args:
+            attn_mode (str): Encoder attention pattern.
+            self_attention_model (str): Positional-encoding scheme.
+
+        Raises:
+            ValueError: If the mode, the positional scheme, or an overridden mask hook is unsupported.
+        """
+        validate_fp8_flex_attention_config(attn_mode, self_attention_model)
+        if type(self)._build_mask_mod is not TransformerEncoder._build_mask_mod:
+            raise ValueError(
+                f"attention_backend='{FP8_FLEX_BACKEND}' cannot be used with {type(self).__name__}, which "
+                "overrides _build_mask_mod. The FP8 operator rebuilds the mask as key padding only, so any "
+                "other masking term would be silently discarded. Use attention_backend='flex'."
+            )
 
     def forward(self, audio_signal, length, bypass_pre_encode=False):
         """

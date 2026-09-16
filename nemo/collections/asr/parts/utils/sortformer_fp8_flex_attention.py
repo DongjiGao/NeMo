@@ -69,6 +69,9 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 FP8_FLEX_BACKEND = "fp8_flex"
 
 FP8_DTYPE = torch.float8_e4m3fn
+# Largest finite E4M3 magnitude. Inputs are clamped to it because the cast is non-saturating: torch
+# encodes anything at or beyond this as NaN rather than the maximum.
+FP8_MAX = torch.finfo(FP8_DTYPE).max
 # Only the BF16 residual stream this encoder runs inference in is admitted; the cast target is fixed.
 SUPPORTED_INPUT_DTYPES = (torch.bfloat16,)
 # Blackwell families this one implementation targets (SM100/SM103, SM110, SM120).
@@ -291,16 +294,25 @@ def _fp8_flex_attention_boundary(
     Deliberately a dedicated module-level function rather than ``torch.compile(flex_attention)``: Dynamo keys
     its compiled-code cache on the code object of the compiled frame, so wrapping ``flex_attention`` itself
     would share one cache -- and one recompile budget -- with the encoder's default
-    ``flex_attention_compiled`` and every other FlexAttention wrapper in the process. Once that budget is
-    exhausted the frame silently falls back to eager, where ``kernel_options`` (and therefore the mandatory
-    Triton backend selection) is ignored.
+    ``flex_attention_compiled`` and every other FlexAttention wrapper in the process.
+
+    That budget is small and exhausting it is fatal, not a fallback: ``dynamic=False`` specializes on every
+    distinct shape, ``torch._dynamo.config.recompile_limit`` defaults to 8, and under ``fullgraph=True``
+    the ninth distinct shape raises ``FailOnRecompileLimitHit`` rather than dropping to eager. This
+    backend therefore requires the caller to pin the time dimension -- with ``async_pad_to_max=True`` in
+    the streaming path -- and it is why a variable-length run fails partway instead of degrading.
     """
+    # Clamped because the cast is not saturating: torch maps any magnitude at or above the E4M3 limit to
+    # the format's NaN encoding, which would poison the whole attended row and propagate through the
+    # residual stream with nothing to attribute it to. Clamping degrades an overflow to saturation
+    # instead. This is separate from scaling, which this backend deliberately does not do.
     # Q/K row-major: contiguous over ``(B, H, T, D)``.
-    query_fp8 = query.to(FP8_DTYPE).contiguous()
-    key_fp8 = key.to(FP8_DTYPE).contiguous()
+    query_fp8 = query.clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE).contiguous()
+    key_fp8 = key.clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE).contiguous()
     # V in the column-major attention layout the FP8 kernel reads: shape ``(B, H, T, D)`` with stride 1 along
-    # time and stride T along the head dim, built by the usual transpose-contiguous-transpose.
-    value_fp8 = value.to(FP8_DTYPE).transpose(-2, -1).contiguous().transpose(-2, -1)
+    # time and stride T along the head dim, built by the usual transpose-contiguous-transpose. V is the
+    # likeliest to overflow because, unlike Q/K, it never passes through QK-norm.
+    value_fp8 = value.clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE).transpose(-2, -1).contiguous().transpose(-2, -1)
 
     block_mask = BlockMask(
         seq_lengths=(q_len, kv_len),
@@ -331,6 +343,10 @@ def _fp8_flex_attention_boundary(
 # inside this region would drop back to eager and silently discard the backend selection; ``dynamic=False``
 # because this backend is inference-only and measured at one fixed shape. This compile is entered from the
 # custom operator's runtime implementation, i.e. from outside whatever graph the encoder is compiled into.
+#
+# Module level, so one compiled object is shared by every layer and every model in the process. That is
+# intentional -- see the boundary's docstring -- but it means the 8-entry recompile budget is consumed by
+# distinct shapes, and ``fullgraph=True`` makes overflow a hard error. Callers must pin the time dimension.
 _fp8_flex_attention_compiled = torch.compile(_fp8_flex_attention_boundary, fullgraph=True, dynamic=False)
 
 
@@ -535,17 +551,11 @@ def _validate_fp8_flex_valid_lengths(valid_lengths: Optional[torch.Tensor], quer
         raise ValueError("valid_lengths must be contiguous. Use prepare_fp8_flex_valid_lengths().")
     if valid_lengths.device != query.device:
         raise ValueError(f"valid_lengths is on device {valid_lengths.device} but query is on {query.device}.")
-    # A value check needs a device-to-host read, so it is only done in eager mode: under torch.compile it
-    # would be a data-dependent read in the hot path.
-    if not torch.compiler.is_compiling() and valid_lengths.numel() > 0:
-        seq_len = query.shape[-2]
-        minimum = int(valid_lengths.min())
-        maximum = int(valid_lengths.max())
-        if minimum < 0 or maximum > seq_len:
-            raise ValueError(
-                f"valid_lengths values must lie in [0, {seq_len}] (the padded time dimension), got range "
-                f"[{minimum}, {maximum}]."
-            )
+    # The value range is deliberately not re-checked here. It needs a device-to-host read, and this
+    # function runs once per layer, so on a 31-layer encoder it would cost 62 synchronizations per forward
+    # on the eager hot path. prepare_fp8_flex_valid_lengths() is the documented producer and already
+    # performs exactly this check once per forward on the same tensor. The structural checks above are
+    # free and stay, because they catch a caller that bypassed that producer.
 
 
 def _validate_int_pair(value: Any, name: str) -> tuple:

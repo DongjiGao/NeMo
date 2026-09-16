@@ -19,7 +19,7 @@ import time
 from functools import wraps
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 from omegaconf import open_dict
@@ -425,6 +425,37 @@ def get_prediction_cache_metadata(cfg, diar_model, infer_audio_rttm_dict) -> Dic
         "strong_boost_rate": float(modules.strong_boost_rate),
         "weak_boost_rate": float(modules.weak_boost_rate),
         "scores_boost_latest": float(modules.scores_boost_latest),
+        # The encoder execution mode belongs in the key for the same reason the attention backend does:
+        # inductor rewrites the kernels it captures, which shifts predictions. Without these, an eager
+        # arm and a compiled arm sharing one out_preds_tensors would silently report the same numbers --
+        # exactly the backend comparison this cache is used for. Each maps its default to None so keys
+        # written before these fields existed still match.
+        "encoder_execution": _encoder_execution_cache_identity(cfg),
+    }
+
+
+def _encoder_execution_cache_identity(cfg) -> Optional[Dict[str, Any]]:
+    """
+    Describe the encoder execution mode for prediction-cache metadata.
+
+    Args:
+        cfg: Diarization config carrying the compile and CUDA Graph settings.
+
+    Returns:
+        identity (Optional[Dict[str, Any]]): ``None`` for the default uncompiled configuration, so a
+        cache written before these fields were keyed still compares equal; otherwise the settings that
+        change the emitted kernels.
+    """
+    compile_encoder = bool(getattr(cfg, "compile_encoder", False))
+    compile_cuda_graphs = bool(getattr(cfg, "compile_cuda_graphs", False))
+    if not compile_encoder and not compile_cuda_graphs:
+        return None
+    return {
+        "compile_encoder": compile_encoder,
+        "compile_cuda_graphs": compile_cuda_graphs,
+        "compile_dynamic": bool(getattr(cfg, "compile_dynamic", True)),
+        "compile_backend": str(getattr(cfg, "compile_backend", "inductor")),
+        "compile_cuda_graph_max_audio_length": getattr(cfg, "compile_cuda_graph_max_audio_length", None),
     }
 
 
