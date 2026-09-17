@@ -991,6 +991,120 @@ class ParallelExpertEncoder(nn.Module):
             **state["outputs"],
         )
 
+    @contextlib.contextmanager
+    def serve_ctc_timestamps(self, device: torch.device):
+        """Enable timestamp capture for a server, not for a single generation call.
+
+        ``capture_ctc_timestamps`` scopes one batch and keeps a single ``outputs``
+        slot, so a second forward overwrites the first. Under continuous batching
+        the encoder is called repeatedly with interleaved requests, so rows are
+        clobbered before anything consumes them and the nesting guard rejects a
+        concurrent scope outright. This enables capture for the server's lifetime
+        instead and routes rows to per-request storage. Reentrant on purpose.
+
+        Args:
+            device (torch.device): Device to place the cached CTC decoder on.
+        """
+        depth = self.__dict__.get("_ctc_timestamp_serve_depth", 0)
+        if depth == 0:
+            # Warm the cache once here so the first request does not pay the
+            # adapter load, and so a bad path fails at startup, not mid-serve.
+            _get_ctc_timestamp_extractor(self, self.ctc_timestamp_model_path, device)
+        self.__dict__["_ctc_timestamp_serve_depth"] = depth + 1
+        try:
+            yield
+        finally:
+            remaining = self.__dict__.get("_ctc_timestamp_serve_depth", 1) - 1
+            if remaining <= 0:
+                self.__dict__.pop("_ctc_timestamp_serve_depth", None)
+                self.__dict__.pop("_ctc_timestamp_request_store", None)
+            else:
+                self.__dict__["_ctc_timestamp_serve_depth"] = remaining
+
+    @contextlib.contextmanager
+    def ctc_timestamp_request_rows(self, request_ids: Sequence[Optional[str]]):
+        """Declare which request owns each batch row of the next forward.
+
+        The encoder cannot know request identity on its own, so the caller states
+        it for the batch it is about to run. Rows whose id is ``None`` are not
+        stored, which lets a batch mix timestamp and plain requests without
+        paying storage for the latter.
+
+        Args:
+            request_ids (Sequence[Optional[str]]): One id per batch row, in row order.
+        """
+        previous = self.__dict__.get("_ctc_timestamp_row_ids")
+        self.__dict__["_ctc_timestamp_row_ids"] = list(request_ids)
+        try:
+            yield
+        finally:
+            if previous is None:
+                self.__dict__.pop("_ctc_timestamp_row_ids", None)
+            else:
+                self.__dict__["_ctc_timestamp_row_ids"] = previous
+
+    def has_ctc_timestamps(self, request_id: str) -> bool:
+        """Report whether captured rows are waiting for a request.
+
+        Args:
+            request_id (str): Request to check.
+
+        Returns:
+            bool: ``True`` when rows were captured and not yet taken.
+        """
+        return request_id in self.__dict__.get("_ctc_timestamp_request_store", {})
+
+    def take_ctc_timestamps(
+        self,
+        request_id: str,
+        sot_transcripts: Sequence[str],
+        audio_durations: Sequence[float],
+    ) -> List[Dict[str, Any]]:
+        """Align one request's captured rows and release them.
+
+        Args:
+            request_id (str): Request whose rows should be aligned.
+            sot_transcripts (Sequence[str]): Generated t-SOT text for those rows.
+            audio_durations (Sequence[float]): Audio duration per row, in seconds.
+
+        Returns:
+            List[Dict[str, Any]]: Speaker-attributed word timestamps.
+
+        Raises:
+            RuntimeError: If nothing was captured for the request.
+        """
+        store = self.__dict__.get("_ctc_timestamp_request_store", {})
+        outputs = store.pop(request_id, None)
+        if outputs is None:
+            raise RuntimeError(f"No CTC outputs were captured for request {request_id!r}.")
+        # Read the cache directly. Going through _get_ctc_timestamp_extractor would
+        # re-place the CTC decoder on the device of whatever we pass it, and the
+        # stored rows are on CPU, so that would migrate the decoder off the GPU
+        # mid-serve. Alignment needs no decoder anyway; the logits already exist.
+        cached = self.__dict__.get("_ctc_timestamp_extractor_cache")
+        if cached is None:
+            raise RuntimeError("CTC timestamp extractor is not loaded; serving was never enabled.")
+        extractor = cached[1]
+        return extractor.extract_from_outputs_batch(
+            sot_transcripts=sot_transcripts,
+            audio_durations=audio_durations,
+            ctc_log_probs=outputs["ctc_log_probs"],
+            ctc_lengths=outputs["ctc_lengths"],
+            sortformer_sigmoids=outputs["sortformer_sigmoids"],
+            sortformer_lengths=outputs["sortformer_lengths"],
+        )
+
+    def discard_ctc_timestamps(self, request_id: str) -> None:
+        """Drop a request's captured rows without aligning them.
+
+        Needed on abort or client disconnect, since captured rows are held on the
+        encoder until taken and would otherwise leak for the server's lifetime.
+
+        Args:
+            request_id (str): Request whose rows should be released.
+        """
+        self.__dict__.get("_ctc_timestamp_request_store", {}).pop(request_id, None)
+
     def forward(self, audio_signal, length, spk_targets=None):
         """Encode mels and fuse RTTM or Sortformer speaker activity."""
         if spk_targets is not None:
@@ -1187,13 +1301,19 @@ class ParallelExpertEncoder(nn.Module):
             return self.asr_encoder(audio_signal=audio_signal, length=length)
 
     def _ctc_timestamp_decoder(self) -> Optional[nn.Module]:
-        """Return the active timestamp decoder during capture.
+        """Return the active timestamp decoder during capture or serving.
 
         Returns:
-            Optional[nn.Module]: CTC decoder, or ``None`` when capture is inactive.
+            Optional[nn.Module]: CTC decoder, or ``None`` when neither
+            ``capture_ctc_timestamps`` nor ``serve_ctc_timestamps`` is active.
         """
         state = self.__dict__.get("_ctc_timestamp_capture_state")
-        return None if state is None else state["extractor"].ctc_decoder
+        if state is not None:
+            return state["extractor"].ctc_decoder
+        if not self.__dict__.get("_ctc_timestamp_serve_depth"):
+            return None
+        cached = self.__dict__.get("_ctc_timestamp_extractor_cache")
+        return None if cached is None else cached[1].ctc_decoder
 
     def _timestamp_speaker_probs(
         self,
@@ -1240,6 +1360,12 @@ class ParallelExpertEncoder(nn.Module):
             speaker_probs (torch.Tensor): Speaker probabilities shaped ``(B, T, S)``.
             speaker_lengths (torch.Tensor): Valid speaker frame counts shaped ``(B,)``.
         """
+        row_ids = self.__dict__.get("_ctc_timestamp_row_ids")
+        if row_ids is not None:
+            self._store_ctc_timestamp_rows(
+                row_ids, ctc_log_probs, ctc_lengths, speaker_probs, speaker_lengths
+            )
+            return
         state = self.__dict__.get("_ctc_timestamp_capture_state")
         if state is None:
             return
@@ -1249,6 +1375,58 @@ class ParallelExpertEncoder(nn.Module):
             "sortformer_sigmoids": speaker_probs.detach().cpu(),
             "sortformer_lengths": speaker_lengths.detach().cpu(),
         }
+
+    def _store_ctc_timestamp_rows(
+        self,
+        row_ids: Sequence[Optional[str]],
+        ctc_log_probs: torch.Tensor,
+        ctc_lengths: torch.Tensor,
+        speaker_probs: torch.Tensor,
+        speaker_lengths: torch.Tensor,
+    ) -> None:
+        """Split a batch into per-request entries keyed by request id.
+
+        Rows are appended rather than assigned, so a request whose audio spans
+        several forwards accumulates its rows instead of losing all but the last.
+
+        Args:
+            row_ids (Sequence[Optional[str]]): Request id per batch row; ``None`` skips the row.
+            ctc_log_probs (torch.Tensor): CTC log probabilities shaped ``(B, T, V)``.
+            ctc_lengths (torch.Tensor): Valid CTC frame counts shaped ``(B,)``.
+            speaker_probs (torch.Tensor): Speaker probabilities shaped ``(B, T, S)``.
+            speaker_lengths (torch.Tensor): Valid speaker frame counts shaped ``(B,)``.
+
+        Raises:
+            ValueError: If the declared row mapping does not match the batch size.
+        """
+        batch = ctc_log_probs.shape[0]
+        if len(row_ids) != batch:
+            raise ValueError(
+                f"ctc_timestamp_request_rows declared {len(row_ids)} rows but the batch has {batch}."
+            )
+        store = self.__dict__.setdefault("_ctc_timestamp_request_store", {})
+        # Detach to CPU per row: (T, V) at V=32769 is large, and holding it on the
+        # device would charge every in-flight request against the KV cache budget.
+        log_probs = ctc_log_probs.detach().cpu()
+        ctc_lens = ctc_lengths.detach().cpu()
+        sigmoids = speaker_probs.detach().cpu()
+        spk_lens = speaker_lengths.detach().cpu()
+        for row, request_id in enumerate(row_ids):
+            if request_id is None:
+                continue
+            existing = store.get(request_id)
+            entry = {
+                "ctc_log_probs": log_probs[row : row + 1],
+                "ctc_lengths": ctc_lens[row : row + 1],
+                "sortformer_sigmoids": sigmoids[row : row + 1],
+                "sortformer_lengths": spk_lens[row : row + 1],
+            }
+            if existing is None:
+                store[request_id] = entry
+            else:
+                store[request_id] = {
+                    key: torch.cat([existing[key], entry[key]], dim=0) for key in entry
+                }
 
     def _forward(self, audio_signal, length, spk_targets=None):
         """Single-pass forward used by training and validation."""
