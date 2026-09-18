@@ -32,6 +32,7 @@ Requires NeMo toolkit for the audio encoder:
     pip install 'nemo-toolkit[asr]'
 """
 
+import contextlib
 from collections.abc import Iterable
 from typing import Any
 
@@ -65,6 +66,7 @@ from nemo.collections.speechlm2.vllm.salm.audio import (
 )
 from nemo.collections.speechlm2.vllm.salm.backends import HybridBackend, make_backend
 from nemo.collections.speechlm2.vllm.salm.config import _AUDIO_PLACEHOLDER
+from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import pending_row_ids
 
 _AUDIO_INPUT_DTYPE = torch.float32
 _PERCEPTION_DTYPE = torch.bfloat16
@@ -202,7 +204,18 @@ class NeMoSpeechLMForConditionalGeneration(
         # inference over the full audio, so it bypasses the chunking helper.
         with torch.no_grad():
             if self._uses_pe_encoder:
-                with self.perception.encoder.online_inference():
+                encoder = self.perception.encoder
+                # Declare one placeholder id per item so the CTC capture is keyed
+                # rather than landing in a single slot that the next encoder call
+                # overwrites. The real mm_hash is not available here -- vLLM passes
+                # only tensors -- so ctc_timestamps renames these once the runner
+                # announces each (mm_hash, output) pair.
+                rows = contextlib.nullcontext()
+                if encoder.__dict__.get("_ctc_timestamp_serve_depth"):
+                    rows = encoder.ctc_timestamp_request_rows(
+                        pending_row_ids(audio_signal.shape[0])
+                    )
+                with rows, encoder.online_inference():
                     audio_embs, audio_emb_lens = self.perception(
                         input_signal=audio_signal, input_signal_length=audio_lengths
                     )
