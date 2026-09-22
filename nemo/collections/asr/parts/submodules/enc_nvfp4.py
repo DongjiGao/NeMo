@@ -7,8 +7,13 @@ BF16, which is *slower* than BF16), and torchao's NVFP4 path needs the external
 MSLK package. vLLM's CUTLASS FP4 kernels are already installed and already serve
 the quantized decoder, so we call them directly.
 
-Measured at encoder shapes (M=4107): 2.0-2.8x over BF16 per GEMM, versus
-0.34-1.11x for torchao FP8 and 0.73-0.89x for ModelOpt's simulated path.
+The FP4 GEMM alone measured 2.0-2.8x over BF16 at M=4107 tokens, versus
+0.34-1.11x for torchao FP8 and 0.73-0.89x for ModelOpt's simulated path. That is
+not what a full layer costs at serving batch sizes: a typical encoder call is only
+~1-2.5k tokens (median ~1.7k), and there NVFP4Linear -- activation quantize, GEMM,
+and a separate bias pass, since the FP4 GEMM has no bias epilogue -- runs about 5%
+behind FP8Linear at ~1-1.5k tokens and pulls ahead only from ~2k up (27% faster
+at 3k).
 
 Activation scaling is dynamic by default: each forward computes its own global
 scale via an amax reduction. Set static_scales=True after calibration to skip
@@ -84,8 +89,13 @@ class NVFP4Linear(nn.Module):
         self.register_buffer("weight_global_scale", w_gs, persistent=False)
         if static_input_scale is not None:
             self.register_buffer("input_global_scale", static_input_scale.reshape(1), persistent=False)
+            # With both global scales fixed the GEMM's dequant factor is a constant.
+            # Recomputing it per forward costs two kernel launches per layer, which
+            # at the encoder's ~1-2k tokens per call is a measurable share of it.
+            self.register_buffer("alpha", 1.0 / (self.input_global_scale * w_gs), persistent=False)
         else:
             self.input_global_scale = None
+            self.alpha = None
 
         self.bias = None
         if linear.bias is not None:
@@ -97,13 +107,14 @@ class NVFP4Linear(nn.Module):
         x2d = x.reshape(-1, self.in_features)
 
         x_gs = self.input_global_scale
+        alpha = self.alpha
         if x_gs is None:
             x_gs = _global_scale(x2d.abs().max())
+            # CUTLASS applies a single fused dequant factor, so both global scales
+            # are folded into alpha rather than rescaling the output afterwards.
+            alpha = 1.0 / (x_gs * self.weight_global_scale)
 
         xq, x_sf = ops.scaled_fp4_quant(x2d, x_gs)
-        # CUTLASS applies a single fused dequant factor, so both global scales
-        # are folded into alpha rather than rescaling the output afterwards.
-        alpha = 1.0 / (x_gs * self.weight_global_scale)
         out = ops.cutlass_scaled_fp4_mm(xq, self.weight_packed, x_sf, self.weight_scale, alpha, x.dtype)
         if self.bias is not None:
             out = out + self.bias
