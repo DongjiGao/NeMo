@@ -33,8 +33,8 @@ Requires NeMo toolkit for the audio encoder:
 """
 
 import contextlib
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Iterable, Mapping
+from typing import Any, ClassVar, Literal
 
 import torch
 from torch import nn
@@ -45,11 +45,14 @@ from vllm.model_executor.models.interfaces import (
     SupportsMambaPrefixCaching,
     SupportsMultiModal,
     SupportsPP,
+    SupportsTranscription,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import AutoWeightsLoader, init_vllm_registered_model, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
+
+from nemo.utils import logging
 
 from nemo.collections.speechlm2.parts.encoder_chunking import encode_audio_with_optional_chunking
 from nemo.collections.speechlm2.vllm.salm.audio import (
@@ -66,10 +69,53 @@ from nemo.collections.speechlm2.vllm.salm.audio import (
 )
 from nemo.collections.speechlm2.vllm.salm.backends import HybridBackend, make_backend
 from nemo.collections.speechlm2.vllm.salm.config import _AUDIO_PLACEHOLDER
-from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import pending_row_ids
+from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
+    align_request,
+    pending_row_ids,
+    register_encoder,
+)
 
 _AUDIO_INPUT_DTYPE = torch.float32
 _PERCEPTION_DTYPE = torch.bfloat16
+
+# The prompt the reported ASR-leaderboard numbers were measured with. Serving has
+# to render the same one or its WER will not match the published figures: the
+# "Omit accidental repetitions" clause is what suppresses runaway decoding, and
+# dropping the /no_think system turn lets the model emit reasoning instead of a
+# transcript.
+_TRANSCRIBE_PROMPT = (
+    "Produce a verbatim transcript of the audio. Preserve named entities, "
+    "abbreviations, numbers, dates, measurements, acronyms, and technical terms "
+    "as clearly as possible. Keep the same language as spoken and do not "
+    "translate. Omit accidental repetitions."
+)
+
+# runtime_compat enforces locator placement for the chat path: text, one ASCII
+# space, then a final <|audio|>. get_generation_prompt bypasses chat rendering,
+# so it has to reproduce that layout itself or the two entry points would
+# disagree on the prompt for the same model.
+_AUDIO_LAST = True
+
+# Nemotron Speech is English-first. Declaring only what we have measured keeps
+# validate_language from silently promising languages we have not evaluated;
+# other codes still pass with a warning through get_other_languages.
+_SUPPORTED_LANGUAGES: Mapping[str, str] = {"en": "english"}
+
+# Our timestamps come from CTC alignment rather than the token stream, so the
+# serving layer has to hand the model hooks a RequestOutput to correlate against.
+# That plumbing is an upstream addition; against a stock vLLM the hooks are
+# either never called or called without it, and the request would fail deep in
+# response assembly with a misleading "did not contain a valid diarized
+# transcript". Advertising the capability only when the plumbing exists turns
+# that into a clean, up-front "not supported for this model" instead.
+try:  # pragma: no cover - depends on the installed vLLM
+    from vllm.model_executor.models.interfaces import (
+        SupportsTranscription as _SupportsTranscriptionProto,
+    )
+
+    _TIMESTAMP_PLUMBING = hasattr(_SupportsTranscriptionProto, "get_word_timestamps")
+except Exception:  # noqa: BLE001
+    _TIMESTAMP_PLUMBING = False
 
 
 def _is_parallel_expert_encoder(module: nn.Module) -> bool:
@@ -90,8 +136,144 @@ class NeMoSpeechLMForConditionalGeneration(
     SupportsPP,
     IsHybrid,
     SupportsMambaPrefixCaching,
+    SupportsTranscription,
 ):
     """Backbone-agnostic NeMo SpeechLM. Composition with a backend handles per-backbone details."""
+
+    supported_languages: ClassVar[Mapping[str, str]] = _SUPPORTED_LANGUAGES
+    supports_transcription: ClassVar[Literal[True]] = True
+
+    # Timings come from CTC forced alignment over encoder frames rather than from
+    # timestamp tokens, so segment-timestamp parsing stays off: the server would
+    # otherwise try to read timestamps out of the decoded token stream, where
+    # this model emits none.
+    supports_segment_timestamp: ClassVar[bool] = False
+    supports_word_timestamp: ClassVar[bool] = _TIMESTAMP_PLUMBING
+    supports_diarized_transcription: ClassVar[bool] = _TIMESTAMP_PLUMBING
+
+    @classmethod
+    def get_speech_to_text_config(
+        cls, model_config: Any, task_type: Literal["transcribe", "translate"]
+    ) -> Any:
+        """Describe audio handling for the /v1/audio/transcriptions endpoint.
+
+        Chunking is disabled: a ParallelExpertEncoder runs its own
+        context-preserving window over the full audio, and letting the endpoint
+        pre-split would both duplicate that and fragment the CTC frame grid the
+        timestamps are derived from.
+        """
+        from vllm.config import SpeechToTextConfig
+
+        return SpeechToTextConfig(
+            sample_rate=_SAMPLING_RATE,
+            max_audio_clip_s=None,
+            min_energy_split_window_size=None,
+        )
+
+    @classmethod
+    def get_generation_prompt(cls, stt_params: Any) -> Any:
+        """Render the measured transcription prompt for one audio chunk.
+
+        Returns a text prompt rather than token ids on purpose: the multimodal
+        processor splits on ``<|audio|>`` and expands each locator into the
+        estimated audio-token count, so pre-tokenizing here would skip that
+        expansion and the embedding merge would not line up.
+        """
+        from vllm.transformers_utils.tokenizer import cached_tokenizer_from_config
+
+        task_type = getattr(stt_params, "task_type", "transcribe")
+        if task_type != "transcribe":
+            raise ValueError(f"NeMo SpeechLM supports transcription only, got task_type={task_type!r}.")
+
+        text = _TRANSCRIBE_PROMPT
+        content = f"{text} {_AUDIO_PLACEHOLDER}" if _AUDIO_LAST else f"{_AUDIO_PLACEHOLDER}\n{text}"
+
+        tokenizer = cached_tokenizer_from_config(stt_params.model_config)
+        try:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": content}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            # Older templates do not accept enable_thinking; the /no_think
+            # directive in the prompt text is the fallback guard.
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": content}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+        return {"prompt": prompt, "multi_modal_data": {"audio": stt_params.audio}}
+
+    @classmethod
+    def get_word_timestamps(cls, text: str, request_output: Any = None) -> Any:
+        """Return per-word timings for a finished transcription.
+
+        Returns ``None`` rather than an empty list when nothing was captured, so
+        the response omits ``words`` instead of asserting the audio had none.
+        """
+        from vllm.entrypoints.speech_to_text.transcription.protocol import (
+            TranscriptionWord,
+        )
+
+        words = cls._aligned_words(text, request_output)
+        if not words:
+            return None
+        return [
+            TranscriptionWord(word=word["word"], start=word["start"], end=word["end"])
+            for word in words
+        ]
+
+    @classmethod
+    def parse_diarized_transcript(cls, text: str, request_output: Any = None) -> Any:
+        """Group aligned words into speaker-attributed segments.
+
+        The speaker labels come from the model's own ``<spk:N>`` t-SOT tags, while
+        the boundaries come from CTC alignment, so a segment closes whenever the
+        speaker changes rather than on punctuation or silence.
+        """
+        from vllm.model_executor.models.interfaces import DiarizedTranscriptionSegment
+
+        words = cls._aligned_words(text, request_output)
+        if not words:
+            return []
+
+        segments: list[DiarizedTranscriptionSegment] = []
+        run: list[dict] = []
+
+        def flush() -> None:
+            if not run:
+                return
+            segments.append(
+                DiarizedTranscriptionSegment(
+                    start=run[0]["start"],
+                    end=run[-1]["end"],
+                    speaker=run[0]["speaker"],
+                    text=" ".join(word["word"] for word in run).strip(),
+                )
+            )
+
+        for word in words:
+            if run and word["speaker"] != run[0]["speaker"]:
+                flush()
+                run = []
+            run.append(word)
+        flush()
+        return segments
+
+    @classmethod
+    def _aligned_words(cls, text: str, request_output: Any) -> list[dict]:
+        """Align a request's captured rows.
+
+        Consumes the rows, which is safe because the two hooks are reached from
+        mutually exclusive response-format branches: a response is either
+        ``diarized_json`` or ``verbose_json``, never both.
+        """
+        if request_output is None or not getattr(request_output, "request_id", None):
+            return []
+        return align_request(request_output.request_id, text)
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -155,7 +337,40 @@ class NeMoSpeechLMForConditionalGeneration(
             # this run before weights are loaded.
             _apply_encoder_quantization(self.perception, getattr(config, "encoder_quantization", None))
 
+        self._maybe_enable_ctc_timestamps(getattr(config, "ctc_timestamps", None))
+
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
+
+    def _maybe_enable_ctc_timestamps(self, ctc_config: Any) -> None:
+        """Arm CTC timestamp capture when the checkpoint ships an adapter path.
+
+        Driven by a ``ctc_timestamps`` block in the checkpoint config, mirroring
+        how ``encoder_quantization`` travels, so serving needs no extra flags.
+        Off unless configured: capture costs throughput and retains rows, so a
+        deployment that does not want timestamps should not pay for them.
+        """
+        if not self._uses_pe_encoder or not ctc_config:
+            return
+        adapter_path = (
+            ctc_config.get("adapter_path") if isinstance(ctc_config, dict) else getattr(ctc_config, "adapter_path", None)
+        )
+        if not adapter_path:
+            return
+
+        from nemo.collections.asr.modules.parallel_expert_encoder import _get_ctc_timestamp_extractor
+        from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import install_encoder_cache_binding
+
+        encoder = self.perception.encoder
+        encoder.ctc_timestamp_model_path = adapter_path
+        device = next(encoder.parameters()).device
+        # Load now rather than on the first timestamped request: a bad path
+        # should fail at startup, not mid-serve, and the adapter is ~2.7 GB.
+        _get_ctc_timestamp_extractor(encoder, adapter_path, device)
+        encoder.__dict__["_ctc_timestamp_serve_depth"] = 1
+
+        register_encoder(lambda: self.perception.encoder)
+        install_encoder_cache_binding(lambda: self.perception.encoder)
+        logging.info("[NeMoSpeechLM] CTC timestamps enabled from checkpoint config: %s", adapter_path)
 
     # ── audio processing ──
 
