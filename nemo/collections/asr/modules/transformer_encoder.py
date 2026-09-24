@@ -132,6 +132,41 @@ if _ENC_PROF_PATH:
     atexit.register(_enc_prof_write)
 
 
+def _enc_prof_begin(tensor: torch.Tensor):
+    """Open one per-call record if ``NEMO_ENC_PROF`` is set; returns a handle or None."""
+    if not (_ENC_PROF_PATH and tensor.is_cuda):
+        return None
+    import time as _time
+
+    wall = _time.time()
+    start = torch.cuda.Event(enable_timing=True)
+    start.record()
+    return wall, start
+
+
+def _enc_prof_end(handle, batch: int, seq_len: int, length: torch.Tensor) -> None:
+    """Close a record opened by ``_enc_prof_begin``."""
+    if handle is None:
+        return
+    global _enc_prof_valid_buf, _enc_prof_slot
+    wall, start = handle
+    end_ev = torch.cuda.Event(enable_timing=True)
+    end_ev.record()
+    slot = -1
+    if _enc_prof_slot < _ENC_PROF_CAP:
+        if _enc_prof_valid_buf is None:
+            _enc_prof_valid_buf = torch.zeros(_ENC_PROF_CAP, dtype=torch.int64, device=length.device)
+        slot = _enc_prof_slot
+        _enc_prof_valid_buf[slot] = length.sum()
+        _enc_prof_slot += 1
+    _enc_prof_pending.append((wall, start, end_ev, batch, seq_len, slot))
+    _enc_prof_drain()
+    # Checkpoint every 500 calls. The blocking drain inside costs one
+    # stream sync, which is negligible amortized over that many calls.
+    if _enc_prof_slot % 500 == 0:
+        _enc_prof_write()
+
+
 @dataclass
 class TransformerEncoderConfig:
     """Configuration for ``TransformerEncoder`` and its sub-blocks.
@@ -1057,9 +1092,12 @@ class TransformerEncoder(nn.Module):
         if not getattr(self, "_enc_packed_announced", False):
             self._enc_packed_announced = True
             logging.info("ASR encoder running sequence-packed (NEMO_ENC_PACKED=1)")
+        prof = _enc_prof_begin(audio_signal)
         packed = self.forward_sequence_packed(audio_signal, length, fused_qkv=True)
         x = unpack_encoder_output(packed, total_length=packed.padded_length).transpose(1, 2)
-        return x, packed.lengths.to(torch.int64)
+        length = packed.lengths.to(torch.int64)
+        _enc_prof_end(prof, x.shape[0], x.shape[2], length)
+        return x, length
 
     def _maybe_quantize(self) -> None:
         """Swap encoder Linears for a low-precision implementation, once.
@@ -1211,13 +1249,7 @@ class TransformerEncoder(nn.Module):
         ):
             self._maybe_quantize()
 
-        prof_start = None
-        if _ENC_PROF_PATH and audio_signal.is_cuda:
-            import time as _time
-
-            prof_wall = _time.time()
-            prof_start = torch.cuda.Event(enable_timing=True)
-            prof_start.record()
+        prof = _enc_prof_begin(audio_signal)
 
         if length is None:
             length = audio_signal.new_full(
@@ -1272,25 +1304,7 @@ class TransformerEncoder(nn.Module):
             x = self.out_proj(x)
         x = x.transpose(1, 2)  # (B, T, D) -> (B, D, T)
         length = length.to(dtype=torch.int64)
-
-        if prof_start is not None:
-            global _enc_prof_valid_buf, _enc_prof_slot
-            end_ev = torch.cuda.Event(enable_timing=True)
-            end_ev.record()
-            slot = -1
-            if _enc_prof_slot < _ENC_PROF_CAP:
-                if _enc_prof_valid_buf is None:
-                    _enc_prof_valid_buf = torch.zeros(_ENC_PROF_CAP, dtype=torch.int64, device=length.device)
-                slot = _enc_prof_slot
-                _enc_prof_valid_buf[slot] = length.sum()
-                _enc_prof_slot += 1
-            _enc_prof_pending.append((prof_wall, prof_start, end_ev, B, T, slot))
-            _enc_prof_drain()
-            # Checkpoint every 500 calls. The blocking drain inside costs one
-            # stream sync, which is negligible amortized over that many calls.
-            if _enc_prof_slot % 500 == 0:
-                _enc_prof_write()
-
+        _enc_prof_end(prof, B, T, length)
         return x, length
 
     def _build_mask_mod(self, length):
