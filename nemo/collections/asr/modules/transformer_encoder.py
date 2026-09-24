@@ -73,7 +73,9 @@ _ENC_QUANT_ELIGIBLE = {"asr": {"asr"}, "diar": {"diar"}, "both": {"asr", "diar"}
 _ENC_PACKED = os.environ.get("NEMO_ENC_PACKED", "0").lower() in ("1", "true", "yes")
 # Which branch(es) NEMO_ENC_PACKED reroutes, with NEMO_ENC_QUANT_BRANCH's values:
 # "asr" (default), "diar" or "both". The diarizer's calls come from Sortformer's
-# streaming step with pre-encoded input ([speaker cache | FIFO | chunk]).
+# streaming step with pre-encoded input ([speaker cache | FIFO | chunk]). Serving
+# keeps "asr": ParallelExpertEncoder thresholds the diarizer's speaker probabilities
+# at 0.5, so even rounding-level changes to the diarizer can flip speaker labels.
 _ENC_PACKED_BRANCH = os.environ.get("NEMO_ENC_PACKED_BRANCH", "asr").lower()
 # Opt-in on top of NEMO_ENC_PACKED's flat varlen path: replay the layer stack from
 # CUDA graphs, one per token budget (see _FlatVarlenGraphs). Calls with more tokens,
