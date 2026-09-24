@@ -1089,15 +1089,64 @@ class TransformerEncoder(nn.Module):
         """
         if (_ENC_QUANT or getattr(self, "_enc_quant_cfg", None)) and not getattr(self, "_enc_quant_done", False):
             self._maybe_quantize()
+        flat = self.self_attention_model != "rel_pos" and _can_use_flash_attention_varlen_layout(
+            audio_signal, self.d_model // self.n_heads
+        )
         if not getattr(self, "_enc_packed_announced", False):
             self._enc_packed_announced = True
-            logging.info("ASR encoder running sequence-packed (NEMO_ENC_PACKED=1)")
+            variant = "flat varlen, sync-free" if flat else "compacting"
+            logging.info(f"ASR encoder running sequence-packed ({variant}; NEMO_ENC_PACKED=1)")
         prof = _enc_prof_begin(audio_signal)
-        packed = self.forward_sequence_packed(audio_signal, length, fused_qkv=True)
-        x = unpack_encoder_output(packed, total_length=packed.padded_length).transpose(1, 2)
-        length = packed.lengths.to(torch.int64)
+        if flat:
+            x, length = self._forward_flat_varlen(audio_signal, length)
+        else:
+            packed = self.forward_sequence_packed(audio_signal, length, fused_qkv=True)
+            x = unpack_encoder_output(packed, total_length=packed.padded_length).transpose(1, 2)
+            length = packed.lengths.to(torch.int64)
         _enc_prof_end(prof, x.shape[0], x.shape[2], length)
         return x, length
+
+    def _forward_flat_varlen(self, audio_signal, length):
+        """Encode token-flat while keeping every frame, so no step needs a host sync.
+
+        Compacting (``pack_encoder_output``) sizes its output from the lengths, which
+        forces a device-to-host copy and boolean-mask indexing on every call. Here each
+        item is instead a real segment of ``length[i]`` frames followed by a filler
+        segment holding its padding: the boundaries have a fixed shape (2B + 1) and are
+        built on the device, ``max_seqlen`` is the padded length the host already knows,
+        and packing and unpacking are reshapes. Filler segments attend only among
+        themselves and are zeroed on the way out.
+        """
+        x, length, _ = self._prepare_sequence_packed_input(audio_signal, length, False)
+        B, T, D = x.shape
+        seg = torch.stack((length, T - length), dim=1).reshape(-1)
+        cu = torch.zeros(2 * B + 1, dtype=torch.int32, device=x.device)
+        cu[1:] = torch.cumsum(seg, 0)
+        position_ids = None
+        if self.self_attention_model == "rope":
+            cu64 = cu.to(torch.int64)
+            token = torch.arange(B * T, device=x.device, dtype=torch.int64)
+            position_ids = token - cu64[torch.bucketize(token, cu64[1:], right=True)]
+        h = x.reshape(B * T, D)
+        for layer in self.layers:
+            h = _forward_sequence_packed_layer(
+                layer,
+                h,
+                lengths=seg,
+                cu_seqlens=cu,
+                max_seqlen=T,
+                position_ids=position_ids,
+                pos_emb=None,
+                padded_length=T,
+                causal=self.attn_mode == "causal",
+                sequence_offsets=None,
+                fused_qkv=True,
+            )
+        h = self.final_norm(h)
+        if self.out_proj is not None:
+            h = self.out_proj(h)
+        valid = torch.arange(T, device=x.device) < length[:, None]
+        return (h.reshape(B, T, -1) * valid.unsqueeze(-1)).transpose(1, 2), length
 
     def _maybe_quantize(self) -> None:
         """Swap encoder Linears for a low-precision implementation, once.
