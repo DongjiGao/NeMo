@@ -32,6 +32,7 @@ from nemo.collections.asr.parts.packed_sequence import (
     PackedEncoderActivations,
     pack_encoder_output,
     packed_encoder_position_ids,
+    unpack_encoder_output,
 )
 from nemo.collections.asr.parts.submodules.multi_head_attention import (
     PositionalEncoding,
@@ -64,6 +65,10 @@ _ENC_QUANT = os.environ.get("NEMO_ENC_QUANT")
 # checkpoint-resident recipe is only ever attached to the ASR branch.
 _ENC_QUANT_BRANCH = os.environ.get("NEMO_ENC_QUANT_BRANCH", "asr").lower()
 _ENC_QUANT_ELIGIBLE = {"asr": {"asr"}, "diar": {"diar"}, "both": {"asr", "diar"}}
+# Opt-in: route the ASR-tagged encoder's forward through forward_sequence_packed and
+# return the usual padded contract. Only the branch tagged _enc_quant_is_asr is
+# affected; the diarizer is the same class and keeps the padded path.
+_ENC_PACKED = os.environ.get("NEMO_ENC_PACKED", "0").lower() in ("1", "true", "yes")
 # Per-call records are kept rather than a running total because the first call
 # pays flex_attention's torch.compile cost, and vLLM's startup memory profiling
 # also invokes the encoder on dummy audio. Wall-clock stamps let those be
@@ -1030,7 +1035,31 @@ class TransformerEncoder(nn.Module):
             self.update_max_seq_length(seq_length=audio_signal.size(1), device=audio_signal.device)
         else:
             self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
+        if (
+            _ENC_PACKED
+            and not bypass_pre_encode
+            and audio_signal.is_cuda
+            and getattr(self, "_enc_quant_is_asr", False)
+        ):
+            return self._forward_packed_as_padded(audio_signal, length)
         return self.forward_internal(audio_signal, length, bypass_pre_encode=bypass_pre_encode)
+
+    def _forward_packed_as_padded(self, audio_signal, length):
+        """Run the encoder token-flat and return the padded ``forward`` contract.
+
+        This bypasses ``forward_internal``, so the lazy quantization hook is applied
+        here. Quantized Linears require the fused QKV projection: the unfused path
+        slices ``w_qkv.weight``, which FP8Linear and NVFP4Linear do not have.
+        Positions past each sequence's length come back as zeros.
+        """
+        if (_ENC_QUANT or getattr(self, "_enc_quant_cfg", None)) and not getattr(self, "_enc_quant_done", False):
+            self._maybe_quantize()
+        if not getattr(self, "_enc_packed_announced", False):
+            self._enc_packed_announced = True
+            logging.info("ASR encoder running sequence-packed (NEMO_ENC_PACKED=1)")
+        packed = self.forward_sequence_packed(audio_signal, length, fused_qkv=True)
+        x = unpack_encoder_output(packed, total_length=packed.padded_length).transpose(1, 2)
+        return x, packed.lengths.to(torch.int64)
 
     def _maybe_quantize(self) -> None:
         """Swap encoder Linears for a low-precision implementation, once.
