@@ -17,6 +17,7 @@ import json
 import math
 import os
 import random
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Sequence
@@ -69,6 +70,14 @@ _ENC_QUANT_ELIGIBLE = {"asr": {"asr"}, "diar": {"diar"}, "both": {"asr", "diar"}
 # return the usual padded contract. Only the branch tagged _enc_quant_is_asr is
 # affected; the diarizer is the same class and keeps the padded path.
 _ENC_PACKED = os.environ.get("NEMO_ENC_PACKED", "0").lower() in ("1", "true", "yes")
+# Opt-in on top of NEMO_ENC_PACKED's flat varlen path: replay the layer stack from
+# CUDA graphs, one per token budget (see _FlatVarlenGraphs). Calls with more tokens,
+# more items, or a longer item than the graphs were captured for run eager.
+_ENC_CUDAGRAPH = os.environ.get("NEMO_ENC_CUDAGRAPH", "0").lower() in ("1", "true", "yes")
+_ENC_CUDAGRAPH_MAX_TOKENS = int(os.environ.get("NEMO_ENC_CUDAGRAPH_MAX_TOKENS", "4096"))
+_ENC_CUDAGRAPH_STEP = int(os.environ.get("NEMO_ENC_CUDAGRAPH_STEP", "128"))
+_ENC_CUDAGRAPH_MAX_ITEMS = int(os.environ.get("NEMO_ENC_CUDAGRAPH_MAX_ITEMS", "64"))
+_ENC_CUDAGRAPH_MAX_SEQLEN = int(os.environ.get("NEMO_ENC_CUDAGRAPH_MAX_SEQLEN", "512"))
 # Per-call records are kept rather than a running total because the first call
 # pays flex_attention's torch.compile cost, and vLLM's startup memory profiling
 # also invokes the encoder on dummy audio. Wall-clock stamps let those be
@@ -1094,7 +1103,9 @@ class TransformerEncoder(nn.Module):
         )
         if not getattr(self, "_enc_packed_announced", False):
             self._enc_packed_announced = True
-            variant = "flat varlen, sync-free" if flat else "compacting"
+            variant = "compacting"
+            if flat:
+                variant = "flat varlen, sync-free, CUDA graphs" if _ENC_CUDAGRAPH else "flat varlen, sync-free"
             logging.info(f"ASR encoder running sequence-packed ({variant}; NEMO_ENC_PACKED=1)")
         prof = _enc_prof_begin(audio_signal)
         if flat:
@@ -1114,30 +1125,40 @@ class TransformerEncoder(nn.Module):
         item is instead a real segment of ``length[i]`` frames followed by a filler
         segment holding its padding: the boundaries have a fixed shape (2B + 1) and are
         built on the device, ``max_seqlen`` is the padded length the host already knows,
-        and packing and unpacking are reshapes. Filler segments attend only among
+        and packing         and unpacking are reshapes. Filler segments attend only among
         themselves and are zeroed on the way out.
+
+        With ``NEMO_ENC_CUDAGRAPH`` the layer stack replays from a CUDA graph
+        whenever the call fits one.
         """
         x, length, _ = self._prepare_sequence_packed_input(audio_signal, length, False)
         B, T, D = x.shape
-        seg = torch.stack((length, T - length), dim=1).reshape(-1)
-        cu = torch.zeros(2 * B + 1, dtype=torch.int32, device=x.device)
-        cu[1:] = torch.cumsum(seg, 0)
+        h = self._flat_varlen_graphs().run(x, length) if _ENC_CUDAGRAPH else None
+        if h is None:
+            seg = torch.stack((length, T - length), dim=1).reshape(-1)
+            cu = torch.zeros(2 * B + 1, dtype=torch.int32, device=x.device)
+            cu[1:] = torch.cumsum(seg, 0)
+            h = self._flat_varlen_stack(x.reshape(B * T, D), seg, cu, max_seqlen=T)
+        valid = torch.arange(T, device=x.device) < length[:, None]
+        return (h.reshape(B, T, -1) * valid.unsqueeze(-1)).transpose(1, 2), length
+
+    def _flat_varlen_stack(self, h, seg, cu, max_seqlen):
+        """Layers, final norm and projection over token-flat ``h`` split into segments by ``cu``."""
         position_ids = None
         if self.self_attention_model == "rope":
             cu64 = cu.to(torch.int64)
-            token = torch.arange(B * T, device=x.device, dtype=torch.int64)
+            token = torch.arange(h.shape[0], device=h.device, dtype=torch.int64)
             position_ids = token - cu64[torch.bucketize(token, cu64[1:], right=True)]
-        h = x.reshape(B * T, D)
         for layer in self.layers:
             h = _forward_sequence_packed_layer(
                 layer,
                 h,
                 lengths=seg,
                 cu_seqlens=cu,
-                max_seqlen=T,
+                max_seqlen=max_seqlen,
                 position_ids=position_ids,
                 pos_emb=None,
-                padded_length=T,
+                padded_length=max_seqlen,
                 causal=self.attn_mode == "causal",
                 sequence_offsets=None,
                 fused_qkv=True,
@@ -1145,8 +1166,20 @@ class TransformerEncoder(nn.Module):
         h = self.final_norm(h)
         if self.out_proj is not None:
             h = self.out_proj(h)
-        valid = torch.arange(T, device=x.device) < length[:, None]
-        return (h.reshape(B, T, -1) * valid.unsqueeze(-1)).transpose(1, 2), length
+        return h
+
+    def _flat_varlen_graphs(self) -> "_FlatVarlenGraphs":
+        graphs = getattr(self, "_flat_graphs", None)
+        if graphs is None:
+            graphs = _FlatVarlenGraphs(
+                self,
+                max_tokens=_ENC_CUDAGRAPH_MAX_TOKENS,
+                step=_ENC_CUDAGRAPH_STEP,
+                max_items=_ENC_CUDAGRAPH_MAX_ITEMS,
+                max_seqlen=_ENC_CUDAGRAPH_MAX_SEQLEN,
+            )
+            self._flat_graphs = graphs
+        return graphs
 
     def _maybe_quantize(self) -> None:
         """Swap encoder Linears for a low-precision implementation, once.
@@ -2224,3 +2257,101 @@ def _forward_sequence_packed_layer(layer, x, **kwargs):
             f"Activation-checkpoint wrapper around {type(wrapped).__name__} cannot execute sequence-packed layers."
         )
     return checkpoint_fn(packed_forward, x, **kwargs)
+
+
+class _FlatVarlenGraphs:
+    """CUDA graphs of ``TransformerEncoder._flat_varlen_stack``, one per token budget.
+
+    Small encoder calls are launch-bound: the stack is about a thousand kernels, and
+    launching them costs the CPU ~10 ms however few tokens a call carries, while a
+    replay costs only the GPU time. Budgets run every ``step`` tokens up to
+    ``max_tokens`` and are all captured on the first call, so their memory is claimed
+    while the serving stack is still measuring it (vLLM's startup profiling run is
+    the encoder's first call).
+
+    A call is copied into the smallest budget that fits. Unused item slots become
+    zero-length segments and unused budget tokens one filler segment, so real tokens
+    attend exactly as in the eager path. Attention's ``max_seqlen`` is fixed at
+    capture and must cover both the longest item and the filler (under ``step``
+    tokens); calls with more items, a longer item or more tokens run eager.
+    """
+
+    def __init__(self, encoder, *, max_tokens: int, step: int, max_items: int, max_seqlen: int):
+        self.encoder = encoder
+        self.step = step
+        self.budgets = list(range(step, max_tokens + 1, step))
+        self.max_items = max_items
+        self.max_seqlen = max(max_seqlen, step)
+        self.graphs = {}
+        self.x = self.cu = self.out = None
+        self.ropes = []
+        self.rope_ptrs = []
+
+    def run(self, x, length):
+        """Return the stack's ``(B * T, D_out)`` output for padded ``x``, or None to run eager.
+
+        The result is a view of the graph's output buffer, valid until the next replay.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        if not self.graphs or self._rope_ptrs() != self.rope_ptrs:
+            # First call, or a RoPE table was reallocated since capture: the graphs
+            # would read the freed one.
+            self._capture(x)
+        B, T, D = x.shape
+        n = B * T
+        if n == 0 or B > self.max_items or T > self.max_seqlen or n > self.budgets[-1] or x.dtype != self.x.dtype:
+            return None
+        budget = self.budgets[-(-n // self.step) - 1]
+        self.x[:n].copy_(x.reshape(n, D))
+        self.x[n:budget].zero_()
+        cu = self.cu
+        cu[1 : 2 * B + 1].copy_(torch.cumsum(torch.stack((length, T - length), dim=1).reshape(-1), 0))
+        cu[2 * B + 1 : -1].fill_(n)
+        cu[-1].fill_(budget)
+        self.graphs[budget].replay()
+        return self.out[:n]
+
+    def _rope_ptrs(self):
+        return [(m.cos.data_ptr(), m.sin.data_ptr()) for m in self.ropes if hasattr(m, "cos")]
+
+    def _stack(self, budget):
+        cu = self.cu
+        return self.encoder._flat_varlen_stack(self.x[:budget], cu[1:] - cu[:-1], cu, self.max_seqlen)
+
+    def _dummy_layout(self, budget):
+        # Evenly spaced boundaries keep every segment valid and under max_seqlen.
+        n = self.cu.numel()
+        self.cu.copy_(torch.arange(n, device=self.cu.device) * budget // (n - 1))
+
+    def _capture(self, x):
+        start = time.perf_counter()
+        self.graphs.clear()
+        self.x = torch.zeros(self.budgets[-1], x.shape[-1], device=x.device, dtype=x.dtype)
+        self.cu = torch.zeros(2 * self.max_items + 2, device=x.device, dtype=torch.int32)
+        self.ropes = [m for m in self.encoder.modules() if isinstance(m, RotaryPositionalEncoding)]
+
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            self._dummy_layout(self.budgets[-1])
+            for _ in range(2):
+                out = self._stack(self.budgets[-1])
+        torch.cuda.current_stream().wait_stream(side)
+        self.out = torch.empty(self.budgets[-1], out.shape[-1], device=x.device, dtype=out.dtype)
+
+        # Largest first, sharing one pool, so smaller budgets reuse its memory.
+        pool = None
+        for budget in reversed(self.budgets):
+            self._dummy_layout(budget)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool):
+                self.out[:budget].copy_(self._stack(budget))
+            pool = graph.pool()
+            self.graphs[budget] = graph
+        self.rope_ptrs = self._rope_ptrs()
+        logging.info(
+            f"Encoder CUDA graphs: {len(self.budgets)} budgets up to {self.budgets[-1]} tokens "
+            f"(step {self.step}, up to {self.max_items} items, max_seqlen {self.max_seqlen}), "
+            f"captured in {time.perf_counter() - start:.1f}s"
+        )
