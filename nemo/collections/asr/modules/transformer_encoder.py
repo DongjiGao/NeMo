@@ -85,6 +85,11 @@ _ENC_CUDAGRAPH_MAX_TOKENS = int(os.environ.get("NEMO_ENC_CUDAGRAPH_MAX_TOKENS", 
 _ENC_CUDAGRAPH_STEP = int(os.environ.get("NEMO_ENC_CUDAGRAPH_STEP", "128"))
 _ENC_CUDAGRAPH_MAX_ITEMS = int(os.environ.get("NEMO_ENC_CUDAGRAPH_MAX_ITEMS", "64"))
 _ENC_CUDAGRAPH_MAX_SEQLEN = int(os.environ.get("NEMO_ENC_CUDAGRAPH_MAX_SEQLEN", "512"))
+# Opt-in on the flat varlen path: run each layer through torch.compile, which fuses
+# the small elementwise kernels (norms, RoPE, bias adds, GELU, residual adds) left
+# around the GEMMs and attention. Identical layers share one compiled graph, and
+# shapes are dynamic so every token budget reuses it.
+_ENC_COMPILE = os.environ.get("NEMO_ENC_COMPILE", "0").lower() in ("1", "true", "yes")
 
 
 def _packed_branches() -> set:
@@ -637,6 +642,7 @@ class MultiHeadAttention(nn.Module):
         causal: bool = False,
         sequence_offsets: Optional[Sequence[int]] = None,
         fused_qkv: bool = False,
+        flash_attention=None,
     ) -> torch.Tensor:
         """Run self-attention on token-flat encoder states.
 
@@ -644,6 +650,10 @@ class MultiHeadAttention(nn.Module):
         FlashAttention's native variable-length THD kernel when available. Other
         inputs use a compact per-utterance FlexAttention reference without
         recreating a padded batch-wide activation.
+
+        ``flash_attention`` skips that choice and uses the given varlen kernel. Callers
+        under torch.compile pass it pre-resolved, because tracing the resolver retries
+        its ``flash_attn`` import and breaks the graph.
         """
         return self._forward_sequence_packed(
             x,
@@ -656,6 +666,7 @@ class MultiHeadAttention(nn.Module):
             causal=causal,
             sequence_offsets=sequence_offsets,
             fused_qkv=fused_qkv,
+            flash_attention=flash_attention,
         )
 
     def _forward_sequence_packed(
@@ -671,12 +682,14 @@ class MultiHeadAttention(nn.Module):
         causal,
         sequence_offsets,
         fused_qkv,
+        flash_attention=None,
     ):
         q, k, v = self._project_sequence_packed_qkv(x, position_ids=position_ids, fused_qkv=fused_qkv)
         out = self._compute_sequence_packed_attention(
             q,
             k,
             v,
+            flash_attention=flash_attention,
             lengths=lengths,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
@@ -727,10 +740,11 @@ class MultiHeadAttention(nn.Module):
         padded_length,
         causal,
         sequence_offsets,
+        flash_attention=None,
     ):
-        use_flash = not self._uses_rel_pos and _can_use_flash_attention_varlen(q)
-        if use_flash:
+        if flash_attention is None and not self._uses_rel_pos and _can_use_flash_attention_varlen(q):
             flash_attention = _get_flash_attention_varlen()
+        if flash_attention is not None:
             out = flash_attention(
                 q,
                 k,
@@ -830,6 +844,7 @@ class TransformerBlock(nn.Module):
         causal,
         sequence_offsets,
         fused_qkv,
+        flash_attention=None,
     ):
         attn_out = self.attn.forward_sequence_packed(
             self.norm1(x),
@@ -842,6 +857,7 @@ class TransformerBlock(nn.Module):
             causal=causal,
             sequence_offsets=sequence_offsets,
             fused_qkv=fused_qkv,
+            flash_attention=flash_attention,
         )
         x = x + self.drop(attn_out)
         x = x + self.drop(self.ffn(self.norm2(x)))
@@ -1126,7 +1142,9 @@ class TransformerEncoder(nn.Module):
             self._enc_packed_announced = True
             variant = "compacting"
             if flat:
-                variant = "flat varlen, sync-free, CUDA graphs" if _ENC_CUDAGRAPH else "flat varlen, sync-free"
+                variant = "flat varlen, sync-free"
+                variant += ", CUDA graphs" if _ENC_CUDAGRAPH else ""
+                variant += ", compiled layers" if _ENC_COMPILE else ""
             name = "Diarizer" if self._enc_branch() == "diar" else "ASR"
             logging.info(f"{name} encoder running sequence-packed ({variant}; NEMO_ENC_PACKED=1)")
         prof = _enc_prof_begin(audio_signal)
@@ -1173,7 +1191,13 @@ class TransformerEncoder(nn.Module):
             cu64 = cu.to(torch.int64)
             token = torch.arange(h.shape[0], device=h.device, dtype=torch.int64)
             position_ids = token - cu64[torch.bucketize(token, cu64[1:], right=True)]
+        causal = self.attn_mode == "causal"
+        compiled = _compiled_flat_layer() if _ENC_COMPILE else None
+        flash = _get_flash_attention_varlen() if compiled is not None else None
         for layer in self.layers:
+            if compiled is not None and not hasattr(layer, "_checkpoint_wrapped_module"):
+                h = compiled(layer, h, cu, max_seqlen, position_ids, causal, flash)
+                continue
             h = _forward_sequence_packed_layer(
                 layer,
                 h,
@@ -1183,7 +1207,7 @@ class TransformerEncoder(nn.Module):
                 position_ids=position_ids,
                 pos_emb=None,
                 padded_length=max_seqlen,
-                causal=self.attn_mode == "causal",
+                causal=causal,
                 sequence_offsets=None,
                 fused_qkv=True,
             )
@@ -2281,6 +2305,29 @@ def _forward_sequence_packed_layer(layer, x, **kwargs):
             f"Activation-checkpoint wrapper around {type(wrapped).__name__} cannot execute sequence-packed layers."
         )
     return checkpoint_fn(packed_forward, x, **kwargs)
+
+
+def _flat_layer(layer, h, cu, max_seqlen, position_ids, causal, flash_attention):
+    # ``lengths`` only feeds the FlexAttention fallback, which a pre-resolved
+    # ``flash_attention`` rules out, so it is not threaded through the compiled graph.
+    return layer._forward_sequence_packed(
+        h,
+        lengths=None,
+        cu_seqlens=cu,
+        max_seqlen=max_seqlen,
+        position_ids=position_ids,
+        pos_emb=None,
+        padded_length=max_seqlen,
+        causal=causal,
+        sequence_offsets=None,
+        fused_qkv=True,
+        flash_attention=flash_attention,
+    )
+
+
+@lru_cache(maxsize=1)
+def _compiled_flat_layer():
+    return torch.compile(_flat_layer, dynamic=True)
 
 
 class _FlatVarlenGraphs:
