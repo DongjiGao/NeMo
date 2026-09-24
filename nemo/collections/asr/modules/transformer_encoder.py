@@ -66,10 +66,15 @@ _ENC_QUANT = os.environ.get("NEMO_ENC_QUANT")
 # checkpoint-resident recipe is only ever attached to the ASR branch.
 _ENC_QUANT_BRANCH = os.environ.get("NEMO_ENC_QUANT_BRANCH", "asr").lower()
 _ENC_QUANT_ELIGIBLE = {"asr": {"asr"}, "diar": {"diar"}, "both": {"asr", "diar"}}
-# Opt-in: route the ASR-tagged encoder's forward through forward_sequence_packed and
-# return the usual padded contract. Only the branch tagged _enc_quant_is_asr is
-# affected; the diarizer is the same class and keeps the padded path.
+# Opt-in: route a tagged encoder's forward through the sequence-packed path and
+# return the usual padded contract. By default only the ASR branch is affected; the
+# diarizer is the same class and keeps the padded path unless NEMO_ENC_PACKED_BRANCH
+# includes it.
 _ENC_PACKED = os.environ.get("NEMO_ENC_PACKED", "0").lower() in ("1", "true", "yes")
+# Which branch(es) NEMO_ENC_PACKED reroutes, with NEMO_ENC_QUANT_BRANCH's values:
+# "asr" (default), "diar" or "both". The diarizer's calls come from Sortformer's
+# streaming step with pre-encoded input ([speaker cache | FIFO | chunk]).
+_ENC_PACKED_BRANCH = os.environ.get("NEMO_ENC_PACKED_BRANCH", "asr").lower()
 # Opt-in on top of NEMO_ENC_PACKED's flat varlen path: replay the layer stack from
 # CUDA graphs, one per token budget (see _FlatVarlenGraphs). Calls with more tokens,
 # more items, or a longer item than the graphs were captured for run eager.
@@ -78,6 +83,17 @@ _ENC_CUDAGRAPH_MAX_TOKENS = int(os.environ.get("NEMO_ENC_CUDAGRAPH_MAX_TOKENS", 
 _ENC_CUDAGRAPH_STEP = int(os.environ.get("NEMO_ENC_CUDAGRAPH_STEP", "128"))
 _ENC_CUDAGRAPH_MAX_ITEMS = int(os.environ.get("NEMO_ENC_CUDAGRAPH_MAX_ITEMS", "64"))
 _ENC_CUDAGRAPH_MAX_SEQLEN = int(os.environ.get("NEMO_ENC_CUDAGRAPH_MAX_SEQLEN", "512"))
+
+
+def _packed_branches() -> set:
+    if _ENC_PACKED_BRANCH not in _ENC_QUANT_ELIGIBLE:
+        raise ValueError(
+            f"NEMO_ENC_PACKED_BRANCH='{_ENC_PACKED_BRANCH}' is not supported; "
+            f"expected one of {sorted(_ENC_QUANT_ELIGIBLE)}."
+        )
+    return _ENC_QUANT_ELIGIBLE[_ENC_PACKED_BRANCH]
+
+
 # Per-call records are kept rather than a running total because the first call
 # pays flex_attention's torch.compile cost, and vLLM's startup memory profiling
 # also invokes the encoder on dummy audio. Wall-clock stamps let those be
@@ -1079,16 +1095,19 @@ class TransformerEncoder(nn.Module):
             self.update_max_seq_length(seq_length=audio_signal.size(1), device=audio_signal.device)
         else:
             self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
-        if (
-            _ENC_PACKED
-            and not bypass_pre_encode
-            and audio_signal.is_cuda
-            and getattr(self, "_enc_quant_is_asr", False)
-        ):
-            return self._forward_packed_as_padded(audio_signal, length)
+        if _ENC_PACKED and audio_signal.is_cuda and self._enc_branch() in _packed_branches():
+            return self._forward_packed_as_padded(audio_signal, length, bypass_pre_encode)
         return self.forward_internal(audio_signal, length, bypass_pre_encode=bypass_pre_encode)
 
-    def _forward_packed_as_padded(self, audio_signal, length):
+    def _enc_branch(self) -> Optional[str]:
+        """"asr" or "diar" as tagged by ParallelExpertEncoder, None for an untagged encoder."""
+        if getattr(self, "_enc_quant_is_asr", False):
+            return "asr"
+        if getattr(self, "_enc_quant_skip", False):
+            return "diar"
+        return None
+
+    def _forward_packed_as_padded(self, audio_signal, length, bypass_pre_encode=False):
         """Run the encoder token-flat and return the padded ``forward`` contract.
 
         This bypasses ``forward_internal``, so the lazy quantization hook is applied
@@ -1106,18 +1125,21 @@ class TransformerEncoder(nn.Module):
             variant = "compacting"
             if flat:
                 variant = "flat varlen, sync-free, CUDA graphs" if _ENC_CUDAGRAPH else "flat varlen, sync-free"
-            logging.info(f"ASR encoder running sequence-packed ({variant}; NEMO_ENC_PACKED=1)")
+            name = "Diarizer" if self._enc_branch() == "diar" else "ASR"
+            logging.info(f"{name} encoder running sequence-packed ({variant}; NEMO_ENC_PACKED=1)")
         prof = _enc_prof_begin(audio_signal)
         if flat:
-            x, length = self._forward_flat_varlen(audio_signal, length)
+            x, length = self._forward_flat_varlen(audio_signal, length, bypass_pre_encode)
         else:
-            packed = self.forward_sequence_packed(audio_signal, length, fused_qkv=True)
+            packed = self.forward_sequence_packed(
+                audio_signal, length, bypass_pre_encode=bypass_pre_encode, fused_qkv=True
+            )
             x = unpack_encoder_output(packed, total_length=packed.padded_length).transpose(1, 2)
             length = packed.lengths.to(torch.int64)
         _enc_prof_end(prof, x.shape[0], x.shape[2], length)
         return x, length
 
-    def _forward_flat_varlen(self, audio_signal, length):
+    def _forward_flat_varlen(self, audio_signal, length, bypass_pre_encode=False):
         """Encode token-flat while keeping every frame, so no step needs a host sync.
 
         Compacting (``pack_encoder_output``) sizes its output from the lengths, which
@@ -1131,7 +1153,7 @@ class TransformerEncoder(nn.Module):
         With ``NEMO_ENC_CUDAGRAPH`` the layer stack replays from a CUDA graph
         whenever the call fits one.
         """
-        x, length, _ = self._prepare_sequence_packed_input(audio_signal, length, False)
+        x, length, _ = self._prepare_sequence_packed_input(audio_signal, length, bypass_pre_encode)
         B, T, D = x.shape
         h = self._flat_varlen_graphs().run(x, length) if _ENC_CUDAGRAPH else None
         if h is None:
