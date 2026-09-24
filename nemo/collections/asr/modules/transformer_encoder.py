@@ -2327,7 +2327,14 @@ def _flat_layer(layer, h, cu, max_seqlen, position_ids, causal, flash_attention)
 
 @lru_cache(maxsize=1)
 def _compiled_flat_layer():
-    return torch.compile(_flat_layer, dynamic=True)
+    # Fused kernels would otherwise keep intermediates in FP32 where eager rounds to
+    # BF16 after every op. The static-scale FP4/FP8 quantizers turn those last-bit
+    # differences in their inputs into different codes, so match eager's rounding.
+    return torch.compile(
+        _flat_layer,
+        dynamic=True,
+        options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
+    )
 
 
 class _FlatVarlenGraphs:
