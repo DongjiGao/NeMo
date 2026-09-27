@@ -179,7 +179,10 @@ class NeMoSpeechLMForConditionalGeneration(
         estimated audio-token count, so pre-tokenizing here would skip that
         expansion and the embedding merge would not line up.
         """
-        from vllm.transformers_utils.tokenizer import cached_tokenizer_from_config
+        try:
+            from vllm.tokenizers import cached_tokenizer_from_config
+        except ImportError:  # older vLLM layout
+            from vllm.transformers_utils.tokenizer import cached_tokenizer_from_config
 
         task_type = getattr(stt_params, "task_type", "transcribe")
         if task_type != "transcribe":
