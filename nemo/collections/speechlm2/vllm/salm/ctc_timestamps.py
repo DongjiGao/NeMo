@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import os
 import threading
+from collections.abc import Sequence
 from typing import Any
 
 from nemo.utils import logging
@@ -77,8 +78,10 @@ _PENDING_PREFIX = "__nemo_ctc_pending_"
 _RETENTION_ENV = "NEMO_CTC_TIMESTAMP_RETAIN"
 _DEFAULT_RETENTION = 64
 
-# Worker method name the API server calls through collective_rpc.
+# Worker method names reached through collective_rpc: one request (the API
+# server's transcription hooks) or many (offline LLM callers).
 WORKER_ALIGN_METHOD = "nemo_ctc_align_request"
+WORKER_ALIGN_BATCH_METHOD = "nemo_ctc_align_requests"
 
 # vLLM forms the scheduler's request id as f"{external_id}-{random_uuid():.8}".
 _INTERNAL_ID_SUFFIX_LEN = 8
@@ -362,19 +365,58 @@ def _worker_align_request(worker: Any, request_id: str, text: str) -> list[dict]
     return align_request(request_id, text)
 
 
+def _worker_align_requests(worker: Any, items: list) -> list[list[dict]]:
+    """``collective_rpc`` entry point: align many finished requests in one call."""
+    del worker
+    return [align_request(request_id, text) for request_id, text in items]
+
+
 def install_worker_align_method() -> None:
-    """Expose :func:`align_request` to the API server as a worker method.
+    """Expose :func:`align_request` to callers outside the engine as worker methods.
 
     ``collective_rpc`` resolves a method name on the worker, so the alignment
-    entry point is attached to vLLM's GPU worker class under
-    ``WORKER_ALIGN_METHOD``.
+    entry points are attached to vLLM's GPU worker class under
+    ``WORKER_ALIGN_METHOD`` and ``WORKER_ALIGN_BATCH_METHOD``.
     """
     try:
         from vllm.v1.worker.gpu_worker import Worker
     except ImportError:  # pragma: no cover - vLLM absent
         return
-    if getattr(Worker, WORKER_ALIGN_METHOD, None) is not _worker_align_request:
-        setattr(Worker, WORKER_ALIGN_METHOD, _worker_align_request)
+    for name, method in (
+        (WORKER_ALIGN_METHOD, _worker_align_request),
+        (WORKER_ALIGN_BATCH_METHOD, _worker_align_requests),
+    ):
+        if getattr(Worker, name, None) is not method:
+            setattr(Worker, name, method)
+
+
+def ctc_word_timestamps(llm: Any, outputs: Sequence[Any], chunk_size: int = 256) -> list[list[dict]]:
+    """Word timestamps for finished outputs of an offline vLLM ``LLM``.
+
+    Alignment runs in the engine process, where the captured rows live, with one
+    RPC per ``chunk_size`` outputs. Call it after generation: the RPC runs on the
+    engine thread, so aligning while other requests decode would stall them.
+
+    Rows are held only for the most recent ``NEMO_CTC_TIMESTAMP_RETAIN`` captures
+    (default 64), so align at least that often, e.g. by generating in chunks no
+    larger than the limit, or raise the limit to cover a whole batch.
+
+    Args:
+        llm (Any): The ``vllm.LLM`` that produced ``outputs``, with CTC timestamps enabled.
+        outputs (Sequence[Any]): Its ``RequestOutput`` objects. Decode speaker-tagged
+            prompts with ``skip_special_tokens=False`` so ``<spk:N>`` reaches the aligner.
+        chunk_size (int): Outputs aligned per RPC.
+
+    Returns:
+        list[list[dict]]: Per output, ``word``/``start``/``end``/``speaker`` entries
+        in start-time order; empty when nothing was captured for that output.
+    """
+    items = [(out.request_id, out.outputs[0].text) for out in outputs]
+    words: list[list[dict]] = []
+    for start in range(0, len(items), chunk_size):
+        batch = items[start : start + chunk_size]
+        words.extend(llm.collective_rpc(WORKER_ALIGN_BATCH_METHOD, args=(batch,))[0])
+    return words
 
 
 def install_encoder_cache_binding(get_encoder) -> None:
