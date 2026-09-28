@@ -70,11 +70,10 @@ from nemo.utils import logging
 _PENDING_PREFIX = "__nemo_ctc_pending_"
 
 # Captured rows must outlive vLLM's encoder-cache entry for the same hash.
-# vLLM frees that entry when the request finishes, but the serving hooks that
-# consume the rows (parse_diarized_transcript / get_word_timestamps) run during
-# response assembly, i.e. at or after that point. Mirroring vLLM's eviction
-# therefore drops rows just before they are needed, so retention is bounded
-# here instead: oldest-first, with a cap, since nothing else limits growth.
+# vLLM frees that entry when the request finishes, but alignment reads the rows
+# at or after that point, so mirroring vLLM's eviction would drop them just
+# before they are needed. Retention is bounded here instead: least recently
+# used first, with a cap, since nothing else limits growth.
 _RETENTION_ENV = "NEMO_CTC_TIMESTAMP_RETAIN"
 _DEFAULT_RETENTION = 64
 
@@ -163,14 +162,6 @@ def mm_hashes_for_request(request_id: str) -> list[str]:
         return list(_request_hashes[key]) if key is not None else []
 
 
-def forget_request(request_id: str) -> None:
-    """Drop the request-to-hash mapping for a finished request."""
-    with _request_lock:
-        key = _resolve_request_id(request_id)
-        if key is not None:
-            _request_hashes.pop(key, None)
-
-
 def _record_request_hashes(pairs) -> None:
     """Associate a request with the hashes whose rows belong to it."""
     with _request_lock:
@@ -178,8 +169,8 @@ def _record_request_hashes(pairs) -> None:
             hashes = _request_hashes.setdefault(req_id, [])
             if mm_hash not in hashes:
                 hashes.append(mm_hash)
-        # The map is tiny per entry but still unbounded if callers never take
-        # their timestamps, so cap it on the same order as the row store.
+        # Entries are tiny but never removed on use, so cap the map on the same
+        # order as the row store.
         limit = _retention_limit() * 4
         while len(_request_hashes) > limit:
             _request_hashes.pop(next(iter(_request_hashes)), None)
@@ -292,11 +283,11 @@ def align_request(request_id: str, text: str) -> list[dict]:
         return []
     extractor = cached[1]
 
-    # Re-insert rather than take: another request with the same audio resolves to
-    # this hash through an encoder-cache hit, and _trim_store bounds retention.
+    # Read without taking, and keep the request's mapping: a repeated call for this
+    # request, or another request whose audio hit vLLM's encoder cache, must still
+    # find the rows. _trim_store and the map's own cap bound both.
     outputs = store.pop(key)
     store[key] = outputs
-    forget_request(request_id)
 
     # The aligner derives its frame grid as duration / frame_count, so a duration
     # synthesized from the frame count reproduces the encoder's own grid exactly.
