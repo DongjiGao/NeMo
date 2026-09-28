@@ -938,6 +938,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         drop_extra_pre_encoded=0,
         left_offset=0,
         right_offset=0,
+        return_native_resolution=False,
     ):
         """
         One-step forward pass for diarization inference in streaming mode.
@@ -966,6 +967,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             drop_extra_pre_encoded (int): Number of leading pre-encoded frames to discard before streaming updates.
             left_offset (int): left offset for the current chunk
             right_offset (int): right offset for the current chunk
+            return_native_resolution (bool): Return speaker probabilities on the model's native frame grid instead
+                of applying ``output_subsampling_factor``. This is used to retain 10 ms diarization output from a
+                high-resolution model while the normal PEE fusion path continues to use downsampled predictions.
 
         Returns:
             streaming_state (SortformerStreamingState):
@@ -1084,7 +1088,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 chunk_preds = high_resolution_preds[:, start : start + chunk_len * self.upsample_factor]
         native_output_factor = 1 if self.high_resolution else self.encoder.subsampling_factor
         downsample_factor = self.output_subsampling_factor // native_output_factor
-        if downsample_factor > 1:
+        if downsample_factor > 1 and not return_native_resolution:
             chunk_preds = self.sortformer_modules.downsample_preds(chunk_preds, downsample_factor)
         total_preds = torch.cat([total_preds, chunk_preds], dim=1)
 

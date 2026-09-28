@@ -20,7 +20,9 @@ from nemo.collections.asr.modules.audio_preprocessing import (  # noqa: F401
     MaskedPatchAugmentation,
     SpectrogramAugmentation,
 )
-from nemo.collections.asr.modules.beam_search_decoder import BeamSearchDecoderWithLM  # noqa: F401
+from nemo.collections.asr.modules.beam_search_decoder import (  # noqa: F401
+    BeamSearchDecoderWithLM,
+)
 from nemo.collections.asr.modules.conformer_encoder import (  # noqa: F401
     ConformerEncoder,
     ConformerEncoderAdapter,
@@ -41,9 +43,8 @@ from nemo.collections.asr.modules.hybrid_autoregressive_transducer import HATJoi
 from nemo.collections.asr.modules.lstm_decoder import LSTMDecoder  # noqa: F401
 from nemo.collections.asr.modules.moe_transformer_encoder import MoETransformerEncoder  # noqa: F401
 from nemo.collections.asr.modules.parallel_expert_encoder import (  # noqa: F401
-    MultiSpeakerSOTWordTimestampAligner,
+    CTCTimestampInputs,
     ParallelExpertEncoder,
-    TransformerCTCDecoder,
 )
 from nemo.collections.asr.modules.rnn_encoder import RNNEncoder  # noqa: F401
 from nemo.collections.asr.modules.rnnt import (  # noqa: F401
@@ -75,11 +76,10 @@ __all__ = [
     'ConformerEncoder',
     'ConformerEncoderAdapter',
     'ConformerMultiLayerFeatureExtractor',
+    'CTCTimestampInputs',
     'GGEMMTransformerEncoder',
     'MoETransformerEncoder',
-    'MultiSpeakerSOTWordTimestampAligner',
     'ParallelExpertEncoder',
-    'TransformerCTCDecoder',
     'ConvASRDecoder',
     'ConvASRDecoderClassification',
     'ConvASRDecoderReconstruction',
