@@ -210,6 +210,18 @@ def _rename_pending(encoder: Any, mm_hashes: list[str]) -> int:
     return renamed
 
 
+def _discard_pending(encoder: Any) -> int:
+    """Drop queued placeholder captures along with their rows."""
+    queue = getattr(_state, "pending_queue", None)
+    if not queue:
+        return 0
+    store = encoder.__dict__.get("_ctc_timestamp_request_store") or {}
+    for placeholder in queue:
+        store.pop(placeholder, None)
+    _state.pending_queue = []
+    return len(queue)
+
+
 def _trim_store(encoder: Any) -> int:
     """Evict least recently used entries so retention stays bounded.
 
@@ -390,6 +402,12 @@ def install_encoder_cache_binding(get_encoder) -> None:
         # encoder input is a cache hit and therefore never reaches the batch
         # below; without this, repeated audio would find no rows.
         _record_request_hashes(_new_request_hashes(scheduler_output))
+
+        # Encoder runs outside this hook, such as the startup profiling pass on
+        # dummy audio, queue placeholders that no scheduled item claims. Left
+        # queued they would pair with this batch's hashes and shift every
+        # capture onto the next request.
+        _discard_pending(encoder)
 
         mm_hashes, _, mm_lora_refs = self._batch_mm_inputs_from_scheduler(scheduler_output)
         outputs = original(self, scheduler_output, *args, **kwargs)

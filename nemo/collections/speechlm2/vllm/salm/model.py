@@ -164,6 +164,9 @@ class NeMoSpeechLMForConditionalGeneration(
     supports_word_timestamp: ClassVar[bool] = _TIMESTAMP_PLUMBING
     supports_diarized_transcription: ClassVar[bool] = _TIMESTAMP_PLUMBING
     transcription_worker_method: ClassVar[str | None] = WORKER_ALIGN_METHOD if _TIMESTAMP_PLUMBING else None
+    # The <spk:N> turn tags are special tokens, so default decoding would strip
+    # them before alignment.
+    keep_special_tokens_for_diarization: ClassVar[bool] = True
 
     @classmethod
     def get_speech_to_text_config(
