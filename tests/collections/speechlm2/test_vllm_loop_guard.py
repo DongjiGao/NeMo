@@ -122,6 +122,17 @@ def test_break_bans_the_next_cycle_token_once_the_loop_spans_min_span():
     assert banned == [CYCLE[(length - len(PREFIX)) % len(CYCLE)]]
 
 
+@pytest.mark.parametrize(("break_window", "banned"), [(None, [CYCLE[3]]), (0, [])])
+def test_default_break_window_keeps_the_decoder_from_sliding_back_into_the_loop(break_window, banned):
+    batch = _Batch()
+    overrides = {} if break_window is None else {"break_window": break_window}
+    batch.add(0, _params(mode="break", **overrides))
+    assert _feed(batch, 0, PREFIX + CYCLE * 16) == [(len(PREFIX) + 64, [CYCLE[0]])]
+
+    expected = [(len(PREFIX) + 68, banned)] if banned else []
+    assert _feed(batch, 0, [40] + CYCLE[:3]) == expected
+
+
 def test_stop_allows_only_stop_tokens():
     batch = _Batch()
     batch.add(0, _params(mode="stop"))

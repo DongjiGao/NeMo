@@ -22,11 +22,11 @@ to ``max_period``. Once a stretch of at least ``min_span`` tokens holds at least
 copies of one block, it acts on the next step:
 
 * ``break``: ban the token that would continue the cycle, so decoding takes its next best token
-  and can resume the transcript; after ``max_interventions`` breaks the request is ended. With
-  ``break_window`` > 0 each break also opens a window of that many steps in which any token that
-  would recreate a ``break_ngram``-gram from the last ``break_history`` tokens is banned, so the
-  decoder cannot slide back into the copies still in its context; after the first break a loop
-  is re-detected at ``rearm_span`` tokens (``min_span`` if 0).
+  and can resume the transcript. Each break also opens a window of ``break_window`` steps (0
+  disables it) in which any token that would recreate a ``break_ngram``-gram from the last
+  ``break_history`` tokens is banned, so the decoder cannot slide back into the copies still in
+  its context. After the first break a loop is re-detected at ``rearm_span`` tokens (``min_span``
+  if 0), and after ``max_interventions`` breaks the request is ended.
 * ``stop``: end the request at once (every token except the request's stop tokens is banned).
 
 A request that never loops is never touched, so clean outputs are unchanged. vLLM's own
@@ -94,11 +94,11 @@ class LoopGuardConfig:
     min_span: int = 64
     min_repeats: int = 3
     max_period: int = 200
-    max_interventions: int = 4
-    break_window: int = 0
+    max_interventions: int = 8
+    break_window: int = 32
     break_ngram: int = 4
     break_history: int = 512
-    rearm_span: int = 0
+    rearm_span: int = 32
 
     @classmethod
     def from_env(cls) -> "LoopGuardConfig":
