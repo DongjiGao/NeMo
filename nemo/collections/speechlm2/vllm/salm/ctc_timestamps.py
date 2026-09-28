@@ -47,7 +47,14 @@ but not its retention: vLLM releases an encoder-cache entry once the request
 finishes, whereas the serving hooks that consume the rows run during response
 assembly, at or after that point. Following ``free_encoder_mm_hashes`` would
 therefore discard rows immediately before they are read, so retention is instead
-bounded locally by ``NEMO_CTC_TIMESTAMP_RETAIN`` entries, oldest evicted first.
+bounded locally by ``NEMO_CTC_TIMESTAMP_RETAIN`` entries, least recently used
+evicted first.
+
+Under ``vllm serve`` the transcription hooks run in the API server process while
+the rows live in the engine process next to the model, so the server cannot read
+them directly. It asks the engine to align through ``collective_rpc`` by the name
+in ``WORKER_ALIGN_METHOD``, passing the external request id; vLLM's scheduler
+knows the request by that id plus a random suffix, which the lookup resolves.
 """
 
 from __future__ import annotations
@@ -70,14 +77,21 @@ _PENDING_PREFIX = "__nemo_ctc_pending_"
 _RETENTION_ENV = "NEMO_CTC_TIMESTAMP_RETAIN"
 _DEFAULT_RETENTION = 64
 
+# Worker method name the API server calls through collective_rpc.
+WORKER_ALIGN_METHOD = "nemo_ctc_align_request"
+
+# vLLM forms the scheduler's request id as f"{external_id}-{random_uuid():.8}".
+_INTERNAL_ID_SUFFIX_LEN = 8
+
 # Placeholder bookkeeping stays thread-local: it is produced and consumed within
 # a single _execute_mm_encoder call on the engine thread, so keeping it per-thread
 # avoids interleaving if that ever runs concurrently.
 _state = threading.local()
 
-# Process-wide, unlike _state. The serving hooks run on the API thread while the
-# capture happens on the engine thread, so anything shared between them must not
-# be thread-local or the hooks would observe an empty map.
+# Process-wide, unlike _state. With an in-process engine the hooks run on the
+# caller's thread while the capture happens on the engine thread, so anything
+# shared between them must not be thread-local or the hooks would observe an
+# empty map.
 _registry: dict[str, Any] = {}
 _request_hashes: dict[str, list[str]] = {}
 _request_lock = threading.Lock()
@@ -116,23 +130,42 @@ def pending_row_ids(count: int) -> list[str]:
     return ids
 
 
+def _resolve_request_id(request_id: str) -> str | None:
+    """Return the recorded key for a request id, accepting the external form.
+
+    Callers holding a ``RequestOutput`` see the external id, while the scheduler
+    reports the internal one; exact matches win so ids without a suffix (older
+    vLLM, in-process callers) resolve unchanged. Must hold ``_request_lock``.
+    """
+    if request_id in _request_hashes:
+        return request_id
+    prefix = f"{request_id}-"
+    for recorded in _request_hashes:
+        if recorded.startswith(prefix) and len(recorded) == len(prefix) + _INTERNAL_ID_SUFFIX_LEN:
+            return recorded
+    return None
+
+
 def mm_hashes_for_request(request_id: str) -> list[str]:
     """Return the multimodal hashes seen for a request, in arrival order.
 
     Args:
-        request_id (str): vLLM request id.
+        request_id (str): vLLM request id, internal or external.
 
     Returns:
         list[str]: Hashes whose rows belong to this request.
     """
     with _request_lock:
-        return list(_request_hashes.get(request_id, ()))
+        key = _resolve_request_id(request_id)
+        return list(_request_hashes[key]) if key is not None else []
 
 
 def forget_request(request_id: str) -> None:
     """Drop the request-to-hash mapping for a finished request."""
     with _request_lock:
-        _request_hashes.pop(request_id, None)
+        key = _resolve_request_id(request_id)
+        if key is not None:
+            _request_hashes.pop(key, None)
 
 
 def _record_request_hashes(pairs) -> None:
@@ -178,12 +211,12 @@ def _rename_pending(encoder: Any, mm_hashes: list[str]) -> int:
 
 
 def _trim_store(encoder: Any) -> int:
-    """Evict oldest entries so retention stays bounded.
+    """Evict least recently used entries so retention stays bounded.
 
-    Rows are only removed by a consumer taking them, so a client that asks for
-    a transcript without timestamps would otherwise leave its rows resident for
-    the life of the server. Python dicts preserve insertion order, so the first
-    keys are the oldest captures.
+    Nothing else removes rows: alignment reads without taking so that repeated
+    audio, served from vLLM's encoder cache, still finds them. Python dicts
+    preserve insertion order and ``align_request`` re-inserts what it reads, so
+    the first keys are the least recently used.
     """
     store = encoder.__dict__.get("_ctc_timestamp_request_store")
     if not store:
@@ -244,7 +277,10 @@ def align_request(request_id: str, text: str) -> list[dict]:
         return []
     extractor = cached[1]
 
+    # Re-insert rather than take: another request with the same audio resolves to
+    # this hash through an encoder-cache hit, and _trim_store bounds retention.
     outputs = store.pop(key)
+    store[key] = outputs
     forget_request(request_id)
 
     # The aligner derives its frame grid as duration / frame_count, so a duration
@@ -295,6 +331,40 @@ def _frame_seconds(encoder: Any) -> float:
     return shift * subsampling
 
 
+def _new_request_hashes(scheduler_output: Any):
+    """Yield ``(req_id, mm_hash)`` for each multimodal item of newly scheduled requests."""
+    for new_req in getattr(scheduler_output, "scheduled_new_reqs", None) or ():
+        features = getattr(new_req, "mm_features", None)
+        if features is not None:
+            hashes = [getattr(feature, "identifier", None) for feature in features]
+        else:
+            hashes = list(getattr(new_req, "mm_hashes", None) or ())
+        for mm_hash in hashes:
+            if mm_hash:
+                yield new_req.req_id, mm_hash
+
+
+def _worker_align_request(worker: Any, request_id: str, text: str) -> list[dict]:
+    """``collective_rpc`` entry point: align on the worker that holds the rows."""
+    del worker
+    return align_request(request_id, text)
+
+
+def install_worker_align_method() -> None:
+    """Expose :func:`align_request` to the API server as a worker method.
+
+    ``collective_rpc`` resolves a method name on the worker, so the alignment
+    entry point is attached to vLLM's GPU worker class under
+    ``WORKER_ALIGN_METHOD``.
+    """
+    try:
+        from vllm.v1.worker.gpu_worker import Worker
+    except ImportError:  # pragma: no cover - vLLM absent
+        return
+    if getattr(Worker, WORKER_ALIGN_METHOD, None) is not _worker_align_request:
+        setattr(Worker, WORKER_ALIGN_METHOD, _worker_align_request)
+
+
 def install_encoder_cache_binding(get_encoder) -> None:
     """Rename captured rows to ``mm_hash`` and record the request-to-hash map.
 
@@ -315,6 +385,11 @@ def install_encoder_cache_binding(get_encoder) -> None:
         encoder = get_encoder()
         if encoder is None:
             return original(self, scheduler_output, *args, **kwargs)
+
+        # New requests resolve to their hashes here, including those whose
+        # encoder input is a cache hit and therefore never reaches the batch
+        # below; without this, repeated audio would find no rows.
+        _record_request_hashes(_new_request_hashes(scheduler_output))
 
         mm_hashes, _, mm_lora_refs = self._batch_mm_inputs_from_scheduler(scheduler_output)
         outputs = original(self, scheduler_output, *args, **kwargs)

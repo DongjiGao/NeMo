@@ -70,7 +70,9 @@ from nemo.collections.speechlm2.vllm.salm.audio import (
 from nemo.collections.speechlm2.vllm.salm.backends import HybridBackend, make_backend
 from nemo.collections.speechlm2.vllm.salm.config import _AUDIO_PLACEHOLDER
 from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
+    WORKER_ALIGN_METHOD,
     align_request,
+    install_worker_align_method,
     pending_row_ids,
     register_encoder,
 )
@@ -90,6 +92,16 @@ _TRANSCRIBE_PROMPT = (
     "translate. Omit accidental repetitions."
 )
 
+# The multi-speaker (t-SOT) prompt of the multispeaker-sot benchmark. Speaker
+# segments need the <spk:N> turn tags only this prompt produces; the verbatim
+# prompt above yields untagged text, which aligns as a single speaker.
+_SOT_PROMPT = (
+    "Transcribe this audio. Include all spoken words and verbal fillers. Write numbers as spoken. "
+    "Use no punctuation and no capitalization. Start every speaker turn with a speaker tag such as "
+    "<spk:0>, <spk:1>, <spk:2>, etc.; assign one stable tag per speaker and keep speaker identities "
+    "consistent. Output only the speaker-tagged transcript."
+)
+
 # runtime_compat enforces locator placement for the chat path: text, one ASCII
 # space, then a final <|audio|>. get_generation_prompt bypasses chat rendering,
 # so it has to reproduce that layout itself or the two entry points would
@@ -101,8 +113,9 @@ _AUDIO_LAST = True
 # other codes still pass with a warning through get_other_languages.
 _SUPPORTED_LANGUAGES: Mapping[str, str] = {"en": "english"}
 
-# Our timestamps come from CTC alignment rather than the token stream, so the
-# serving layer has to hand the model hooks a RequestOutput to correlate against.
+# Our timestamps come from CTC alignment rather than the token stream, and the
+# captured rows live in the engine process, so the serving layer has to fetch the
+# alignment from there (transcription_worker_method) and hand it to the hooks.
 # That plumbing is an upstream addition; against a stock vLLM the hooks are
 # either never called or called without it, and the request would fail deep in
 # response assembly with a misleading "did not contain a valid diarized
@@ -113,7 +126,7 @@ try:  # pragma: no cover - depends on the installed vLLM
         SupportsTranscription as _SupportsTranscriptionProto,
     )
 
-    _TIMESTAMP_PLUMBING = hasattr(_SupportsTranscriptionProto, "get_word_timestamps")
+    _TIMESTAMP_PLUMBING = hasattr(_SupportsTranscriptionProto, "transcription_worker_method")
 except Exception:  # noqa: BLE001
     _TIMESTAMP_PLUMBING = False
 
@@ -150,6 +163,7 @@ class NeMoSpeechLMForConditionalGeneration(
     supports_segment_timestamp: ClassVar[bool] = False
     supports_word_timestamp: ClassVar[bool] = _TIMESTAMP_PLUMBING
     supports_diarized_transcription: ClassVar[bool] = _TIMESTAMP_PLUMBING
+    transcription_worker_method: ClassVar[str | None] = WORKER_ALIGN_METHOD if _TIMESTAMP_PLUMBING else None
 
     @classmethod
     def get_speech_to_text_config(
@@ -172,7 +186,10 @@ class NeMoSpeechLMForConditionalGeneration(
 
     @classmethod
     def get_generation_prompt(cls, stt_params: Any) -> Any:
-        """Render the measured transcription prompt for one audio chunk.
+        """Render the transcription prompt for one audio chunk.
+
+        ``diarized_json`` requests get the t-SOT prompt, which is what makes the
+        model emit speaker tags; everything else gets the measured verbatim prompt.
 
         Returns a text prompt rather than token ids on purpose: the multimodal
         processor splits on ``<|audio|>`` and expands each locator into the
@@ -188,7 +205,8 @@ class NeMoSpeechLMForConditionalGeneration(
         if task_type != "transcribe":
             raise ValueError(f"NeMo SpeechLM supports transcription only, got task_type={task_type!r}.")
 
-        text = _TRANSCRIBE_PROMPT
+        diarized = getattr(stt_params, "response_format", None) == "diarized_json"
+        text = _SOT_PROMPT if diarized else _TRANSCRIBE_PROMPT
         content = f"{text} {_AUDIO_PLACEHOLDER}" if _AUDIO_LAST else f"{_AUDIO_PLACEHOLDER}\n{text}"
 
         tokenizer = cached_tokenizer_from_config(stt_params.model_config)
@@ -211,7 +229,7 @@ class NeMoSpeechLMForConditionalGeneration(
         return {"prompt": prompt, "multi_modal_data": {"audio": stt_params.audio}}
 
     @classmethod
-    def get_word_timestamps(cls, text: str, request_output: Any = None) -> Any:
+    def get_word_timestamps(cls, text: str, request_output: Any = None, worker_output: Any = None) -> Any:
         """Return per-word timings for a finished transcription.
 
         Returns ``None`` rather than an empty list when nothing was captured, so
@@ -221,7 +239,7 @@ class NeMoSpeechLMForConditionalGeneration(
             TranscriptionWord,
         )
 
-        words = cls._aligned_words(text, request_output)
+        words = cls._aligned_words(text, request_output, worker_output)
         if not words:
             return None
         return [
@@ -230,7 +248,7 @@ class NeMoSpeechLMForConditionalGeneration(
         ]
 
     @classmethod
-    def parse_diarized_transcript(cls, text: str, request_output: Any = None) -> Any:
+    def parse_diarized_transcript(cls, text: str, request_output: Any = None, worker_output: Any = None) -> Any:
         """Group aligned words into speaker-attributed segments.
 
         The speaker labels come from the model's own ``<spk:N>`` t-SOT tags, while
@@ -239,7 +257,7 @@ class NeMoSpeechLMForConditionalGeneration(
         """
         from vllm.model_executor.models.interfaces import DiarizedTranscriptionSegment
 
-        words = cls._aligned_words(text, request_output)
+        words = cls._aligned_words(text, request_output, worker_output)
         if not words:
             return []
 
@@ -267,13 +285,15 @@ class NeMoSpeechLMForConditionalGeneration(
         return segments
 
     @classmethod
-    def _aligned_words(cls, text: str, request_output: Any) -> list[dict]:
-        """Align a request's captured rows.
+    def _aligned_words(cls, text: str, request_output: Any, worker_output: Any = None) -> list[dict]:
+        """Return the aligned words for a request.
 
-        Consumes the rows, which is safe because the two hooks are reached from
-        mutually exclusive response-format branches: a response is either
-        ``diarized_json`` or ``verbose_json``, never both.
+        Under ``vllm serve`` the engine already aligned them through
+        ``transcription_worker_method``; aligning here only works when the
+        engine shares this process, as with an in-process ``LLM``.
         """
+        if worker_output is not None:
+            return list(worker_output)
         if request_output is None or not getattr(request_output, "request_id", None):
             return []
         return align_request(request_output.request_id, text)
@@ -340,6 +360,9 @@ class NeMoSpeechLMForConditionalGeneration(
             # this run before weights are loaded.
             _apply_encoder_quantization(self.perception, getattr(config, "encoder_quantization", None))
 
+        # The server calls this for every timestamped request, adapter or not;
+        # without one it returns no words and the request fails with a clean 400.
+        install_worker_align_method()
         self._maybe_enable_ctc_timestamps(getattr(config, "ctc_timestamps", None))
 
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
