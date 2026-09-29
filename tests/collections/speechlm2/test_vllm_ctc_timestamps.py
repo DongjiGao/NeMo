@@ -235,3 +235,27 @@ def test_speaker_prior_weight_defaults_and_rejects_negative_values():
     assert ct.speaker_logprob_weight(SimpleNamespace(speaker_logprob_weight=0)) == 0.0
     with pytest.raises(ValueError, match="non-negative"):
         ct.speaker_logprob_weight({"speaker_logprob_weight": -0.1})
+
+
+def test_byte_budget_evicts_least_recently_used_but_keeps_the_newest(encoder, monkeypatch):
+    _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
+    ct._compact_ready()
+    row_bytes = ct._store["hash-a"]["nbytes"]
+
+    monkeypatch.setenv("NEMO_CTC_TIMESTAMP_RETAIN_GB", str(2.5 * row_bytes / 1e9))
+    ct._trim_store()
+    assert list(ct._store) == ["hash-b", "hash-c"]
+
+    monkeypatch.setenv("NEMO_CTC_TIMESTAMP_RETAIN_GB", "0")
+    ct._trim_store()
+    assert list(ct._store) == ["hash-c"]
+
+
+def test_reencoded_audio_replaces_its_entry_as_the_most_recent(encoder):
+    _capture(1, 4, ["hash-a"])
+    first = ct._store["hash-a"]
+    _capture(1, 4, ["hash-b"])
+    _capture(1, 3, ["hash-a"])
+
+    assert list(ct._store) == ["hash-b", "hash-a"]
+    assert first["dropped"] and ct._store["hash-a"]["asr_encoded"].shape[-1] == 3

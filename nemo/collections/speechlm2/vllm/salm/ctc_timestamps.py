@@ -37,9 +37,9 @@ The inputs move to pinned host memory without blocking the engine. An ASR state 
 copy overlaps with compute instead of stalling it. Once a copy lands, each row is
 compacted to its own valid frames, so retaining it does not keep its whole padded
 batch alive. Retention is local and bounded by ``NEMO_CTC_TIMESTAMP_RETAIN`` entries
-(default: twice the engine's ``max_num_seqs``), least recently used first: vLLM
-frees its encoder-cache entry when a request finishes, which is before alignment
-reads it.
+(default: twice the engine's ``max_num_seqs``) and ``NEMO_CTC_TIMESTAMP_RETAIN_GB``
+of host memory (default 8), least recently used first: vLLM frees its encoder-cache
+entry when a request finishes, which is before alignment reads it.
 
 Alignment runs in the engine process, where the inputs live. Offline callers use
 :func:`ctc_timestamps` (or :func:`ctc_word_timestamps` for words only); a server
@@ -67,6 +67,10 @@ _PENDING_PREFIX = "__nemo_ctc_pending_"
 _RETENTION_ENV = "NEMO_CTC_TIMESTAMP_RETAIN"
 # Used until set_default_retention sizes retention from the engine, and as its floor.
 _DEFAULT_RETENTION = 64
+# The entry count alone does not bound memory: an hour of audio keeps on the order of
+# 0.1-0.2 GB of encoder states.
+_RETENTION_GB_ENV = "NEMO_CTC_TIMESTAMP_RETAIN_GB"
+_DEFAULT_RETENTION_GB = 8.0
 
 # Worker method names reached through collective_rpc: one request (a server's
 # transcription hooks) or many (offline LLM callers).
@@ -200,6 +204,7 @@ def store_timestamp_inputs(row_ids: Sequence[str], inputs: Any, audio_durations:
                 duration=float(duration),
                 ready=ready,
             )
+            entry["nbytes"] = _entry_nbytes(entry)
             _store[row_id] = entry
             _uncompacted.append(entry)
 
@@ -213,6 +218,11 @@ def _to_host(tensor: torch.Tensor | None) -> torch.Tensor | None:
     host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
     host.copy_(tensor.detach(), non_blocking=True)
     return host
+
+
+def _entry_nbytes(entry: dict) -> int:
+    """Host bytes of an entry's tensors, each counted at its own (row) size."""
+    return sum(entry[name].numel() * entry[name].element_size() for name, _, _ in _FIELDS if entry[name] is not None)
 
 
 def _resolve_request_id(request_id: str) -> str | None:
@@ -269,6 +279,15 @@ def _retention_limit() -> int:
     return max(1, value)
 
 
+def _byte_limit() -> int:
+    """How many bytes of stored inputs to hold before evicting the least recently used."""
+    try:
+        gigabytes = float(os.environ.get(_RETENTION_GB_ENV, _DEFAULT_RETENTION_GB))
+    except ValueError:
+        gigabytes = _DEFAULT_RETENTION_GB
+    return int(max(gigabytes, 0.0) * 1e9)
+
+
 def _rename_pending(mm_hashes: list[str]) -> int:
     """Rename this forward's placeholder entries to their real hashes."""
     queue = getattr(_state, "pending_queue", None) or []
@@ -290,6 +309,11 @@ def _rename_pending(mm_hashes: list[str]) -> int:
         for placeholder, mm_hash in zip(queue, mm_hashes):
             entry = _store.pop(placeholder, None)
             if entry is not None:
+                # Re-encoded audio replaces its older entry and becomes the most recent,
+                # which assigning to the existing key would not do.
+                replaced = _store.pop(mm_hash, None)
+                if replaced is not None:
+                    replaced["dropped"] = True
                 _store[mm_hash] = entry
                 renamed += 1
     _state.pending_queue = []
@@ -311,26 +335,32 @@ def _discard_pending() -> int:
 
 
 def _trim_store() -> int:
-    """Evict least recently used entries so retention stays bounded.
+    """Evict least recently used entries until both the entry count and the byte budget hold.
 
     Nothing else removes entries: alignment reads without taking so that repeated
     audio, served from vLLM's encoder cache, still finds them. Python dicts preserve
     insertion order and alignment re-inserts what it reads, so the first keys are the
-    least recently used.
+    least recently used. The newest entry is kept even when it alone exceeds the
+    byte budget.
     """
-    limit = _retention_limit()
+    limit, byte_limit = _retention_limit(), _byte_limit()
     evicted = 0
     with _lock:
-        while len(_store) > limit:
-            _store.pop(next(iter(_store)))["dropped"] = True
+        stored = sum(entry["nbytes"] for entry in _store.values())
+        while len(_store) > limit or (stored > byte_limit and len(_store) > 1):
+            entry = _store.pop(next(iter(_store)))
+            entry["dropped"] = True
+            stored -= entry["nbytes"]
             evicted += 1
     if evicted:
         logging.debug(
-            "[NeMoSpeechLM] Evicted %d CTC timestamp entries (limit %d). "
-            "Raise %s if timestamped requests are being dropped.",
+            "[NeMoSpeechLM] Evicted %d CTC timestamp entries (limits: %d entries, %.1f GB). "
+            "Raise %s or %s if timestamped requests are being dropped.",
             evicted,
             limit,
+            byte_limit / 1e9,
             _RETENTION_ENV,
+            _RETENTION_GB_ENV,
         )
     return evicted
 
@@ -366,6 +396,7 @@ def _compact(entry: dict) -> None:
             tensor = tensor.narrow(time_axis, 0, valid)
         entry[name] = tensor.clone()
     entry["ready"] = None
+    entry["nbytes"] = _entry_nbytes(entry)
 
 
 def _empty_result() -> dict:
@@ -424,12 +455,14 @@ def align_requests(items: Sequence[tuple[str, str]]) -> list[dict]:
     if missing:
         logging.warning(
             "[NeMoSpeechLM] No CTC timestamp inputs for %d of %d requests (first: %s): evicted or never "
-            "captured. Only the latest %d captures are kept; align more often or raise %s.",
+            "captured. At most %d captures and %.1f GB are kept; align more often or raise %s or %s.",
             len(missing),
             len(items),
             missing[0],
             _retention_limit(),
+            _byte_limit() / 1e9,
             _RETENTION_ENV,
+            _RETENTION_GB_ENV,
         )
 
     device = next(encoder.parameters()).device
@@ -572,9 +605,9 @@ def ctc_timestamps(
     thread, so aligning while other requests decode would stall them.
 
     Inputs are held only for the most recent ``NEMO_CTC_TIMESTAMP_RETAIN`` captures
-    (default: twice the engine's ``max_num_seqs``), so align at least that often,
-    e.g. by generating in chunks no larger than the limit, or raise the limit to
-    cover a whole batch.
+    (default: twice the engine's ``max_num_seqs``) within ``NEMO_CTC_TIMESTAMP_RETAIN_GB``
+    of host memory (default 8), so align at least that often, e.g. by generating in
+    chunks no larger than the limits, or raise them to cover a whole batch.
 
     Args:
         llm (Any): The ``vllm.LLM`` that produced ``outputs``, with CTC timestamps enabled.
