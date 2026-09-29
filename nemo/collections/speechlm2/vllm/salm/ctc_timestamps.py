@@ -147,6 +147,25 @@ def set_default_retention(max_num_seqs: int) -> None:
     _registry["retention"] = max(_DEFAULT_RETENTION, 2 * int(max_num_seqs))
 
 
+def require_v1_model_runner(vllm_config: Any) -> None:
+    """Refuse CTC timestamps on vLLM's Model Runner V2.
+
+    Captured inputs are renamed, trimmed and compacted by a hook on the V1 runner's
+    ``GPUModelRunner._execute_mm_encoder``. Under V2, the default from vLLM 0.30 on,
+    that hook never runs: nothing would be aligned, and the inputs would pile up in
+    host memory.
+
+    Args:
+        vllm_config (Any): The engine's ``VllmConfig``; without ``use_v2_model_runner``
+            (older vLLM) the V1 runner is assumed.
+    """
+    if getattr(vllm_config, "use_v2_model_runner", False):
+        raise ValueError(
+            "CTC timestamps need vLLM's V1 GPU model runner, but this engine uses Model Runner V2; "
+            "set VLLM_USE_V2_MODEL_RUNNER=0."
+        )
+
+
 def speaker_logprob_weight(ctc_config: Any) -> float:
     """Read the Sortformer prior weight from a checkpoint's ``ctc_timestamps`` block.
 

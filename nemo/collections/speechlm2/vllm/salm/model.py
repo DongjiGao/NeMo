@@ -75,6 +75,7 @@ from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
     install_worker_align_method,
     pending_row_ids,
     register_encoder,
+    require_v1_model_runner,
     set_default_retention,
     speaker_logprob_weight,
     store_timestamp_inputs,
@@ -395,6 +396,7 @@ class NeMoSpeechLMForConditionalGeneration(
         encoder = self.perception.encoder
         if not getattr(encoder, "supports_ctc_timestamp_inputs", False):
             raise ValueError(f"{type(encoder).__name__} cannot produce CTC timestamp inputs.")
+        require_v1_model_runner(vllm_config)
         weight = speaker_logprob_weight(ctc_config)
         encoder.ctc_timestamp_model_path = adapter_path
         device = next(encoder.parameters()).device

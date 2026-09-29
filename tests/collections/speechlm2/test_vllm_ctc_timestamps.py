@@ -240,6 +240,13 @@ def test_speaker_prior_weight_defaults_and_rejects_negative_values():
         ct.speaker_logprob_weight({"speaker_logprob_weight": -0.1})
 
 
+def test_model_runner_v2_is_refused():
+    ct.require_v1_model_runner(SimpleNamespace())
+    ct.require_v1_model_runner(SimpleNamespace(use_v2_model_runner=False))
+    with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER=0"):
+        ct.require_v1_model_runner(SimpleNamespace(use_v2_model_runner=True))
+
+
 def test_byte_budget_evicts_least_recently_used_but_keeps_the_newest(encoder, monkeypatch):
     _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
     ct._compact_ready()
