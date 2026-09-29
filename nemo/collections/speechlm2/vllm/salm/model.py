@@ -75,6 +75,7 @@ from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
     install_worker_align_method,
     pending_row_ids,
     register_encoder,
+    set_default_retention,
     store_timestamp_inputs,
 )
 
@@ -372,11 +373,11 @@ class NeMoSpeechLMForConditionalGeneration(
         # The server calls this for every timestamped request, adapter or not;
         # without one it returns no words and the request fails with a clean 400.
         install_worker_align_method()
-        self._maybe_enable_ctc_timestamps(getattr(config, "ctc_timestamps", None))
+        self._maybe_enable_ctc_timestamps(getattr(config, "ctc_timestamps", None), vllm_config)
 
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
 
-    def _maybe_enable_ctc_timestamps(self, ctc_config: Any) -> None:
+    def _maybe_enable_ctc_timestamps(self, ctc_config: Any, vllm_config: VllmConfig) -> None:
         """Arm CTC timestamp capture when the checkpoint ships an adapter path.
 
         Driven by a ``ctc_timestamps`` block in the checkpoint config, mirroring
@@ -410,6 +411,7 @@ class NeMoSpeechLMForConditionalGeneration(
         )
         aligner.speaker_logprob_weight = float(_DEFAULT_SPEAKER_LOGPROB_WEIGHT if weight is None else weight)
 
+        set_default_retention(vllm_config.scheduler_config.max_num_seqs)
         register_encoder(lambda: self.perception.encoder)
         install_encoder_cache_binding(lambda: self.perception.encoder)
         logging.info("[NeMoSpeechLM] CTC timestamps enabled from checkpoint config: %s", adapter_path)

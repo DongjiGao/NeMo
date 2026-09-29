@@ -154,3 +154,36 @@ def test_diarization_segments_and_speaker_mapping_pass_through(encoder):
     assert result["diarization"] == [{"speaker": 1, "start": 0.05, "end": 0.93}]
     assert result["speaker_tag_to_diarization_speaker"] == {"0": 1}
     assert result["words"][0]["speaker"] == "0"
+
+
+def test_default_retention_follows_engine_concurrency_unless_overridden(encoder, monkeypatch):
+    monkeypatch.delenv("NEMO_CTC_TIMESTAMP_RETAIN", raising=False)
+    assert ct._retention_limit() == 64
+
+    ct.set_default_retention(512)
+    assert ct._retention_limit() == 1024
+
+    monkeypatch.setenv("NEMO_CTC_TIMESTAMP_RETAIN", "10")
+    assert ct._retention_limit() == 10
+
+
+def test_request_with_several_audio_items_gets_no_timestamps(encoder):
+    _capture(2, 4, ["hash-a", "hash-b"])
+    ct._record_request_hashes([("two-clips", "hash-a"), ("two-clips", "hash-b"), ("one-clip", "hash-b")])
+
+    results = ct.align_requests([("two-clips", "one two"), ("one-clip", "three")])
+
+    assert results[0] == ct._empty_result()
+    assert _words(results[1]) == ["three"]
+    assert [texts for _, texts, _ in encoder.calls] == [["three"]]
+
+
+def test_placeholder_and_hash_count_mismatch_discards_the_forward(encoder):
+    ct.store_timestamp_inputs(ct.pending_row_ids(2), _inputs(2, 4), [1.0, 1.0])
+
+    assert ct._rename_pending(["hash-a"]) == 0
+    assert ct._store == {}
+
+    _capture(1, 3, ["hash-b"])
+    ct._record_request_hashes([("req", "hash-b")])
+    assert _words(ct.align_request("req", "ok")) == ["ok"]

@@ -35,8 +35,9 @@ around one call to ``_batch_mm_inputs_from_scheduler``, whose signatures match i
 The inputs move to pinned host memory without blocking the engine. An ASR state is
 1,280 values per 80 ms frame, far less than the vocabulary-wide CTC output, so the
 copy overlaps with compute instead of stalling it. Retention is local and bounded by
-``NEMO_CTC_TIMESTAMP_RETAIN`` entries, least recently used first: vLLM frees its
-encoder-cache entry when a request finishes, which is before alignment reads it.
+``NEMO_CTC_TIMESTAMP_RETAIN`` entries (default: twice the engine's ``max_num_seqs``),
+least recently used first: vLLM frees its encoder-cache entry when a request
+finishes, which is before alignment reads it.
 
 Alignment runs in the engine process, where the inputs live. Offline callers use
 :func:`ctc_timestamps` (or :func:`ctc_word_timestamps` for words only); a server
@@ -61,6 +62,7 @@ from nemo.utils import logging
 _PENDING_PREFIX = "__nemo_ctc_pending_"
 
 _RETENTION_ENV = "NEMO_CTC_TIMESTAMP_RETAIN"
+# Used until set_default_retention sizes retention from the engine, and as its floor.
 _DEFAULT_RETENTION = 64
 
 # Worker method names reached through collective_rpc: one request (a server's
@@ -113,6 +115,19 @@ def active_encoder() -> Any:
     """Return the live encoder, or ``None`` when timestamps are not enabled."""
     getter = _registry.get("get_encoder")
     return getter() if getter is not None else None
+
+
+def set_default_retention(max_num_seqs: int) -> None:
+    """Size retention from the engine's concurrency; ``NEMO_CTC_TIMESTAMP_RETAIN`` still wins.
+
+    Twice ``max_num_seqs`` holds every request that can be in flight plus as many
+    finished ones awaiting alignment, so a batch up to that size can be generated in
+    one call and aligned afterwards.
+
+    Args:
+        max_num_seqs (int): The engine's ``scheduler_config.max_num_seqs``.
+    """
+    _registry["retention"] = max(_DEFAULT_RETENTION, 2 * int(max_num_seqs))
 
 
 def pending_row_ids(count: int) -> list[str]:
@@ -210,28 +225,37 @@ def _record_request_hashes(pairs) -> None:
 
 def _retention_limit() -> int:
     """How many stored entries to hold before evicting the least recently used."""
+    default = _registry.get("retention", _DEFAULT_RETENTION)
     try:
-        value = int(os.environ.get(_RETENTION_ENV, _DEFAULT_RETENTION))
+        value = int(os.environ.get(_RETENTION_ENV, default))
     except ValueError:
-        return _DEFAULT_RETENTION
+        return default
     return max(1, value)
 
 
 def _rename_pending(mm_hashes: list[str]) -> int:
     """Rename this forward's placeholder entries to their real hashes."""
-    queue = getattr(_state, "pending_queue", None)
-    if not _store or not queue:
+    queue = getattr(_state, "pending_queue", None) or []
+    if len(queue) != len(mm_hashes):
+        # Pairing is positional, so unequal counts would attach inputs to another
+        # item's audio; no timestamps are better than wrong ones.
+        logging.warning(
+            "[NeMoSpeechLM] The encoder captured CTC timestamp inputs for %d items but vLLM scheduled %d; "
+            "discarding them.",
+            len(queue),
+            len(mm_hashes),
+        )
+        _discard_pending()
         return 0
     renamed = 0
     # vLLM accumulates encoder outputs in item order and pairs them with mm_hashes
     # positionally, so the queue head corresponds to the first hash.
-    for mm_hash in mm_hashes:
-        if not queue:
-            break
-        placeholder = queue.pop(0)
-        if placeholder in _store:
-            _store[mm_hash] = _store.pop(placeholder)
+    for placeholder, mm_hash in zip(queue, mm_hashes):
+        entry = _store.pop(placeholder, None)
+        if entry is not None:
+            _store[mm_hash] = entry
             renamed += 1
+    _state.pending_queue = []
     return renamed
 
 
@@ -287,34 +311,49 @@ def align_requests(items: Sequence[tuple[str, str]]) -> list[dict]:
         ``diarization`` (10 ms Sortformer activity segments, ``speaker`` being the
         Sortformer speaker index; the output to score diarization with), and
         ``speaker_tag_to_diarization_speaker`` linking the two. Empty lists when
-        nothing is stored for that request, when the transcript is empty, or when
-        its alignment fails.
+        nothing is stored for that request, when it has more than one audio item,
+        when the transcript is empty, or when its alignment fails.
     """
     results: list[dict] = [_empty_result() for _ in items]
     encoder = active_encoder()
     if encoder is None:
         return results
-    pending = []
+    pending, multi_audio, missing = [], [], []
     for index, (request_id, text) in enumerate(items):
         if not text.strip():
             continue
         hashes = mm_hashes_for_request(request_id)
+        if len(hashes) > 1:
+            # The transcript spans all of the request's audio, but each item has its
+            # own inputs and timeline, so aligning it to any one item would be wrong.
+            multi_audio.append(request_id)
+            continue
         key = next((h for h in hashes if h in _store), None)
         if key is None:
-            logging.warning(
-                "[NeMoSpeechLM] No CTC timestamp inputs for request %s (hashes=%s, store=%d entries). "
-                "They may have been evicted; raise %s.",
-                request_id,
-                hashes,
-                len(_store),
-                _RETENTION_ENV,
-            )
+            missing.append(request_id)
             continue
         # Re-insert rather than take: a repeated call for this request, or another
         # request whose audio hit vLLM's encoder cache, must still find the inputs.
         entry = _store.pop(key)
         _store[key] = entry
         pending.append((index, text, entry))
+    if multi_audio:
+        logging.warning(
+            "[NeMoSpeechLM] CTC timestamps need one audio item per request; skipped %d requests with more "
+            "(first: %s).",
+            len(multi_audio),
+            multi_audio[0],
+        )
+    if missing:
+        logging.warning(
+            "[NeMoSpeechLM] No CTC timestamp inputs for %d of %d requests (first: %s): evicted or never "
+            "captured. Only the latest %d captures are kept; align more often or raise %s.",
+            len(missing),
+            len(items),
+            missing[0],
+            _retention_limit(),
+            _RETENTION_ENV,
+        )
 
     device = next(encoder.parameters()).device
     for start in range(0, len(pending), _ALIGN_BATCH):
@@ -456,13 +495,15 @@ def ctc_timestamps(
     thread, so aligning while other requests decode would stall them.
 
     Inputs are held only for the most recent ``NEMO_CTC_TIMESTAMP_RETAIN`` captures
-    (default 64), so align at least that often, e.g. by generating in chunks no
-    larger than the limit, or raise the limit to cover a whole batch.
+    (default: twice the engine's ``max_num_seqs``), so align at least that often,
+    e.g. by generating in chunks no larger than the limit, or raise the limit to
+    cover a whole batch.
 
     Args:
         llm (Any): The ``vllm.LLM`` that produced ``outputs``, with CTC timestamps enabled.
-        outputs (Sequence[Any]): Its ``RequestOutput`` objects. Decode speaker-tagged
-            prompts with ``skip_special_tokens=False`` so ``<spk:N>`` reaches the aligner.
+        outputs (Sequence[Any]): Its ``RequestOutput`` objects, one audio item each.
+            Decode speaker-tagged prompts with ``skip_special_tokens=False`` so
+            ``<spk:N>`` reaches the aligner.
         texts (Sequence[str] | None): Transcripts to align instead of the generated
             ones, one per output, e.g. a reference or corrected transcript.
         chunk_size (int): Outputs aligned per RPC.
@@ -473,8 +514,7 @@ def ctc_timestamps(
     if texts is not None and len(texts) != len(outputs):
         raise ValueError(f"Got {len(texts)} texts for {len(outputs)} outputs.")
     items = [
-        (out.request_id, out.outputs[0].text if texts is None else texts[index])
-        for index, out in enumerate(outputs)
+        (out.request_id, out.outputs[0].text if texts is None else texts[index]) for index, out in enumerate(outputs)
     ]
     results: list[dict] = []
     for start in range(0, len(items), chunk_size):
@@ -523,9 +563,7 @@ def install_encoder_cache_binding(get_encoder) -> None:
         outputs = original(self, scheduler_output, *args, **kwargs)
 
         _rename_pending(mm_hashes)
-        _record_request_hashes(
-            (req_id, mm_hash) for mm_hash, (req_id, _position) in zip(mm_hashes, mm_lora_refs)
-        )
+        _record_request_hashes((req_id, mm_hash) for mm_hash, (req_id, _position) in zip(mm_hashes, mm_lora_refs))
         # Deliberately NOT mirroring scheduler_output.free_encoder_mm_hashes: vLLM
         # frees its encoder-cache entry when the request finishes, which is before
         # alignment reads the inputs. Bound retention here instead.
