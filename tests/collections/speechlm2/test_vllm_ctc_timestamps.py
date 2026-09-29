@@ -14,6 +14,7 @@
 
 """The vLLM plugin's per-request store for deferred CTC timestamp inputs, on CPU."""
 
+import sys
 from collections import deque
 from types import SimpleNamespace
 
@@ -279,7 +280,7 @@ def test_unexpected_alignment_errors_are_raised_not_hidden(encoder):
         ct.align_requests([("req-a", "fine"), ("req-b", "crash")])
 
 
-def test_durations_given_as_a_tensor_reach_the_aligner(encoder):
+def test_tensor_durations_survive_compaction(encoder):
     ct.store_timestamp_inputs(ct.pending_row_ids(2), _inputs(2, 4), torch.tensor([0.5, 0.25], dtype=torch.float64))
     ct._rename_pending(["hash-a", "hash-b"])
     ct._compact_ready()
@@ -332,3 +333,78 @@ def test_collate_assembles_padded_rows_on_the_gpu(encoder):
     assert batch.asr_encoded.is_cuda and batch.asr_encoded.shape == (2, 4, 5)
     assert torch.equal(batch.asr_encoded[1, :, :3].cpu(), ct._store["hash-b"]["asr_encoded"][0])
     assert torch.count_nonzero(batch.asr_encoded[1, :, 3:]) == 0
+
+
+def test_runner_hook_names_captures_maps_cache_hits_and_drops_stray_placeholders(encoder, monkeypatch):
+    class StubRunner:
+        def _batch_mm_inputs_from_scheduler(self, step):
+            return step.hashes, None, [(req_id, None) for req_id in step.req_ids]
+
+        def _execute_mm_encoder(self, step):
+            # What _process_audio does for the items vLLM encodes this step.
+            if step.hashes:
+                count = len(step.hashes)
+                ct.store_timestamp_inputs(ct.pending_row_ids(count), _inputs(count, 4), [1.0] * count)
+            return "encoded"
+
+    def step(new_requests, encoded):
+        return SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(req_id=req_id, mm_features=[SimpleNamespace(identifier=mm_hash)])
+                for req_id, mm_hash in new_requests
+            ],
+            hashes=[mm_hash for _, mm_hash in encoded],
+            req_ids=[req_id for req_id, _ in encoded],
+        )
+
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_model_runner", SimpleNamespace(GPUModelRunner=StubRunner))
+    ct.install_encoder_cache_binding(lambda: encoder)
+    runner = StubRunner()
+
+    first = step([("req-a-0123abcd", "hash-a")], [("req-a-0123abcd", "hash-a")])
+    assert runner._execute_mm_encoder(first) == "encoded"
+    # The same audio again is an encoder-cache hit: scheduled, but never encoded.
+    runner._execute_mm_encoder(step([("req-b-0123abcd", "hash-a")], []))
+    # A forward outside the hook, like vLLM's startup profiling pass on dummy audio.
+    ct.store_timestamp_inputs(ct.pending_row_ids(1), _inputs(1, 9), [3310.0])
+    runner._execute_mm_encoder(step([("req-c-0123abcd", "hash-c")], [("req-c-0123abcd", "hash-c")]))
+
+    assert set(ct._store) == {"hash-a", "hash-c"} and not ct._uncompacted
+    results = ct.align_requests([("req-a", "a"), ("req-b", "b"), ("req-c", "c")])
+    assert [_words(result) for result in results] == [["a"], ["b"], ["c"]]
+    assert encoder.calls[0][2] == [1.0, 1.0, 1.0]
+
+
+def test_offline_alignment_refuses_a_model_without_timestamps(monkeypatch):
+    monkeypatch.setattr(ct, "_registry", {})
+
+    with pytest.raises(RuntimeError, match="not enabled"):
+        ct._worker_align_requests(None, [("req", "<spk:0> hi")])
+    assert ct._worker_align_request(None, "req", "<spk:0> hi") == ct._empty_result()
+
+
+def test_adapter_on_an_encoder_without_timestamp_support_is_refused():
+    pytest.importorskip("vllm")
+    from nemo.collections.speechlm2.vllm.salm.model import NeMoSpeechLMForConditionalGeneration
+
+    model = object.__new__(NeMoSpeechLMForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model._uses_pe_encoder = False
+
+    model._maybe_enable_ctc_timestamps(None, SimpleNamespace())
+    with pytest.raises(ValueError, match="ParallelExpertEncoder"):
+        model._maybe_enable_ctc_timestamps({"adapter_path": "/adapter.pt"}, SimpleNamespace())
+
+
+def test_transcripts_without_speaker_tags_are_reported(encoder, caplog):
+    _capture(1, 4, ["hash-a"])
+    ct._record_request_hashes([("req", "hash-a")])
+
+    ct.align_request("req", "hello world")
+
+    assert "no <spk:N> speaker tags" in caplog.text
+
+
+def test_requests_without_recorded_audio_are_not_reported_as_evicted(encoder, caplog):
+    assert ct.align_requests([("text-only", "<spk:0> hello")]) == [ct._empty_result()]
+    assert "No audio was recorded" in caplog.text and "evicted" not in caplog.text

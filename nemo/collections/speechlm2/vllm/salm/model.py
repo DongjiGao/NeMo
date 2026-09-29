@@ -382,13 +382,17 @@ class NeMoSpeechLMForConditionalGeneration(
         Off unless configured: capture costs throughput and retains rows, so a
         deployment that does not want timestamps should not pay for them.
         """
-        if not self._uses_pe_encoder or not ctc_config:
+        if not ctc_config:
             return
         adapter_path = (
             ctc_config.get("adapter_path") if isinstance(ctc_config, dict) else getattr(ctc_config, "adapter_path", None)
         )
         if not adapter_path:
             return
+        if not self._uses_pe_encoder:
+            raise ValueError(
+                "ctc_timestamps.adapter_path is set, but CTC timestamps need a ParallelExpertEncoder perception encoder."
+            )
 
         from nemo.collections.speechlm2.parts.ctc_timestamp_utils import get_ctc_timestamp_aligner
         from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import install_encoder_cache_binding

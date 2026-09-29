@@ -457,8 +457,9 @@ def align_requests(items: Sequence[tuple[str, str]]) -> list[dict]:
         ``diarization`` (10 ms Sortformer activity segments, ``speaker`` being the
         Sortformer speaker index; the output to score diarization with), and
         ``speaker_tag_to_diarization_speaker`` linking the two. Empty lists when
-        nothing is stored for that request, when it has more than one audio item,
-        when the transcript is empty, or when the aligner cannot align it.
+        timestamps are not enabled, when no audio was recorded for the request,
+        when its inputs were evicted, when it has more than one audio item, when
+        the transcript is empty, or when the aligner cannot align it.
 
     Raises:
         Exception: Any aligner error other than ``ValueError``, which is how the
@@ -468,12 +469,15 @@ def align_requests(items: Sequence[tuple[str, str]]) -> list[dict]:
     encoder = active_encoder()
     if encoder is None:
         return results
-    pending, multi_audio, missing = [], [], []
+    pending, no_audio, multi_audio, evicted = [], [], [], []
     with _lock:
         for index, (request_id, text) in enumerate(items):
             if not text.strip():
                 continue
             hashes = mm_hashes_for_request(request_id)
+            if not hashes:
+                no_audio.append(request_id)
+                continue
             if len(hashes) > 1:
                 # The transcript spans all of the request's audio, but each item has its
                 # own inputs and timeline, so aligning it to any one item would be wrong.
@@ -481,7 +485,7 @@ def align_requests(items: Sequence[tuple[str, str]]) -> list[dict]:
                 continue
             key = next((h for h in hashes if h in _store), None)
             if key is None:
-                missing.append(request_id)
+                evicted.append(request_id)
                 continue
             # Re-insert rather than take: a repeated call for this request, or another
             # request whose audio hit vLLM's encoder cache, must still find the inputs.
@@ -497,17 +501,35 @@ def align_requests(items: Sequence[tuple[str, str]]) -> list[dict]:
             len(multi_audio),
             multi_audio[0],
         )
-    if missing:
+    if no_audio:
         logging.warning(
-            "[NeMoSpeechLM] No CTC timestamp inputs for %d of %d requests (first: %s): evicted or never "
-            "captured. At most %d captures and %.1f GB are kept; align more often or raise %s or %s.",
-            len(missing),
+            "[NeMoSpeechLM] No audio was recorded for %d of %d requests (first: %s): they carried no audio, "
+            "or the request id is unknown.",
+            len(no_audio),
             len(items),
-            missing[0],
+            no_audio[0],
+        )
+    if evicted:
+        logging.warning(
+            "[NeMoSpeechLM] CTC timestamp inputs for %d of %d requests (first: %s) were evicted. At most %d "
+            "captures and %.1f GB are kept; align more often or raise %s or %s.",
+            len(evicted),
+            len(items),
+            evicted[0],
             _retention_limit(),
             _byte_limit() / 1e9,
             _RETENTION_ENV,
             _RETENTION_GB_ENV,
+        )
+    # t-SOT output always opens with a tag, so a transcript without any lost them in decoding.
+    untagged = [items[index][0] for index, text, _ in pending if "<spk:" not in text]
+    if untagged:
+        logging.warning(
+            "[NeMoSpeechLM] %d of %d transcripts have no <spk:N> speaker tags (first: %s) and are aligned as "
+            "one speaker; decode with skip_special_tokens=False to keep them.",
+            len(untagged),
+            len(pending),
+            untagged[0],
         )
 
     device = next(encoder.parameters()).device
@@ -647,10 +669,20 @@ def _worker_align_request(worker: Any, request_id: str, text: str) -> dict:
 
 
 def _worker_align_requests(worker: Any, items: list) -> list[dict]:
-    """``collective_rpc`` entry point: align many finished requests in one call."""
+    """``collective_rpc`` entry point: align many finished requests in one call.
+
+    Only :func:`ctc_timestamps` calls this, so a model loaded without timestamps is an
+    error here; the single-request entry point, which a server calls for every
+    timestamped request, keeps answering with empty results instead.
+    """
     del worker
     if not _aligns_here():
         return [_empty_result() for _ in items]
+    if active_encoder() is None:
+        raise RuntimeError(
+            "CTC timestamps are not enabled for this model: its config has no ctc_timestamps.adapter_path "
+            "(check the hf_overrides key)."
+        )
     return align_requests([(request_id, text) for request_id, text in items])
 
 
@@ -698,6 +730,10 @@ def ctc_timestamps(
 
     Returns:
         list[dict]: Per output, the result described in :func:`align_requests`.
+
+    Raises:
+        RuntimeError: When ``llm`` was loaded without CTC timestamps, e.g. because the
+            ``ctc_timestamps`` key in ``hf_overrides`` is misspelled.
     """
     if texts is not None and len(texts) != len(outputs):
         raise ValueError(f"Got {len(texts)} texts for {len(outputs)} outputs.")
