@@ -14,6 +14,7 @@
 
 """The vLLM plugin's per-request store for deferred CTC timestamp inputs, on CPU."""
 
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -78,6 +79,7 @@ def encoder(monkeypatch):
     monkeypatch.setattr(ct, "_store", {})
     monkeypatch.setattr(ct, "_request_hashes", {})
     monkeypatch.setattr(ct, "_registry", {})
+    monkeypatch.setattr(ct, "_uncompacted", deque())
     monkeypatch.setattr(ct, "_state", SimpleNamespace())
     fake = _FakeEncoder()
     ct.register_encoder(lambda: fake)
@@ -187,3 +189,49 @@ def test_placeholder_and_hash_count_mismatch_discards_the_forward(encoder):
     _capture(1, 3, ["hash-b"])
     ct._record_request_hashes([("req", "hash-b")])
     assert _words(ct.align_request("req", "ok")) == ["ok"]
+
+
+def test_compaction_trims_each_row_to_its_valid_frames_in_its_own_storage(encoder):
+    inputs = CTCTimestampInputs(
+        asr_encoded=torch.randn(2, 4, 5),
+        asr_encoded_lengths=torch.tensor([5, 3]),
+        sortformer_sigmoids=torch.rand(2, 5, 2),
+        sortformer_lengths=torch.tensor([5, 3]),
+        diarization_labels=torch.ones(2, 4, 40, dtype=torch.bool),
+        diarization_lengths=torch.tensor([40, 24]),
+    )
+    ct.store_timestamp_inputs(ct.pending_row_ids(2), inputs, [0.4, 0.24])
+    ct._rename_pending(["hash-a", "hash-b"])
+
+    assert ct._compact_ready() == 2
+    short = ct._store["hash-b"]
+    assert short["asr_encoded"].shape == (1, 4, 3)
+    assert short["sortformer_sigmoids"].shape == (1, 3, 2)
+    assert short["diarization_labels"].shape == (1, 4, 24)
+    asr = short["asr_encoded"]
+    assert asr.untyped_storage().nbytes() == asr.numel() * asr.element_size()
+    assert torch.equal(asr[0], inputs.asr_encoded[1, :, :3])
+
+    ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b")])
+    ct.align_requests([("req-a", "one"), ("req-b", "two")])
+    collated = encoder.calls[0][0]
+    assert collated.asr_encoded.shape == (2, 4, 5)
+    assert collated.diarization_labels[0].all()
+    assert torch.count_nonzero(collated.diarization_labels[1, :, 24:]) == 0
+
+
+def test_evicted_rows_are_not_compacted(encoder, monkeypatch):
+    monkeypatch.setenv("NEMO_CTC_TIMESTAMP_RETAIN", "1")
+    _capture(2, 4, ["hash-a", "hash-b"])
+
+    ct._trim_store()
+
+    assert ct._compact_ready() == 1
+    assert list(ct._store) == ["hash-b"]
+
+
+def test_speaker_prior_weight_defaults_and_rejects_negative_values():
+    assert ct.speaker_logprob_weight({}) == 0.25
+    assert ct.speaker_logprob_weight(SimpleNamespace(speaker_logprob_weight=0)) == 0.0
+    with pytest.raises(ValueError, match="non-negative"):
+        ct.speaker_logprob_weight({"speaker_logprob_weight": -0.1})

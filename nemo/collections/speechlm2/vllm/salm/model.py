@@ -76,6 +76,7 @@ from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
     pending_row_ids,
     register_encoder,
     set_default_retention,
+    speaker_logprob_weight,
     store_timestamp_inputs,
 )
 
@@ -114,11 +115,6 @@ _AUDIO_LAST = True
 # validate_language from silently promising languages we have not evaluated;
 # other codes still pass with a warning through get_other_languages.
 _SUPPORTED_LANGUAGES: Mapping[str, str] = {"en": "english"}
-
-# Weight of the Sortformer speaker-activity prior in CTC alignment, overridable per
-# checkpoint as ctc_timestamps.speaker_logprob_weight. The aligner's own default is
-# 0.0, which lets words in overlapped speech drift out of their speaker's turns.
-_DEFAULT_SPEAKER_LOGPROB_WEIGHT = 0.25
 
 # Our timestamps come from CTC alignment rather than the token stream, and the
 # captured rows live in the engine process, so the serving layer has to fetch the
@@ -399,17 +395,13 @@ class NeMoSpeechLMForConditionalGeneration(
         encoder = self.perception.encoder
         if not getattr(encoder, "supports_ctc_timestamp_inputs", False):
             raise ValueError(f"{type(encoder).__name__} cannot produce CTC timestamp inputs.")
+        weight = speaker_logprob_weight(ctc_config)
         encoder.ctc_timestamp_model_path = adapter_path
         device = next(encoder.parameters()).device
         # Load now rather than on the first timestamped request, so a bad artifact
         # path fails at startup instead of mid-serve.
         aligner = get_ctc_timestamp_aligner(encoder, adapter_path, device)
-        weight = (
-            ctc_config.get("speaker_logprob_weight")
-            if isinstance(ctc_config, dict)
-            else getattr(ctc_config, "speaker_logprob_weight", None)
-        )
-        aligner.speaker_logprob_weight = float(_DEFAULT_SPEAKER_LOGPROB_WEIGHT if weight is None else weight)
+        aligner.speaker_logprob_weight = weight
 
         set_default_retention(vllm_config.scheduler_config.max_num_seqs)
         register_encoder(lambda: self.perception.encoder)

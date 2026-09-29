@@ -34,10 +34,12 @@ around one call to ``_batch_mm_inputs_from_scheduler``, whose signatures match i
 
 The inputs move to pinned host memory without blocking the engine. An ASR state is
 1,280 values per 80 ms frame, far less than the vocabulary-wide CTC output, so the
-copy overlaps with compute instead of stalling it. Retention is local and bounded by
-``NEMO_CTC_TIMESTAMP_RETAIN`` entries (default: twice the engine's ``max_num_seqs``),
-least recently used first: vLLM frees its encoder-cache entry when a request
-finishes, which is before alignment reads it.
+copy overlaps with compute instead of stalling it. Once a copy lands, each row is
+compacted to its own valid frames, so retaining it does not keep its whole padded
+batch alive. Retention is local and bounded by ``NEMO_CTC_TIMESTAMP_RETAIN`` entries
+(default: twice the engine's ``max_num_seqs``), least recently used first: vLLM
+frees its encoder-cache entry when a request finishes, which is before alignment
+reads it.
 
 Alignment runs in the engine process, where the inputs live. Offline callers use
 :func:`ctc_timestamps` (or :func:`ctc_word_timestamps` for words only); a server
@@ -51,6 +53,7 @@ from __future__ import annotations
 
 import os
 import threading
+from collections import deque
 from collections.abc import Sequence
 from typing import Any
 
@@ -77,28 +80,36 @@ _INTERNAL_ID_SUFFIX_LEN = 8
 # (batch, frames, vocabulary) log-prob tensor on the device.
 _ALIGN_BATCH = 16
 
-# CTCTimestampInputs tensor fields, with the time axis to pad along when collating
-# requests from different forwards (None for per-row lengths).
+# Weight of the Sortformer speaker-activity prior in CTC alignment, overridable per
+# checkpoint as ctc_timestamps.speaker_logprob_weight. The aligner's own default is
+# 0.0, which lets words in overlapped speech drift out of their speaker's turns.
+DEFAULT_SPEAKER_LOGPROB_WEIGHT = 0.25
+
+# CTCTimestampInputs tensor fields: the time axis to trim and pad along, and the
+# lengths field marking its valid frames (None for the lengths fields themselves).
 _FIELDS = (
-    ("asr_encoded", 2),
-    ("asr_encoded_lengths", None),
-    ("sortformer_sigmoids", 1),
-    ("sortformer_lengths", None),
-    ("diarization_labels", 2),
-    ("diarization_lengths", None),
+    ("asr_encoded", 2, "asr_encoded_lengths"),
+    ("asr_encoded_lengths", None, None),
+    ("sortformer_sigmoids", 1, "sortformer_lengths"),
+    ("sortformer_lengths", None, None),
+    ("diarization_labels", 2, "diarization_lengths"),
+    ("diarization_lengths", None, None),
 )
 
 # Placeholder bookkeeping stays thread-local: it is produced and consumed within a
 # single _execute_mm_encoder call on the engine thread.
 _state = threading.local()
 
-# Process-wide, unlike _state. With an in-process engine the alignment call runs on
-# the caller's thread while the encoder runs on the engine thread, so anything shared
-# between them must not be thread-local.
+# Process-wide, unlike _state, and guarded by _lock. With an in-process engine the
+# alignment call runs on the caller's thread while the encoder runs on the engine
+# thread, so anything shared between them must not be thread-local.
 _registry: dict[str, Any] = {}
 _store: dict[str, dict] = {}
 _request_hashes: dict[str, list[str]] = {}
-_request_lock = threading.Lock()
+# Stored rows that still view their forward's padded host buffers, oldest first.
+_uncompacted: deque[dict] = deque()
+# Reentrant because the alignment lookup resolves request ids while holding it.
+_lock = threading.RLock()
 
 
 def register_encoder(get_encoder) -> None:
@@ -130,6 +141,29 @@ def set_default_retention(max_num_seqs: int) -> None:
     _registry["retention"] = max(_DEFAULT_RETENTION, 2 * int(max_num_seqs))
 
 
+def speaker_logprob_weight(ctc_config: Any) -> float:
+    """Read the Sortformer prior weight from a checkpoint's ``ctc_timestamps`` block.
+
+    The aligner validates the weight only in its constructor, and the plugin sets it
+    on an aligner that is already built, so it is validated here instead.
+
+    Args:
+        ctc_config (Any): The ``ctc_timestamps`` block, as a dict or an attribute object.
+
+    Returns:
+        float: The configured weight, or ``DEFAULT_SPEAKER_LOGPROB_WEIGHT`` when unset.
+    """
+    value = (
+        ctc_config.get("speaker_logprob_weight")
+        if isinstance(ctc_config, dict)
+        else getattr(ctc_config, "speaker_logprob_weight", None)
+    )
+    weight = float(DEFAULT_SPEAKER_LOGPROB_WEIGHT if value is None else value)
+    if weight < 0:
+        raise ValueError(f"ctc_timestamps.speaker_logprob_weight must be non-negative; got {weight}.")
+    return weight
+
+
 def pending_row_ids(count: int) -> list[str]:
     """Return placeholder ids for the items of one encoder forward.
 
@@ -154,18 +188,20 @@ def store_timestamp_inputs(row_ids: Sequence[str], inputs: Any, audio_durations:
         inputs (CTCTimestampInputs): The encoder's timestamp inputs for the batch.
         audio_durations (Sequence[float]): Audio duration per row, in seconds.
     """
-    host = {name: _to_host(getattr(inputs, name)) for name, _ in _FIELDS}
-    on_device = any(getattr(inputs, name) is not None and getattr(inputs, name).is_cuda for name, _ in _FIELDS)
+    host = {name: _to_host(getattr(inputs, name)) for name, _, _ in _FIELDS}
+    on_device = any(getattr(inputs, name) is not None and getattr(inputs, name).is_cuda for name, _, _ in _FIELDS)
     # Rows are read only after this event, so the copies never block the forward.
     ready = torch.cuda.current_stream().record_event() if on_device else None
-    for row, (row_id, duration) in enumerate(zip(row_ids, audio_durations)):
-        entry = {name: None if tensor is None else tensor[row : row + 1] for name, tensor in host.items()}
-        entry.update(
-            diarization_frame_seconds=inputs.diarization_frame_seconds,
-            duration=float(duration),
-            ready=ready,
-        )
-        _store[row_id] = entry
+    with _lock:
+        for row, (row_id, duration) in enumerate(zip(row_ids, audio_durations)):
+            entry = {name: None if tensor is None else tensor[row : row + 1] for name, tensor in host.items()}
+            entry.update(
+                diarization_frame_seconds=inputs.diarization_frame_seconds,
+                duration=float(duration),
+                ready=ready,
+            )
+            _store[row_id] = entry
+            _uncompacted.append(entry)
 
 
 def _to_host(tensor: torch.Tensor | None) -> torch.Tensor | None:
@@ -184,7 +220,7 @@ def _resolve_request_id(request_id: str) -> str | None:
 
     Callers holding a ``RequestOutput`` see the external id, while the scheduler
     reports the internal one; exact matches win so ids without a suffix (older vLLM,
-    in-process callers) resolve unchanged. Must hold ``_request_lock``.
+    in-process callers) resolve unchanged. Must hold ``_lock``.
     """
     if request_id in _request_hashes:
         return request_id
@@ -204,14 +240,14 @@ def mm_hashes_for_request(request_id: str) -> list[str]:
     Returns:
         list[str]: Hashes whose inputs belong to this request.
     """
-    with _request_lock:
+    with _lock:
         key = _resolve_request_id(request_id)
         return list(_request_hashes[key]) if key is not None else []
 
 
 def _record_request_hashes(pairs) -> None:
     """Associate a request with the hashes whose inputs belong to it."""
-    with _request_lock:
+    with _lock:
         for req_id, mm_hash in pairs:
             hashes = _request_hashes.setdefault(req_id, [])
             if mm_hash not in hashes:
@@ -250,11 +286,12 @@ def _rename_pending(mm_hashes: list[str]) -> int:
     renamed = 0
     # vLLM accumulates encoder outputs in item order and pairs them with mm_hashes
     # positionally, so the queue head corresponds to the first hash.
-    for placeholder, mm_hash in zip(queue, mm_hashes):
-        entry = _store.pop(placeholder, None)
-        if entry is not None:
-            _store[mm_hash] = entry
-            renamed += 1
+    with _lock:
+        for placeholder, mm_hash in zip(queue, mm_hashes):
+            entry = _store.pop(placeholder, None)
+            if entry is not None:
+                _store[mm_hash] = entry
+                renamed += 1
     _state.pending_queue = []
     return renamed
 
@@ -264,8 +301,11 @@ def _discard_pending() -> int:
     queue = getattr(_state, "pending_queue", None)
     if not queue:
         return 0
-    for placeholder in queue:
-        _store.pop(placeholder, None)
+    with _lock:
+        for placeholder in queue:
+            entry = _store.pop(placeholder, None)
+            if entry is not None:
+                entry["dropped"] = True
     _state.pending_queue = []
     return len(queue)
 
@@ -280,9 +320,10 @@ def _trim_store() -> int:
     """
     limit = _retention_limit()
     evicted = 0
-    while len(_store) > limit:
-        _store.pop(next(iter(_store)), None)
-        evicted += 1
+    with _lock:
+        while len(_store) > limit:
+            _store.pop(next(iter(_store)))["dropped"] = True
+            evicted += 1
     if evicted:
         logging.debug(
             "[NeMoSpeechLM] Evicted %d CTC timestamp entries (limit %d). "
@@ -292,6 +333,39 @@ def _trim_store() -> int:
             _RETENTION_ENV,
         )
     return evicted
+
+
+def _compact_ready() -> int:
+    """Compact stored rows whose host copies have landed, oldest first, without waiting.
+
+    A row starts as a view of its forward's padded host buffers, which would stay
+    alive for as long as any row of that forward is retained. Copies complete in
+    stream order, so the first row still in flight ends the pass.
+    """
+    compacted = 0
+    with _lock:
+        while _uncompacted:
+            entry = _uncompacted[0]
+            if entry["ready"] is not None and not entry["ready"].query():
+                break
+            _uncompacted.popleft()
+            if not entry.get("dropped"):
+                _compact(entry)
+                compacted += 1
+    return compacted
+
+
+def _compact(entry: dict) -> None:
+    """Replace an entry's views of its forward's buffers with copies of its valid frames."""
+    for name, time_axis, lengths_name in _FIELDS:
+        tensor = entry[name]
+        if tensor is None:
+            continue
+        if time_axis is not None and entry[lengths_name] is not None:
+            valid = min(int(entry[lengths_name][0]), tensor.shape[time_axis])
+            tensor = tensor.narrow(time_axis, 0, valid)
+        entry[name] = tensor.clone()
+    entry["ready"] = None
 
 
 def _empty_result() -> dict:
@@ -319,24 +393,27 @@ def align_requests(items: Sequence[tuple[str, str]]) -> list[dict]:
     if encoder is None:
         return results
     pending, multi_audio, missing = [], [], []
-    for index, (request_id, text) in enumerate(items):
-        if not text.strip():
-            continue
-        hashes = mm_hashes_for_request(request_id)
-        if len(hashes) > 1:
-            # The transcript spans all of the request's audio, but each item has its
-            # own inputs and timeline, so aligning it to any one item would be wrong.
-            multi_audio.append(request_id)
-            continue
-        key = next((h for h in hashes if h in _store), None)
-        if key is None:
-            missing.append(request_id)
-            continue
-        # Re-insert rather than take: a repeated call for this request, or another
-        # request whose audio hit vLLM's encoder cache, must still find the inputs.
-        entry = _store.pop(key)
-        _store[key] = entry
-        pending.append((index, text, entry))
+    with _lock:
+        for index, (request_id, text) in enumerate(items):
+            if not text.strip():
+                continue
+            hashes = mm_hashes_for_request(request_id)
+            if len(hashes) > 1:
+                # The transcript spans all of the request's audio, but each item has its
+                # own inputs and timeline, so aligning it to any one item would be wrong.
+                multi_audio.append(request_id)
+                continue
+            key = next((h for h in hashes if h in _store), None)
+            if key is None:
+                missing.append(request_id)
+                continue
+            # Re-insert rather than take: a repeated call for this request, or another
+            # request whose audio hit vLLM's encoder cache, must still find the inputs.
+            entry = _store.pop(key)
+            _store[key] = entry
+            # A snapshot, so compaction on the engine thread cannot swap its tensors
+            # while they are being collated.
+            pending.append((index, text, dict(entry)))
     if multi_audio:
         logging.warning(
             "[NeMoSpeechLM] CTC timestamps need one audio item per request; skipped %d requests with more "
@@ -394,7 +471,7 @@ def _collate(entries: list[dict], device: torch.device) -> Any:
         if entry["ready"] is not None:
             entry["ready"].synchronize()
     fields = {}
-    for name, time_axis in _FIELDS:
+    for name, time_axis, _ in _FIELDS:
         tensors = [entry[name] for entry in entries]
         if any(tensor is None for tensor in tensors):
             fields[name] = None
@@ -568,6 +645,7 @@ def install_encoder_cache_binding(get_encoder) -> None:
         # frees its encoder-cache entry when the request finishes, which is before
         # alignment reads the inputs. Bound retention here instead.
         _trim_store()
+        _compact_ready()
         return outputs
 
     _execute_mm_encoder._nemo_ctc_timestamp_bound = True
