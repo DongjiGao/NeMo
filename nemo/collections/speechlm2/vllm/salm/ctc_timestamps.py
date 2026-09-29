@@ -110,6 +110,8 @@ _state = threading.local()
 _registry: dict[str, Any] = {}
 _store: dict[str, dict] = {}
 _request_hashes: dict[str, list[str]] = {}
+# External request id -> the internal id the scheduler reported for it.
+_external_ids: dict[str, str] = {}
 # Stored rows that still view their forward's padded host buffers, oldest first.
 _uncompacted: deque[dict] = deque()
 # Reentrant because the alignment lookup resolves request ids while holding it.
@@ -184,24 +186,33 @@ def pending_row_ids(count: int) -> list[str]:
     return ids
 
 
-def store_timestamp_inputs(row_ids: Sequence[str], inputs: Any, audio_durations: Sequence[float]) -> None:
+def store_timestamp_inputs(
+    row_ids: Sequence[str], inputs: Any, audio_durations: torch.Tensor | Sequence[float]
+) -> None:
     """Keep one forward's ``CTCTimestampInputs`` per item, in host memory.
 
     Args:
         row_ids (Sequence[str]): One placeholder id per batch row, from :func:`pending_row_ids`.
         inputs (CTCTimestampInputs): The encoder's timestamp inputs for the batch.
-        audio_durations (Sequence[float]): Audio duration per row, in seconds.
+        audio_durations (torch.Tensor | Sequence[float]): Audio duration per row, in
+            seconds. A device tensor is copied along with the inputs, so the forward
+            never waits to read it.
     """
+    if not isinstance(audio_durations, torch.Tensor):
+        audio_durations = torch.tensor(audio_durations, dtype=torch.float64)
     host = {name: _to_host(getattr(inputs, name)) for name, _, _ in _FIELDS}
-    on_device = any(getattr(inputs, name) is not None and getattr(inputs, name).is_cuda for name, _, _ in _FIELDS)
+    durations = _to_host(audio_durations)
+    on_device = audio_durations.is_cuda or any(
+        getattr(inputs, name) is not None and getattr(inputs, name).is_cuda for name, _, _ in _FIELDS
+    )
     # Rows are read only after this event, so the copies never block the forward.
     ready = torch.cuda.current_stream().record_event() if on_device else None
     with _lock:
-        for row, (row_id, duration) in enumerate(zip(row_ids, audio_durations)):
+        for row, row_id in enumerate(row_ids):
             entry = {name: None if tensor is None else tensor[row : row + 1] for name, tensor in host.items()}
             entry.update(
                 diarization_frame_seconds=inputs.diarization_frame_seconds,
-                duration=float(duration),
+                duration=durations[row : row + 1],
                 ready=ready,
             )
             entry["nbytes"] = _entry_nbytes(entry)
@@ -234,11 +245,14 @@ def _resolve_request_id(request_id: str) -> str | None:
     """
     if request_id in _request_hashes:
         return request_id
-    prefix = f"{request_id}-"
-    for recorded in _request_hashes:
-        if recorded.startswith(prefix) and len(recorded) == len(prefix) + _INTERNAL_ID_SUFFIX_LEN:
-            return recorded
-    return None
+    internal = _external_ids.get(request_id)
+    return internal if internal in _request_hashes else None
+
+
+def _external_id(internal_id: str) -> str | None:
+    """Strip vLLM's ``-{8 chars}`` request id suffix, or ``None`` when there is none."""
+    cut = len(internal_id) - _INTERNAL_ID_SUFFIX_LEN - 1
+    return internal_id[:cut] if cut > 0 and internal_id[cut] == "-" else None
 
 
 def mm_hashes_for_request(request_id: str) -> list[str]:
@@ -262,11 +276,18 @@ def _record_request_hashes(pairs) -> None:
             hashes = _request_hashes.setdefault(req_id, [])
             if mm_hash not in hashes:
                 hashes.append(mm_hash)
+            external = _external_id(req_id)
+            if external is not None:
+                _external_ids[external] = req_id
         # Entries are tiny but never removed on use, so cap the map on the same
         # order as the input store.
         limit = _retention_limit() * 4
         while len(_request_hashes) > limit:
-            _request_hashes.pop(next(iter(_request_hashes)), None)
+            evicted = next(iter(_request_hashes))
+            del _request_hashes[evicted]
+            external = _external_id(evicted)
+            if external is not None and _external_ids.get(external) == evicted:
+                del _external_ids[external]
 
 
 def _retention_limit() -> int:
@@ -395,6 +416,7 @@ def _compact(entry: dict) -> None:
             valid = min(int(entry[lengths_name][0]), tensor.shape[time_axis])
             tensor = tensor.narrow(time_axis, 0, valid)
         entry[name] = tensor.clone()
+    entry["duration"] = float(entry["duration"])
     entry["ready"] = None
     entry["nbytes"] = _entry_nbytes(entry)
 
@@ -417,7 +439,11 @@ def align_requests(items: Sequence[tuple[str, str]]) -> list[dict]:
         Sortformer speaker index; the output to score diarization with), and
         ``speaker_tag_to_diarization_speaker`` linking the two. Empty lists when
         nothing is stored for that request, when it has more than one audio item,
-        when the transcript is empty, or when its alignment fails.
+        when the transcript is empty, or when the aligner cannot align it.
+
+    Raises:
+        Exception: Any aligner error other than ``ValueError``, which is how the
+            aligner rejects a transcript it cannot align.
     """
     results: list[dict] = [_empty_result() for _ in items]
     encoder = active_encoder()
@@ -480,17 +506,22 @@ def align_request(request_id: str, text: str) -> dict:
 
 def _align_chunk(encoder: Any, chunk: list, device: torch.device) -> list[dict]:
     """Run the deferred head and alignment for up to ``_ALIGN_BATCH`` requests."""
+    entries = [entry for _, _, entry in chunk]
     try:
+        timestamp_inputs = _collate(entries, device)
         results = encoder.generate_ctc_timestamps(
-            timestamp_inputs=_collate([entry for _, _, entry in chunk], device),
+            timestamp_inputs=timestamp_inputs,
             sot_transcripts=[text for _, text, _ in chunk],
-            audio_durations=[entry["duration"] for _, _, entry in chunk],
+            # Read only after _collate has waited for the host copies.
+            audio_durations=[float(entry["duration"]) for entry in entries],
         )
     except Exception as error:  # noqa: BLE001
         if len(chunk) > 1:
-            # One transcript the tokenizer cannot split consistently should not
-            # cost the rest of the batch its timestamps.
+            # Retry one by one, so that a single bad transcript, or a batch too large
+            # for device memory, does not cost the rest their timestamps.
             return [_align_chunk(encoder, [item], device)[0] for item in chunk]
+        if not isinstance(error, ValueError):
+            raise
         logging.warning("[NeMoSpeechLM] CTC alignment failed: %s", error)
         return [_empty_result()]
     return [_public_result(result) for result in results]
@@ -506,34 +537,39 @@ def _collate(entries: list[dict], device: torch.device) -> Any:
     fields = {}
     for name, time_axis, _ in _FIELDS:
         tensors = [entry[name] for entry in entries]
-        if any(tensor is None for tensor in tensors):
-            fields[name] = None
-            continue
-        if time_axis is not None:
-            width = max(tensor.shape[time_axis] for tensor in tensors)
-            tensors = [_pad_to(tensor, time_axis, width) for tensor in tensors]
-        fields[name] = torch.cat(tensors, dim=0).to(device=device, non_blocking=True)
+        fields[name] = None if any(t is None for t in tensors) else _collate_field(tensors, time_axis, device)
     return CTCTimestampInputs(**fields, diarization_frame_seconds=entries[0]["diarization_frame_seconds"])
 
 
-def _pad_to(tensor: torch.Tensor, axis: int, width: int) -> torch.Tensor:
-    """Zero-pad ``tensor`` along ``axis`` to ``width``; lengths mark the valid frames."""
-    if tensor.shape[axis] == width:
-        return tensor
-    shape = list(tensor.shape)
-    shape[axis] = width
-    padded = tensor.new_zeros(shape)
-    padded.narrow(axis, 0, tensor.shape[axis]).copy_(tensor)
-    return padded
+def _collate_field(tensors: list[torch.Tensor], time_axis: int | None, device: torch.device) -> torch.Tensor:
+    """Stack single-row tensors, zero-padding ``time_axis``; lengths mark the valid frames.
+
+    The batch is assembled in pinned memory when it is bound for the GPU, so the copy
+    to the device does not block.
+    """
+    shape = [len(tensors), *tensors[0].shape[1:]]
+    if time_axis is not None:
+        shape[time_axis] = max(tensor.shape[time_axis] for tensor in tensors)
+    batch = torch.zeros(shape, dtype=tensors[0].dtype, pin_memory=device.type == "cuda")
+    for row, tensor in enumerate(tensors):
+        target = batch[row : row + 1]
+        if time_axis is not None:
+            target = target.narrow(time_axis, 0, tensor.shape[time_axis])
+        target.copy_(tensor)
+    return batch.to(device=device, non_blocking=True)
 
 
 def _public_result(result: dict) -> dict:
-    """Plain, serializable view of one aligner result (see :func:`align_requests`)."""
+    """Plain, serializable view of one aligner result (see :func:`align_requests`).
+
+    Times are rounded to milliseconds; further digits are float noise from frame
+    arithmetic.
+    """
     words = [
         {
             "word": word["word"],
-            "start": float(word["start"]),
-            "end": float(word["end"]),
+            "start": _seconds(word["start"]),
+            "end": _seconds(word["end"]),
             "speaker": str(word["speaker"]),
         }
         for speaker_words in (result.get("speaker_word_timestamps") or {}).values()
@@ -541,7 +577,7 @@ def _public_result(result: dict) -> dict:
     ]
     words.sort(key=lambda w: (w["start"], w["end"]))
     diarization = [
-        {"speaker": int(segment["speaker"]), "start": float(segment["start"]), "end": float(segment["end"])}
+        {"speaker": int(segment["speaker"]), "start": _seconds(segment["start"]), "end": _seconds(segment["end"])}
         for segment in result.get("diarization_timestamps") or ()
     ]
     mapping = {
@@ -549,6 +585,10 @@ def _public_result(result: dict) -> dict:
         for tag, column in (result.get("speaker_tag_to_sortformer_column") or {}).items()
     }
     return {"words": words, "diarization": diarization, "speaker_tag_to_diarization_speaker": mapping}
+
+
+def _seconds(value: Any) -> float:
+    return round(float(value), 3)
 
 
 def _new_request_hashes(scheduler_output: Any):
@@ -564,15 +604,34 @@ def _new_request_hashes(scheduler_output: Any):
                 yield new_req.req_id, mm_hash
 
 
+def _aligns_here() -> bool:
+    """Whether this worker aligns.
+
+    Every tensor-parallel rank of the first pipeline stage runs the encoder and holds
+    the same inputs, so only its rank 0 aligns; ``collective_rpc`` lists that worker's
+    reply first. Outside an initialized engine, as in unit tests, every caller aligns.
+    """
+    try:
+        from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+    except ImportError:  # pragma: no cover - vLLM absent
+        return True
+    try:
+        return get_tp_group().rank_in_group == 0 and get_pp_group().is_first_rank
+    except (AssertionError, AttributeError):
+        return True
+
+
 def _worker_align_request(worker: Any, request_id: str, text: str) -> dict:
     """``collective_rpc`` entry point: align on the worker that holds the inputs."""
     del worker
-    return align_request(request_id, text)
+    return align_request(request_id, text) if _aligns_here() else _empty_result()
 
 
 def _worker_align_requests(worker: Any, items: list) -> list[dict]:
     """``collective_rpc`` entry point: align many finished requests in one call."""
     del worker
+    if not _aligns_here():
+        return [_empty_result() for _ in items]
     return align_requests([(request_id, text) for request_id, text in items])
 
 
@@ -629,6 +688,7 @@ def ctc_timestamps(
     results: list[dict] = []
     for start in range(0, len(items), chunk_size):
         batch = items[start : start + chunk_size]
+        # One reply per worker, in rank order; only the first worker aligns.
         results.extend(llm.collective_rpc(WORKER_ALIGN_BATCH_METHOD, args=(batch,))[0])
     return results
 

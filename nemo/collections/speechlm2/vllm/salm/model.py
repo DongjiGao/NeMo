@@ -466,13 +466,12 @@ class NeMoSpeechLMForConditionalGeneration(
                         # stored under placeholders that ctc_timestamps renames to
                         # each item's mm_hash once the runner announces it.
                         row_ids = pending_row_ids(audio_signal.shape[0])
-                        durations = (audio_lengths.float() / _SAMPLING_RATE).tolist()
                         audio_embs, audio_emb_lens, timestamp_inputs = self.perception(
                             input_signal=audio_signal,
                             input_signal_length=audio_lengths,
                             return_ctc_timestamp_inputs=True,
                         )
-                        store_timestamp_inputs(row_ids, timestamp_inputs, durations)
+                        store_timestamp_inputs(row_ids, timestamp_inputs, audio_lengths.double() / _SAMPLING_RATE)
                 audio_embeds = [emb[:emblen] for emb, emblen in zip(audio_embs, audio_emb_lens)]
             else:
                 audio_embeds = encode_audio_with_optional_chunking(

@@ -37,6 +37,8 @@ class _FakeEncoder(nn.Module):
         self.calls.append((timestamp_inputs, list(sot_transcripts), list(audio_durations)))
         if any("unalignable" in text for text in sot_transcripts):
             raise ValueError("tokenizer disagreement")
+        if any("crash" in text for text in sot_transcripts):
+            raise RuntimeError("kernel failure")
         return [
             {
                 "speaker_word_timestamps": {
@@ -78,6 +80,7 @@ def _capture(batch, frames, hashes, durations=None):
 def encoder(monkeypatch):
     monkeypatch.setattr(ct, "_store", {})
     monkeypatch.setattr(ct, "_request_hashes", {})
+    monkeypatch.setattr(ct, "_external_ids", {})
     monkeypatch.setattr(ct, "_registry", {})
     monkeypatch.setattr(ct, "_uncompacted", deque())
     monkeypatch.setattr(ct, "_state", SimpleNamespace())
@@ -259,3 +262,66 @@ def test_reencoded_audio_replaces_its_entry_as_the_most_recent(encoder):
 
     assert list(ct._store) == ["hash-b", "hash-a"]
     assert first["dropped"] and ct._store["hash-a"]["asr_encoded"].shape[-1] == 3
+
+
+def test_unexpected_alignment_errors_are_raised_not_hidden(encoder):
+    _capture(2, 4, ["hash-a", "hash-b"])
+    ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b")])
+
+    with pytest.raises(RuntimeError, match="kernel failure"):
+        ct.align_requests([("req-a", "fine"), ("req-b", "crash")])
+
+
+def test_durations_given_as_a_tensor_reach_the_aligner(encoder):
+    ct.store_timestamp_inputs(ct.pending_row_ids(2), _inputs(2, 4), torch.tensor([0.5, 0.25], dtype=torch.float64))
+    ct._rename_pending(["hash-a", "hash-b"])
+    ct._compact_ready()
+    ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b")])
+
+    ct.align_requests([("req-a", "x"), ("req-b", "y")])
+
+    assert encoder.calls[0][2] == [0.5, 0.25]
+    assert ct._store["hash-b"]["duration"] == 0.25
+
+
+def test_external_ids_resolve_through_an_index_that_follows_eviction(encoder, monkeypatch):
+    monkeypatch.setenv("NEMO_CTC_TIMESTAMP_RETAIN", "1")
+
+    ct._record_request_hashes([(f"req{i}-0123abcd", f"hash-{i}") for i in range(5)])
+
+    assert ct.mm_hashes_for_request("req0") == []
+    assert ct.mm_hashes_for_request("req4") == ct.mm_hashes_for_request("req4-0123abcd") == ["hash-4"]
+    assert ct._external_ids == {f"req{i}": f"req{i}-0123abcd" for i in range(1, 5)}
+
+
+def test_only_the_first_tensor_parallel_rank_aligns(encoder, monkeypatch):
+    _capture(1, 4, ["hash-a"])
+    ct._record_request_hashes([("req", "hash-a")])
+
+    monkeypatch.setattr(ct, "_aligns_here", lambda: False)
+    assert ct._worker_align_requests(None, [("req", "x")]) == [ct._empty_result()]
+    assert encoder.calls == []
+
+    monkeypatch.setattr(ct, "_aligns_here", lambda: True)
+    assert _words(ct._worker_align_requests(None, [("req", "x")])[0]) == ["x"]
+
+
+def test_output_times_are_rounded_to_milliseconds(encoder):
+    _capture(1, 4, ["hash-a"])
+    ct._record_request_hashes([("req", "hash-a")])
+
+    words = ct.align_request("req", "a b c")["words"]
+
+    assert [(w["start"], w["end"]) for w in words] == [(0.1, 0.18), (0.2, 0.28), (0.3, 0.38)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_collate_assembles_padded_rows_on_the_gpu(encoder):
+    _capture(1, 5, ["hash-a"])
+    _capture(1, 3, ["hash-b"])
+
+    batch = ct._collate([ct._store["hash-a"], ct._store["hash-b"]], torch.device("cuda"))
+
+    assert batch.asr_encoded.is_cuda and batch.asr_encoded.shape == (2, 4, 5)
+    assert torch.equal(batch.asr_encoded[1, :, :3].cpu(), ct._store["hash-b"]["asr_encoded"][0])
+    assert torch.count_nonzero(batch.asr_encoded[1, :, 3:]) == 0
