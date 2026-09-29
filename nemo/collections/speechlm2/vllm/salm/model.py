@@ -32,7 +32,6 @@ Requires NeMo toolkit for the audio encoder:
     pip install 'nemo-toolkit[asr]'
 """
 
-import contextlib
 from collections.abc import Iterable, Mapping
 from typing import Any, ClassVar, Literal
 
@@ -71,10 +70,12 @@ from nemo.collections.speechlm2.vllm.salm.backends import HybridBackend, make_ba
 from nemo.collections.speechlm2.vllm.salm.config import _AUDIO_PLACEHOLDER
 from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
     WORKER_ALIGN_METHOD,
+    active_encoder,
     align_request,
     install_worker_align_method,
     pending_row_ids,
     register_encoder,
+    store_timestamp_inputs,
 )
 
 _AUDIO_INPUT_DTYPE = torch.float32
@@ -112,6 +113,11 @@ _AUDIO_LAST = True
 # validate_language from silently promising languages we have not evaluated;
 # other codes still pass with a warning through get_other_languages.
 _SUPPORTED_LANGUAGES: Mapping[str, str] = {"en": "english"}
+
+# Weight of the Sortformer speaker-activity prior in CTC alignment, overridable per
+# checkpoint as ctc_timestamps.speaker_logprob_weight. The aligner's own default is
+# 0.0, which lets words in overlapped speech drift out of their speaker's turns.
+_DEFAULT_SPEAKER_LOGPROB_WEIGHT = 0.25
 
 # Our timestamps come from CTC alignment rather than the token stream, and the
 # captured rows live in the engine process, so the serving layer has to fetch the
@@ -386,16 +392,23 @@ class NeMoSpeechLMForConditionalGeneration(
         if not adapter_path:
             return
 
-        from nemo.collections.asr.modules.parallel_expert_encoder import _get_ctc_timestamp_extractor
+        from nemo.collections.speechlm2.parts.ctc_timestamp_utils import get_ctc_timestamp_aligner
         from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import install_encoder_cache_binding
 
         encoder = self.perception.encoder
+        if not getattr(encoder, "supports_ctc_timestamp_inputs", False):
+            raise ValueError(f"{type(encoder).__name__} cannot produce CTC timestamp inputs.")
         encoder.ctc_timestamp_model_path = adapter_path
         device = next(encoder.parameters()).device
-        # Load now rather than on the first timestamped request: a bad path
-        # should fail at startup, not mid-serve, and the adapter is ~2.7 GB.
-        _get_ctc_timestamp_extractor(encoder, adapter_path, device)
-        encoder.__dict__["_ctc_timestamp_serve_depth"] = 1
+        # Load now rather than on the first timestamped request, so a bad artifact
+        # path fails at startup instead of mid-serve.
+        aligner = get_ctc_timestamp_aligner(encoder, adapter_path, device)
+        weight = (
+            ctc_config.get("speaker_logprob_weight")
+            if isinstance(ctc_config, dict)
+            else getattr(ctc_config, "speaker_logprob_weight", None)
+        )
+        aligner.speaker_logprob_weight = float(_DEFAULT_SPEAKER_LOGPROB_WEIGHT if weight is None else weight)
 
         register_encoder(lambda: self.perception.encoder)
         install_encoder_cache_binding(lambda: self.perception.encoder)
@@ -449,20 +462,23 @@ class NeMoSpeechLMForConditionalGeneration(
         with torch.no_grad():
             if self._uses_pe_encoder:
                 encoder = self.perception.encoder
-                # Declare one placeholder id per item so the CTC capture is keyed
-                # rather than landing in a single slot that the next encoder call
-                # overwrites. The real mm_hash is not available here -- vLLM passes
-                # only tensors -- so ctc_timestamps renames these once the runner
-                # announces each (mm_hash, output) pair.
-                rows = contextlib.nullcontext()
-                if encoder.__dict__.get("_ctc_timestamp_serve_depth"):
-                    rows = encoder.ctc_timestamp_request_rows(
-                        pending_row_ids(audio_signal.shape[0])
-                    )
-                with rows, encoder.online_inference():
-                    audio_embs, audio_emb_lens = self.perception(
-                        input_signal=audio_signal, input_signal_length=audio_lengths
-                    )
+                with encoder.online_inference():
+                    if active_encoder() is None:
+                        audio_embs, audio_emb_lens = self.perception(
+                            input_signal=audio_signal, input_signal_length=audio_lengths
+                        )
+                    else:
+                        # vLLM passes only tensors here, so the timestamp inputs are
+                        # stored under placeholders that ctc_timestamps renames to
+                        # each item's mm_hash once the runner announces it.
+                        row_ids = pending_row_ids(audio_signal.shape[0])
+                        durations = (audio_lengths.float() / _SAMPLING_RATE).tolist()
+                        audio_embs, audio_emb_lens, timestamp_inputs = self.perception(
+                            input_signal=audio_signal,
+                            input_signal_length=audio_lengths,
+                            return_ctc_timestamp_inputs=True,
+                        )
+                        store_timestamp_inputs(row_ids, timestamp_inputs, durations)
                 audio_embeds = [emb[:emblen] for emb, emblen in zip(audio_embs, audio_emb_lens)]
             else:
                 audio_embeds = encode_audio_with_optional_chunking(
