@@ -43,10 +43,16 @@ class _FakeEncoder(nn.Module):
                         {"word": word, "speaker": 0, "start": 0.1 * (index + 1), "end": 0.1 * (index + 1) + 0.08}
                         for index, word in enumerate(text.split())
                     ]
-                }
+                },
+                "diarization_timestamps": [{"speaker": 1, "start": 0.05, "end": 0.93}],
+                "speaker_tag_to_sortformer_column": {0: 1},
             }
             for text in sot_transcripts
         ]
+
+
+def _words(result):
+    return [w["word"] for w in result["words"]]
 
 
 def _inputs(batch, frames):
@@ -83,9 +89,9 @@ def test_external_request_id_resolves_and_rows_from_two_forwards_are_padded(enco
     _capture(1, 3, ["hash-b"], durations=[0.24])
     ct._record_request_hashes([("req-a-0123abcd", "hash-a"), ("req-b-89abcdef", "hash-b")])
 
-    words = ct.align_requests([("req-a", "one two"), ("req-b", "three")])
+    results = ct.align_requests([("req-a", "one two"), ("req-b", "three")])
 
-    assert [[w["word"] for w in item] for item in words] == [["one", "two"], ["three"]]
+    assert [_words(result) for result in results] == [["one", "two"], ["three"]]
     inputs, texts, durations = encoder.calls[0]
     assert texts == ["one two", "three"] and durations == [0.4, 0.24]
     assert inputs.asr_encoded.shape == (2, 4, 5)
@@ -102,7 +108,7 @@ def test_cache_hit_request_and_repeated_alignment_find_the_same_inputs(encoder):
     ct._record_request_hashes(ct._new_request_hashes(SimpleNamespace(scheduled_new_reqs=[first, repeat])))
 
     assert ct.align_request("req-1", "a b") == ct.align_request("req-1", "a b")
-    assert [w["word"] for w in ct.align_request("req-2", "c")] == ["c"]
+    assert _words(ct.align_request("req-2", "c")) == ["c"]
 
 
 def test_placeholders_queued_outside_the_hook_are_discarded(encoder):
@@ -127,13 +133,24 @@ def test_retention_evicts_least_recently_aligned_first(encoder, monkeypatch):
     ct._trim_store()
 
     assert set(ct._store) == {"hash-a", "hash-c"}
-    assert ct.align_request("req-b", "gone") == []
+    assert ct.align_request("req-b", "gone") == ct._empty_result()
 
 
 def test_one_unalignable_transcript_does_not_cost_the_batch(encoder):
     _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
     ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b"), ("req-c", "hash-c")])
 
-    words = ct.align_requests([("req-a", "x"), ("req-b", "unalignable"), ("req-c", "y z")])
+    results = ct.align_requests([("req-a", "x"), ("req-b", "unalignable"), ("req-c", "y z")])
 
-    assert [[w["word"] for w in item] for item in words] == [["x"], [], ["y", "z"]]
+    assert [_words(result) for result in results] == [["x"], [], ["y", "z"]]
+
+
+def test_diarization_segments_and_speaker_mapping_pass_through(encoder):
+    _capture(1, 4, ["hash-a"])
+    ct._record_request_hashes([("req", "hash-a")])
+
+    result = ct.align_request("req", "<spk:0> hi")
+
+    assert result["diarization"] == [{"speaker": 1, "start": 0.05, "end": 0.93}]
+    assert result["speaker_tag_to_diarization_speaker"] == {"0": 1}
+    assert result["words"][0]["speaker"] == "0"

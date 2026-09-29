@@ -302,10 +302,10 @@ class NeMoSpeechLMForConditionalGeneration(
         engine shares this process, as with an in-process ``LLM``.
         """
         if worker_output is not None:
-            return list(worker_output)
+            return list(worker_output["words"])
         if request_output is None or not getattr(request_output, "request_id", None):
             return []
-        return align_request(request_output.request_id, text)
+        return align_request(request_output.request_id, text)["words"]
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

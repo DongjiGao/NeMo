@@ -39,7 +39,8 @@ copy overlaps with compute instead of stalling it. Retention is local and bounde
 encoder-cache entry when a request finishes, which is before alignment reads it.
 
 Alignment runs in the engine process, where the inputs live. Offline callers use
-:func:`ctc_word_timestamps`; a server reaches the same code through
+:func:`ctc_timestamps` (or :func:`ctc_word_timestamps` for words only); a server
+reaches the same code through
 ``collective_rpc`` by the names in ``WORKER_ALIGN_METHOD`` and
 ``WORKER_ALIGN_BATCH_METHOD``, passing the external request id, which vLLM's
 scheduler knows with a random suffix appended.
@@ -269,7 +270,11 @@ def _trim_store() -> int:
     return evicted
 
 
-def align_requests(items: Sequence[tuple[str, str]]) -> list[list[dict]]:
+def _empty_result() -> dict:
+    return {"words": [], "diarization": [], "speaker_tag_to_diarization_speaker": {}}
+
+
+def align_requests(items: Sequence[tuple[str, str]]) -> list[dict]:
     """Align finished transcripts against their requests' stored inputs.
 
     Args:
@@ -277,14 +282,18 @@ def align_requests(items: Sequence[tuple[str, str]]) -> list[list[dict]]:
             transcript is aligned exactly as given, speaker tags included.
 
     Returns:
-        list[list[dict]]: Per item, ``word``/``start``/``end``/``speaker`` entries in
-        start-time order; empty when nothing is stored for that request, when the
-        transcript is empty, or when its alignment fails.
+        list[dict]: Per item, ``words`` (``word``/``start``/``end``/``speaker`` in
+        start-time order, speaker being the transcript's ``<spk:N>`` tag),
+        ``diarization`` (10 ms Sortformer activity segments, ``speaker`` being the
+        Sortformer speaker index; the output to score diarization with), and
+        ``speaker_tag_to_diarization_speaker`` linking the two. Empty lists when
+        nothing is stored for that request, when the transcript is empty, or when
+        its alignment fails.
     """
-    words: list[list[dict]] = [[] for _ in items]
+    results: list[dict] = [_empty_result() for _ in items]
     encoder = active_encoder()
     if encoder is None:
-        return words
+        return results
     pending = []
     for index, (request_id, text) in enumerate(items):
         if not text.strip():
@@ -310,17 +319,17 @@ def align_requests(items: Sequence[tuple[str, str]]) -> list[list[dict]]:
     device = next(encoder.parameters()).device
     for start in range(0, len(pending), _ALIGN_BATCH):
         chunk = pending[start : start + _ALIGN_BATCH]
-        for (index, _, _), chunk_words in zip(chunk, _align_chunk(encoder, chunk, device)):
-            words[index] = chunk_words
-    return words
+        for (index, _, _), result in zip(chunk, _align_chunk(encoder, chunk, device)):
+            results[index] = result
+    return results
 
 
-def align_request(request_id: str, text: str) -> list[dict]:
+def align_request(request_id: str, text: str) -> dict:
     """Align one finished transcript; see :func:`align_requests`."""
     return align_requests([(request_id, text)])[0]
 
 
-def _align_chunk(encoder: Any, chunk: list, device: torch.device) -> list[list[dict]]:
+def _align_chunk(encoder: Any, chunk: list, device: torch.device) -> list[dict]:
     """Run the deferred head and alignment for up to ``_ALIGN_BATCH`` requests."""
     try:
         results = encoder.generate_ctc_timestamps(
@@ -334,8 +343,8 @@ def _align_chunk(encoder: Any, chunk: list, device: torch.device) -> list[list[d
             # cost the rest of the batch its timestamps.
             return [_align_chunk(encoder, [item], device)[0] for item in chunk]
         logging.warning("[NeMoSpeechLM] CTC alignment failed: %s", error)
-        return [[]]
-    return [_public_words(result) for result in results]
+        return [_empty_result()]
+    return [_public_result(result) for result in results]
 
 
 def _collate(entries: list[dict], device: torch.device) -> Any:
@@ -369,8 +378,8 @@ def _pad_to(tensor: torch.Tensor, axis: int, width: int) -> torch.Tensor:
     return padded
 
 
-def _public_words(result: dict) -> list[dict]:
-    """Flatten the aligner's per-speaker word timestamps into one start-ordered list."""
+def _public_result(result: dict) -> dict:
+    """Plain, serializable view of one aligner result (see :func:`align_requests`)."""
     words = [
         {
             "word": word["word"],
@@ -382,7 +391,15 @@ def _public_words(result: dict) -> list[dict]:
         for word in speaker_words
     ]
     words.sort(key=lambda w: (w["start"], w["end"]))
-    return words
+    diarization = [
+        {"speaker": int(segment["speaker"]), "start": float(segment["start"]), "end": float(segment["end"])}
+        for segment in result.get("diarization_timestamps") or ()
+    ]
+    mapping = {
+        str(tag): None if column is None else int(column)
+        for tag, column in (result.get("speaker_tag_to_sortformer_column") or {}).items()
+    }
+    return {"words": words, "diarization": diarization, "speaker_tag_to_diarization_speaker": mapping}
 
 
 def _new_request_hashes(scheduler_output: Any):
@@ -398,13 +415,13 @@ def _new_request_hashes(scheduler_output: Any):
                 yield new_req.req_id, mm_hash
 
 
-def _worker_align_request(worker: Any, request_id: str, text: str) -> list[dict]:
+def _worker_align_request(worker: Any, request_id: str, text: str) -> dict:
     """``collective_rpc`` entry point: align on the worker that holds the inputs."""
     del worker
     return align_request(request_id, text)
 
 
-def _worker_align_requests(worker: Any, items: list) -> list[list[dict]]:
+def _worker_align_requests(worker: Any, items: list) -> list[dict]:
     """``collective_rpc`` entry point: align many finished requests in one call."""
     del worker
     return align_requests([(request_id, text) for request_id, text in items])
@@ -429,8 +446,10 @@ def install_worker_align_method() -> None:
             setattr(Worker, name, method)
 
 
-def ctc_word_timestamps(llm: Any, outputs: Sequence[Any], chunk_size: int = 256) -> list[list[dict]]:
-    """Word timestamps for finished outputs of an offline vLLM ``LLM``.
+def ctc_timestamps(
+    llm: Any, outputs: Sequence[Any], texts: Sequence[str] | None = None, chunk_size: int = 256
+) -> list[dict]:
+    """CTC word timestamps and diarization for finished outputs of an offline vLLM ``LLM``.
 
     Alignment runs in the engine process, where the stored inputs live, with one RPC
     per ``chunk_size`` outputs. Call it after generation: the RPC runs on the engine
@@ -444,18 +463,29 @@ def ctc_word_timestamps(llm: Any, outputs: Sequence[Any], chunk_size: int = 256)
         llm (Any): The ``vllm.LLM`` that produced ``outputs``, with CTC timestamps enabled.
         outputs (Sequence[Any]): Its ``RequestOutput`` objects. Decode speaker-tagged
             prompts with ``skip_special_tokens=False`` so ``<spk:N>`` reaches the aligner.
+        texts (Sequence[str] | None): Transcripts to align instead of the generated
+            ones, one per output, e.g. a reference or corrected transcript.
         chunk_size (int): Outputs aligned per RPC.
 
     Returns:
-        list[list[dict]]: Per output, ``word``/``start``/``end``/``speaker`` entries in
-        start-time order; empty when nothing was stored for that output.
+        list[dict]: Per output, the result described in :func:`align_requests`.
     """
-    items = [(out.request_id, out.outputs[0].text) for out in outputs]
-    words: list[list[dict]] = []
+    if texts is not None and len(texts) != len(outputs):
+        raise ValueError(f"Got {len(texts)} texts for {len(outputs)} outputs.")
+    items = [
+        (out.request_id, out.outputs[0].text if texts is None else texts[index])
+        for index, out in enumerate(outputs)
+    ]
+    results: list[dict] = []
     for start in range(0, len(items), chunk_size):
         batch = items[start : start + chunk_size]
-        words.extend(llm.collective_rpc(WORKER_ALIGN_BATCH_METHOD, args=(batch,))[0])
-    return words
+        results.extend(llm.collective_rpc(WORKER_ALIGN_BATCH_METHOD, args=(batch,))[0])
+    return results
+
+
+def ctc_word_timestamps(llm: Any, outputs: Sequence[Any], chunk_size: int = 256) -> list[list[dict]]:
+    """Just the word timestamps of :func:`ctc_timestamps`, one list per output."""
+    return [result["words"] for result in ctc_timestamps(llm, outputs, chunk_size=chunk_size)]
 
 
 def install_encoder_cache_binding(get_encoder) -> None:
