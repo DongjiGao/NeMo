@@ -134,6 +134,30 @@ try:  # pragma: no cover - depends on the installed vLLM
 except Exception:  # noqa: BLE001
     _TIMESTAMP_PLUMBING = False
 
+# With that plumbing the server aligns only these responses; verbose_json only when
+# word timestamps are requested, which get_generation_prompt cannot see.
+_ALIGNED_RESPONSE_FORMATS = ("diarized_json", "verbose_json")
+
+
+def _ctc_adapter_path(ctc_config: Any) -> str | None:
+    """Return the adapter path of a checkpoint's ``ctc_timestamps`` block, if any."""
+    if not ctc_config:
+        return None
+    if isinstance(ctc_config, dict):
+        return ctc_config.get("adapter_path")
+    return getattr(ctc_config, "adapter_path", None)
+
+
+def _server_skips_ctc_capture(stt_params: Any) -> bool:
+    """Whether a transcription request's audio should not be captured for CTC timestamps.
+
+    A capture that the server never aligns would stay in the engine until the byte cap
+    evicts it.
+    """
+    if not _ctc_adapter_path(getattr(stt_params.model_config.hf_config, "ctc_timestamps", None)):
+        return False
+    return not (_TIMESTAMP_PLUMBING and getattr(stt_params, "response_format", None) in _ALIGNED_RESPONSE_FORMATS)
+
 
 def _is_parallel_expert_encoder(module: nn.Module) -> bool:
     """Recognize the shared speaker-aware encoder contract without importing ASR at plugin import time."""
@@ -197,6 +221,8 @@ class NeMoSpeechLMForConditionalGeneration(
 
         ``diarized_json`` requests get the t-SOT prompt, which is what makes the
         model emit speaker tags; everything else gets the measured verbatim prompt.
+        With CTC timestamps enabled, requests whose response the server never aligns
+        opt out of timestamp capture through ``mm_processor_kwargs``.
 
         Returns a text prompt rather than token ids on purpose: the multimodal
         processor splits on ``<|audio|>`` and expands each locator into the
@@ -233,7 +259,10 @@ class NeMoSpeechLMForConditionalGeneration(
                 add_generation_prompt=True,
             )
 
-        return {"prompt": prompt, "multi_modal_data": {"audio": stt_params.audio}}
+        inputs = {"prompt": prompt, "multi_modal_data": {"audio": stt_params.audio}}
+        if _server_skips_ctc_capture(stt_params):
+            inputs["mm_processor_kwargs"] = {"capture_ctc_timestamps": False}
+        return inputs
 
     @classmethod
     def get_word_timestamps(cls, text: str, request_output: Any = None, worker_output: Any = None) -> Any:
@@ -382,11 +411,7 @@ class NeMoSpeechLMForConditionalGeneration(
         Off unless configured: capture costs throughput and retains rows, so a
         deployment that does not want timestamps should not pay for them.
         """
-        if not ctc_config:
-            return
-        adapter_path = (
-            ctc_config.get("adapter_path") if isinstance(ctc_config, dict) else getattr(ctc_config, "adapter_path", None)
-        )
+        adapter_path = _ctc_adapter_path(ctc_config)
         if not adapter_path:
             return
 
@@ -422,6 +447,7 @@ class NeMoSpeechLMForConditionalGeneration(
         self,
         audio_signal: torch.Tensor | list[torch.Tensor] | None = None,
         audio_signal_length: torch.Tensor | None = None,
+        capture_ctc_timestamps: torch.Tensor | None = None,
         **kwargs,
     ) -> NeMoSpeechLMAudioInputs | None:
         if audio_signal is None:
@@ -440,6 +466,7 @@ class NeMoSpeechLMForConditionalGeneration(
         return NeMoSpeechLMAudioInputs(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
+            capture_ctc_timestamps=capture_ctc_timestamps,
         )
 
     def _process_audio(self, audio_input: NeMoSpeechLMAudioInputs) -> tuple[torch.Tensor, ...]:
@@ -464,7 +491,9 @@ class NeMoSpeechLMForConditionalGeneration(
         # does CTC timestamp capture, whose inputs cover one forward.
         with torch.no_grad():
             if active_encoder() is not None:
-                audio_embeds = self._encode_with_ctc_capture(audio_signal, audio_lengths)
+                audio_embeds = self._encode_with_ctc_capture(
+                    audio_signal, audio_lengths, audio_input.capture_ctc_timestamps
+                )
             elif self._uses_pe_encoder:
                 with self.perception.encoder.online_inference():
                     audio_embs, audio_emb_lens = self.perception(
@@ -482,20 +511,35 @@ class NeMoSpeechLMForConditionalGeneration(
 
         return tuple(emb.to(_PERCEPTION_DTYPE) for emb in audio_embeds)
 
-    def _encode_with_ctc_capture(self, audio_signal: torch.Tensor, audio_lengths: torch.Tensor) -> list[torch.Tensor]:
-        """One encoder forward over the whole audio that also keeps each item's CTC timestamp inputs."""
+    def _encode_with_ctc_capture(
+        self, audio_signal: torch.Tensor, audio_lengths: torch.Tensor, capture: torch.Tensor | None
+    ) -> list[torch.Tensor]:
+        """One encoder forward over the whole audio that also keeps CTC timestamp inputs.
+
+        Args:
+            audio_signal (torch.Tensor): Padded audio, one row per item.
+            audio_lengths (torch.Tensor): Valid samples per row.
+            capture (torch.Tensor | None): Per row, on the host, whether to keep its
+                inputs; ``None`` keeps every row.
+        """
         # vLLM passes only tensors here, so the timestamp inputs are stored under
         # placeholders that ctc_timestamps renames to each item's mm_hash once the
-        # runner announces it.
+        # runner announces it. The renaming pairs placeholders with the step's hashes
+        # by position, so rows that are not kept still take one.
         row_ids = pending_row_ids(audio_signal.shape[0])
+        if capture is not None:
+            row_ids = [row_id if keep else None for row_id, keep in zip(row_ids, capture.tolist())]
         online = self.perception.encoder.online_inference() if self._uses_pe_encoder else contextlib.nullcontext()
         with online:
-            audio_embs, audio_emb_lens, timestamp_inputs = self.perception(
-                input_signal=audio_signal,
-                input_signal_length=audio_lengths,
-                return_ctc_timestamp_inputs=True,
-            )
-        store_timestamp_inputs(row_ids, timestamp_inputs, audio_lengths.double() / _SAMPLING_RATE)
+            if all(row_id is None for row_id in row_ids):
+                audio_embs, audio_emb_lens = self.perception(input_signal=audio_signal, input_signal_length=audio_lengths)
+            else:
+                audio_embs, audio_emb_lens, timestamp_inputs = self.perception(
+                    input_signal=audio_signal,
+                    input_signal_length=audio_lengths,
+                    return_ctc_timestamp_inputs=True,
+                )
+                store_timestamp_inputs(row_ids, timestamp_inputs, audio_lengths.double() / _SAMPLING_RATE)
         return [emb[:emblen] for emb, emblen in zip(audio_embs, audio_emb_lens)]
 
     def embed_multimodal(self, **kwargs) -> MultiModalEmbeddings:

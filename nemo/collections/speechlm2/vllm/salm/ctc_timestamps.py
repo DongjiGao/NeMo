@@ -44,10 +44,11 @@ does not know about. So each capture records the requests that own it (repeated 
 shares one through the encoder cache). A capture is deleted once the last of them is
 aligned with ``release=True`` or released through :func:`ctc_release`, and vLLM has
 evicted its audio from the encoder cache: until then a new request with that audio is
-served from the cache and captures nothing, so it needs the old capture. Captures nobody
-releases, such as those of server requests that do not ask for timestamps, are bounded
-only by ``NEMO_CTC_TIMESTAMP_RETAIN_GB`` of host memory (default 8), least recently
-used first.
+served from the cache and captures nothing, so it needs the old capture. A request can
+also opt out of capture with ``mm_processor_kwargs={"capture_ctc_timestamps": False}``,
+which the server's prompt hook sets for responses it never aligns. Captures nobody
+releases are bounded only by ``NEMO_CTC_TIMESTAMP_RETAIN_GB`` of host memory
+(default 8), least recently used first.
 
 Alignment runs in the engine process, where the inputs live. Offline callers use
 :func:`ctc_timestamps` (or :func:`ctc_word_timestamps` for words only); a server
@@ -211,12 +212,13 @@ def pending_row_ids(count: int) -> list[str]:
 
 
 def store_timestamp_inputs(
-    row_ids: Sequence[str], inputs: Any, audio_durations: torch.Tensor | Sequence[float]
+    row_ids: Sequence[str | None], inputs: Any, audio_durations: torch.Tensor | Sequence[float]
 ) -> None:
     """Keep one forward's ``CTCTimestampInputs`` per item, in host memory.
 
     Args:
-        row_ids (Sequence[str]): One placeholder id per batch row, from :func:`pending_row_ids`.
+        row_ids (Sequence[str | None]): One placeholder id per batch row, from
+            :func:`pending_row_ids`; ``None`` skips the row.
         inputs (CTCTimestampInputs): The encoder's timestamp inputs for the batch.
         audio_durations (torch.Tensor | Sequence[float]): Audio duration per row, in
             seconds. A device tensor is copied along with the inputs, so the forward
@@ -233,6 +235,8 @@ def store_timestamp_inputs(
     ready = torch.cuda.current_stream().record_event() if on_device else None
     with _lock:
         for row, row_id in enumerate(row_ids):
+            if row_id is None:
+                continue
             entry = {name: None if tensor is None else tensor[row : row + 1] for name, tensor in host.items()}
             entry.update(
                 diarization_frame_seconds=inputs.diarization_frame_seconds,
@@ -410,9 +414,10 @@ def _trim_store() -> int:
 
     Captures normally go when their last owner is aligned or released, so this only
     catches captures nobody releases: outputs an offline caller drops, and in a server
-    every request that does not ask for timestamps. Python dicts preserve insertion
-    order and alignment re-inserts what it keeps, so the first keys are the least
-    recently used. The newest capture is kept even when it alone exceeds the budget.
+    aborted requests and ``verbose_json`` requests without word timestamps. Python
+    dicts preserve insertion order and alignment re-inserts what it keeps, so the first
+    keys are the least recently used. The newest capture is kept even when it alone
+    exceeds the budget.
     """
     byte_limit = _byte_limit()
     evicted = 0
@@ -424,7 +429,7 @@ def _trim_store() -> int:
             stored -= entry["nbytes"]
             evicted += 1
     if evicted:
-        # Routine for a server, whose untimestamped requests are never released;
+        # A long-running server can reach it through requests it never aligns;
         # alignment reports each capture it then misses.
         logging.warning(
             "[NeMoSpeechLM] Evicting CTC timestamp captures that were never aligned or released to stay under "

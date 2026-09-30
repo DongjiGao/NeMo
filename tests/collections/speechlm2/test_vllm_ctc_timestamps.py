@@ -472,33 +472,124 @@ def test_timestamps_refuse_encoder_chunking_outside_the_parallel_expert_encoder(
         model._maybe_enable_ctc_timestamps({"adapter_path": "/adapter.pt"}, SimpleNamespace())
 
 
-def test_any_encoder_with_the_flag_captures_through_one_unchunked_forward(encoder):
-    pytest.importorskip("vllm")
+class _FakePerception(nn.Module):
+    """A perception module whose encoder is not a ParallelExpertEncoder; records each forward."""
+
+    def __init__(self):
+        super().__init__()
+        self.anchor = nn.Parameter(torch.ones(1))
+        self.forwards = []
+
+    def forward(self, input_signal, input_signal_length, return_ctc_timestamp_inputs=False):
+        self.forwards.append((tuple(input_signal.shape), return_ctc_timestamp_inputs))
+        batch = input_signal.shape[0]
+        outputs = (torch.ones(batch, 3, 4), torch.full((batch,), 3))
+        return (*outputs, _inputs(batch, 4)) if return_ctc_timestamp_inputs else outputs
+
+
+def _model_with_fake_perception():
     from nemo.collections.speechlm2.vllm.salm.model import NeMoSpeechLMForConditionalGeneration
-
-    class _Perception(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.anchor = nn.Parameter(torch.ones(1))
-            self.forwards = []
-
-        def forward(self, input_signal, input_signal_length, return_ctc_timestamp_inputs=False):
-            self.forwards.append(tuple(input_signal.shape))
-            batch = input_signal.shape[0]
-            outputs = (torch.ones(batch, 3, 4), torch.full((batch,), 3))
-            return (*outputs, _inputs(batch, 4)) if return_ctc_timestamp_inputs else outputs
 
     model = object.__new__(NeMoSpeechLMForConditionalGeneration)
     torch.nn.Module.__init__(model)
-    model.perception = _Perception()
+    model.perception = _FakePerception()
     model._uses_pe_encoder = False
     model.encoder_chunk_size_seconds = None
+    return model
 
-    audio = SimpleNamespace(audio_signal=torch.ones(2, 16), audio_signal_length=torch.tensor([16, 8]))
-    embeddings = model._process_audio(audio)
 
-    assert [tuple(e.shape) for e in embeddings] == [(3, 4), (3, 4)] and model.perception.forwards == [(2, 16)]
+def _audio(capture=None):
+    capture = None if capture is None else torch.tensor(capture)
+    return SimpleNamespace(
+        audio_signal=torch.ones(2, 16), audio_signal_length=torch.tensor([16, 8]), capture_ctc_timestamps=capture
+    )
+
+
+def test_any_encoder_with_the_flag_captures_through_one_unchunked_forward(encoder):
+    pytest.importorskip("vllm")
+    model = _model_with_fake_perception()
+
+    embeddings = model._process_audio(_audio())
+
+    assert [tuple(e.shape) for e in embeddings] == [(3, 4), (3, 4)]
+    assert model.perception.forwards == [((2, 16), True)]
     assert len(ct._store) == 2 and len(ct._state.pending_queue) == 2
+
+
+def test_items_that_opt_out_keep_their_placeholder_but_store_nothing(encoder):
+    pytest.importorskip("vllm")
+    model = _model_with_fake_perception()
+
+    model._process_audio(_audio([False, True]))
+    model._process_audio(_audio([False, False]))
+
+    assert [capture for _, capture in model.perception.forwards] == [True, False]
+    # Placeholders pair with the step's hashes by position, so every item needs one.
+    assert ct._rename_pending(["hash-a", "hash-b", "hash-c", "hash-d"]) == 1
+    assert list(ct._store) == ["hash-b"] and float(ct._store["hash-b"]["duration"]) == 8 / 16000
+
+
+def test_processor_marks_the_audio_of_requests_that_opt_out_of_capture():
+    pytest.importorskip("vllm")
+    from nemo.collections.speechlm2.vllm.salm.audio import NeMoSpeechLMMultiModalProcessor
+
+    class _Tokenizer:
+        def get_vocab(self):
+            return {"<|audio|>": 0}
+
+        def encode(self, prompt, add_special_tokens=True):
+            return [0] * len(prompt.split())
+
+    processor = object.__new__(NeMoSpeechLMMultiModalProcessor)
+    processor.info = SimpleNamespace(
+        get_tokenizer=_Tokenizer,
+        _estimate_audio_tokens=lambda samples, chunk_size_seconds=None, estimator_config=None: 2,
+        _get_encoder_chunk_size_seconds=lambda: None,
+        _get_audio_token_estimator_config=lambda: None,
+    )
+
+    def capture_flags(mm_kwargs):
+        result = processor._call_hf_processor(
+            prompt="<|audio|> <|audio|>",
+            mm_data={"audios": [[0.0] * 8, [0.0] * 4]},
+            mm_kwargs=mm_kwargs,
+            tok_kwargs={},
+        )
+        return result["capture_ctc_timestamps"].tolist()
+
+    assert capture_flags({}) == [True, True]
+    assert capture_flags({"capture_ctc_timestamps": False}) == [False, False]
+    # Read on the host while encoding, where a device copy would need a sync.
+    assert processor._get_mm_fields_config(None, {})["capture_ctc_timestamps"].field.keep_on_cpu
+
+
+def test_server_requests_opt_out_of_capture_unless_their_response_is_aligned(monkeypatch):
+    pytest.importorskip("vllm")
+    import vllm.tokenizers
+
+    from nemo.collections.speechlm2.vllm.salm import model as salm_model
+
+    template = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: messages[0]["content"])
+    monkeypatch.setattr(vllm.tokenizers, "cached_tokenizer_from_config", lambda model_config: template)
+
+    def processor_kwargs(response_format, adapter_path="/adapter.pt"):
+        hf_config = SimpleNamespace(ctc_timestamps={"adapter_path": adapter_path} if adapter_path else None)
+        params = SimpleNamespace(
+            task_type="transcribe",
+            response_format=response_format,
+            audio=None,
+            model_config=SimpleNamespace(hf_config=hf_config),
+        )
+        return salm_model.NeMoSpeechLMForConditionalGeneration.get_generation_prompt(params).get("mm_processor_kwargs")
+
+    opted_out = {"capture_ctc_timestamps": False}
+    monkeypatch.setattr(salm_model, "_TIMESTAMP_PLUMBING", True)
+    formats = ("json", "text", "verbose_json", "diarized_json")
+    assert [processor_kwargs(f) for f in formats] == [opted_out, opted_out, None, None]
+    assert processor_kwargs("json", adapter_path=None) is None
+    # A server without the alignment plumbing aligns nothing.
+    monkeypatch.setattr(salm_model, "_TIMESTAMP_PLUMBING", False)
+    assert processor_kwargs("diarized_json") == opted_out
 
 
 def test_transcripts_without_speaker_tags_are_reported(encoder, caplog):
