@@ -32,6 +32,7 @@ Requires NeMo toolkit for the audio encoder:
     pip install 'nemo-toolkit[asr]'
 """
 
+import contextlib
 from collections.abc import Iterable, Mapping
 from typing import Any, ClassVar, Literal
 
@@ -389,10 +390,6 @@ class NeMoSpeechLMForConditionalGeneration(
         )
         if not adapter_path:
             return
-        if not self._uses_pe_encoder:
-            raise ValueError(
-                "ctc_timestamps.adapter_path is set, but CTC timestamps need a ParallelExpertEncoder perception encoder."
-            )
 
         from nemo.collections.speechlm2.parts.ctc_timestamp_utils import get_ctc_timestamp_aligner
         from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import install_encoder_cache_binding
@@ -400,6 +397,13 @@ class NeMoSpeechLMForConditionalGeneration(
         encoder = self.perception.encoder
         if not getattr(encoder, "supports_ctc_timestamp_inputs", False):
             raise ValueError(f"{type(encoder).__name__} cannot produce CTC timestamp inputs.")
+        if not self._uses_pe_encoder and self.encoder_chunk_size_seconds:
+            # Captured inputs cover one forward over the whole audio; nothing would
+            # reassemble the inputs of the chunks this setting splits it into.
+            raise ValueError(
+                "CTC timestamps need one unchunked encoder forward, but encoder_chunk_size_seconds="
+                f"{self.encoder_chunk_size_seconds} is set."
+            )
         require_v1_model_runner(vllm_config)
         speaker_prior_weight = read_speaker_prior_weight(ctc_config)
         encoder.ctc_timestamp_model_path = adapter_path
@@ -458,26 +462,16 @@ class NeMoSpeechLMForConditionalGeneration(
         # forward and the per-chunk embeddings are concatenated. ``None``
         # disables chunking and runs a single forward over the full batch.
         # A ParallelExpertEncoder instead runs its own context-preserving online
-        # inference over the full audio, so it bypasses the chunking helper.
+        # inference over the full audio, so it bypasses the chunking helper, and so
+        # does CTC timestamp capture, whose inputs cover one forward.
         with torch.no_grad():
-            if self._uses_pe_encoder:
-                encoder = self.perception.encoder
-                with encoder.online_inference():
-                    if active_encoder() is None:
-                        audio_embs, audio_emb_lens = self.perception(
-                            input_signal=audio_signal, input_signal_length=audio_lengths
-                        )
-                    else:
-                        # vLLM passes only tensors here, so the timestamp inputs are
-                        # stored under placeholders that ctc_timestamps renames to
-                        # each item's mm_hash once the runner announces it.
-                        row_ids = pending_row_ids(audio_signal.shape[0])
-                        audio_embs, audio_emb_lens, timestamp_inputs = self.perception(
-                            input_signal=audio_signal,
-                            input_signal_length=audio_lengths,
-                            return_ctc_timestamp_inputs=True,
-                        )
-                        store_timestamp_inputs(row_ids, timestamp_inputs, audio_lengths.double() / _SAMPLING_RATE)
+            if active_encoder() is not None:
+                audio_embeds = self._encode_with_ctc_capture(audio_signal, audio_lengths)
+            elif self._uses_pe_encoder:
+                with self.perception.encoder.online_inference():
+                    audio_embs, audio_emb_lens = self.perception(
+                        input_signal=audio_signal, input_signal_length=audio_lengths
+                    )
                 audio_embeds = [emb[:emblen] for emb, emblen in zip(audio_embs, audio_emb_lens)]
             else:
                 audio_embeds = encode_audio_with_optional_chunking(
@@ -489,6 +483,22 @@ class NeMoSpeechLMForConditionalGeneration(
                 )
 
         return tuple(emb.to(_PERCEPTION_DTYPE) for emb in audio_embeds)
+
+    def _encode_with_ctc_capture(self, audio_signal: torch.Tensor, audio_lengths: torch.Tensor) -> list[torch.Tensor]:
+        """One encoder forward over the whole audio that also keeps each item's CTC timestamp inputs."""
+        # vLLM passes only tensors here, so the timestamp inputs are stored under
+        # placeholders that ctc_timestamps renames to each item's mm_hash once the
+        # runner announces it.
+        row_ids = pending_row_ids(audio_signal.shape[0])
+        online = self.perception.encoder.online_inference() if self._uses_pe_encoder else contextlib.nullcontext()
+        with online:
+            audio_embs, audio_emb_lens, timestamp_inputs = self.perception(
+                input_signal=audio_signal,
+                input_signal_length=audio_lengths,
+                return_ctc_timestamp_inputs=True,
+            )
+        store_timestamp_inputs(row_ids, timestamp_inputs, audio_lengths.double() / _SAMPLING_RATE)
+        return [emb[:emblen] for emb, emblen in zip(audio_embs, audio_emb_lens)]
 
     def embed_multimodal(self, **kwargs) -> MultiModalEmbeddings:
         audio_input = self._parse_audio_input(**kwargs)

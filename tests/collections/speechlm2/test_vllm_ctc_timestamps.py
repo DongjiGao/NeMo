@@ -389,11 +389,56 @@ def test_adapter_on_an_encoder_without_timestamp_support_is_refused():
 
     model = object.__new__(NeMoSpeechLMForConditionalGeneration)
     torch.nn.Module.__init__(model)
+    model.perception = SimpleNamespace(encoder=SimpleNamespace())
     model._uses_pe_encoder = False
+    model.encoder_chunk_size_seconds = None
 
     model._maybe_enable_ctc_timestamps(None, SimpleNamespace())
-    with pytest.raises(ValueError, match="ParallelExpertEncoder"):
+    with pytest.raises(ValueError, match="cannot produce CTC timestamp inputs"):
         model._maybe_enable_ctc_timestamps({"adapter_path": "/adapter.pt"}, SimpleNamespace())
+
+
+def test_timestamps_refuse_encoder_chunking_outside_the_parallel_expert_encoder():
+    pytest.importorskip("vllm")
+    from nemo.collections.speechlm2.vllm.salm.model import NeMoSpeechLMForConditionalGeneration
+
+    model = object.__new__(NeMoSpeechLMForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.perception = SimpleNamespace(encoder=SimpleNamespace(supports_ctc_timestamp_inputs=True))
+    model._uses_pe_encoder = False
+    model.encoder_chunk_size_seconds = 30.0
+
+    with pytest.raises(ValueError, match="unchunked"):
+        model._maybe_enable_ctc_timestamps({"adapter_path": "/adapter.pt"}, SimpleNamespace())
+
+
+def test_any_encoder_with_the_flag_captures_through_one_unchunked_forward(encoder):
+    pytest.importorskip("vllm")
+    from nemo.collections.speechlm2.vllm.salm.model import NeMoSpeechLMForConditionalGeneration
+
+    class _Perception(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = nn.Parameter(torch.ones(1))
+            self.forwards = []
+
+        def forward(self, input_signal, input_signal_length, return_ctc_timestamp_inputs=False):
+            self.forwards.append(tuple(input_signal.shape))
+            batch = input_signal.shape[0]
+            outputs = (torch.ones(batch, 3, 4), torch.full((batch,), 3))
+            return (*outputs, _inputs(batch, 4)) if return_ctc_timestamp_inputs else outputs
+
+    model = object.__new__(NeMoSpeechLMForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.perception = _Perception()
+    model._uses_pe_encoder = False
+    model.encoder_chunk_size_seconds = None
+
+    audio = SimpleNamespace(audio_signal=torch.ones(2, 16), audio_signal_length=torch.tensor([16, 8]))
+    embeddings = model._process_audio(audio)
+
+    assert [tuple(e.shape) for e in embeddings] == [(3, 4), (3, 4)] and model.perception.forwards == [(2, 16)]
+    assert len(ct._store) == 2 and len(ct._state.pending_queue) == 2
 
 
 def test_transcripts_without_speaker_tags_are_reported(encoder, caplog):
