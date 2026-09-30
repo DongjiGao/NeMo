@@ -81,6 +81,8 @@ def _capture(batch, frames, hashes, durations=None):
 def encoder(monkeypatch):
     monkeypatch.setattr(ct, "_store", {})
     monkeypatch.setattr(ct, "_request_hashes", {})
+    monkeypatch.setattr(ct, "_hash_owners", {})
+    monkeypatch.setattr(ct, "_engine_cached", set())
     monkeypatch.setattr(ct, "_external_ids", {})
     monkeypatch.setattr(ct, "_registry", {})
     monkeypatch.setattr(ct, "_uncompacted", deque())
@@ -113,7 +115,7 @@ def test_cache_hit_request_and_repeated_alignment_find_the_same_inputs(encoder):
     repeat = SimpleNamespace(req_id="req-2", mm_features=[SimpleNamespace(identifier="hash-a")])
     ct._record_request_hashes(ct._new_request_hashes(SimpleNamespace(scheduled_new_reqs=[first, repeat])))
 
-    assert ct.align_request("req-1", "a b") == ct.align_request("req-1", "a b")
+    assert ct.align_request("req-1", "a b", release=False) == ct.align_request("req-1", "a b")
     assert _words(ct.align_request("req-2", "c")) == ["c"]
 
 
@@ -129,17 +131,33 @@ def test_placeholders_queued_outside_the_hook_are_discarded(encoder):
     assert encoder.calls[0][2] == [0.32]
 
 
-def test_retention_evicts_least_recently_aligned_first(encoder, monkeypatch):
-    monkeypatch.setenv("NEMO_CTC_TIMESTAMP_RETAIN", "2")
+def test_a_shared_capture_is_deleted_once_its_last_owner_is_aligned(encoder, caplog):
+    _capture(1, 4, ["hash-a"])
+    ct._record_request_hashes([("req-1", "hash-a"), ("req-2", "hash-a")])
+
+    assert _words(ct.align_request("req-1", "a")) == ["a"]
+    assert "hash-a" in ct._store and ct.align_request("req-1", "a") == ct._empty_result()
+    assert "already aligned or released" in caplog.text
+
+    assert _words(ct.align_request("req-2", "b")) == ["b"]
+    assert ct._store == {} and ct._hash_owners == {} and ct._request_hashes == {}
+
+
+def test_an_unowned_capture_lives_while_vllm_caches_its_audio(encoder):
     _capture(2, 4, ["hash-a", "hash-b"])
-    ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b"), ("req-c", "hash-c")])
-    ct.align_request("req-a", "keep")
-    _capture(1, 4, ["hash-c"])
+    ct._follow_engine_cache(encoded=["hash-a", "hash-b"])
+    ct._record_request_hashes([("req-1", "hash-a"), ("req-2", "hash-b")])
 
-    ct._trim_store()
+    ct.align_request("req-1", "a")
+    # A later request with the same audio is an encoder-cache hit and captures nothing.
+    ct._record_request_hashes([("req-3", "hash-a")])
+    assert _words(ct.align_request("req-3", "c")) == ["c"]
+    assert "hash-a" in ct._store
 
-    assert set(ct._store) == {"hash-a", "hash-c"}
-    assert ct.align_request("req-b", "gone") == ct._empty_result()
+    ct._follow_engine_cache(freed=["hash-a", "hash-b"])
+    assert list(ct._store) == ["hash-b"]
+    ct.align_request("req-2", "b")
+    assert ct._store == {}
 
 
 def test_one_unalignable_transcript_does_not_cost_the_batch(encoder):
@@ -162,15 +180,48 @@ def test_diarization_segments_and_speaker_mapping_pass_through(encoder):
     assert result["words"][0]["speaker"] == "0"
 
 
-def test_default_retention_follows_engine_concurrency_unless_overridden(encoder, monkeypatch):
-    monkeypatch.delenv("NEMO_CTC_TIMESTAMP_RETAIN", raising=False)
-    assert ct._retention_limit() == 64
+def test_release_false_keeps_captures_until_the_worker_releases_them(encoder):
+    _capture(2, 4, ["hash-a", "hash-b"])
+    ct._record_request_hashes([("req-a-0123abcd", "hash-a"), ("req-b-0123abcd", "hash-b")])
 
-    ct.set_default_retention(512)
-    assert ct._retention_limit() == 1024
+    ct.align_requests([("req-a", "x"), ("req-b", "y")], release=False)
+    assert set(ct._store) == {"hash-a", "hash-b"}
 
-    monkeypatch.setenv("NEMO_CTC_TIMESTAMP_RETAIN", "10")
-    assert ct._retention_limit() == 10
+    ct._worker_release_requests(None, ["req-a", "req-b", "never-seen"])
+    assert ct._store == {} and ct._request_hashes == {} and ct._external_ids == {}
+
+
+def test_ranks_that_do_not_align_still_release_their_captures(encoder, monkeypatch):
+    _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
+    ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b"), ("req-c", "hash-c")])
+    monkeypatch.setattr(ct, "_aligns_here", lambda: False)
+
+    assert ct._worker_align_requests(None, [("req-a", "x")], False) == [ct._empty_result()]
+    assert set(ct._store) == {"hash-a", "hash-b", "hash-c"}
+    ct._worker_align_requests(None, [("req-a", "x"), ("req-b", "y")])
+    assert ct._worker_align_request(None, "req-c", "z") == ct._empty_result()
+    assert ct._store == {} and encoder.calls == []
+
+
+def test_offline_api_aligns_repeatedly_then_releases(encoder):
+    _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
+    ct._record_request_hashes([(f"req-{name}-0123abcd", f"hash-{name}") for name in "abc"])
+    methods = {
+        ct.WORKER_ALIGN_BATCH_METHOD: ct._worker_align_requests,
+        ct.WORKER_RELEASE_METHOD: ct._worker_release_requests,
+    }
+    llm = SimpleNamespace(collective_rpc=lambda method, args: [methods[method](None, *args)])
+    outputs = [SimpleNamespace(request_id=f"req-{name}", outputs=[SimpleNamespace(text=name)]) for name in "ab"]
+
+    generated = ct.ctc_word_timestamps(llm, outputs, release=False)
+    reference = ct.ctc_timestamps(llm, outputs, texts=["ref a", "ref b"])
+
+    assert [[word["word"] for word in words] for words in generated] == [["a"], ["b"]]
+    assert [_words(result) for result in reference] == [["ref", "a"], ["ref", "b"]]
+    assert list(ct._store) == ["hash-c"]
+
+    ct.ctc_release(llm, [SimpleNamespace(request_id="req-c")])
+    assert ct._store == {}
 
 
 def test_request_with_several_audio_items_gets_no_timestamps(encoder):
@@ -225,7 +276,7 @@ def test_compaction_trims_each_row_to_its_valid_frames_in_its_own_storage(encode
 
 
 def test_evicted_rows_are_not_compacted(encoder, monkeypatch):
-    monkeypatch.setenv("NEMO_CTC_TIMESTAMP_RETAIN", "1")
+    monkeypatch.setenv("NEMO_CTC_TIMESTAMP_RETAIN_GB", "0")
     _capture(2, 4, ["hash-a", "hash-b"])
 
     ct._trim_store()
@@ -248,7 +299,8 @@ def test_model_runner_v2_is_refused():
         ct.require_v1_model_runner(SimpleNamespace(use_v2_model_runner=True))
 
 
-def test_byte_budget_evicts_least_recently_used_but_keeps_the_newest(encoder, monkeypatch):
+def test_byte_budget_evicts_least_recently_used_but_keeps_the_newest(encoder, monkeypatch, caplog):
+    monkeypatch.setattr(ct.logging, "once_logged", set())
     _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
     ct._compact_ready()
     row_bytes = ct._store["hash-a"]["nbytes"]
@@ -260,6 +312,8 @@ def test_byte_budget_evicts_least_recently_used_but_keeps_the_newest(encoder, mo
     monkeypatch.setenv("NEMO_CTC_TIMESTAMP_RETAIN_GB", "0")
     ct._trim_store()
     assert list(ct._store) == ["hash-c"]
+    # A server evicts routinely, so this is said once rather than per step.
+    assert caplog.text.count("Evicting CTC timestamp captures") == 1
 
 
 def test_reencoded_audio_replaces_its_entry_as_the_most_recent(encoder):
@@ -286,14 +340,14 @@ def test_tensor_durations_survive_compaction(encoder):
     ct._compact_ready()
     ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b")])
 
-    ct.align_requests([("req-a", "x"), ("req-b", "y")])
+    ct.align_requests([("req-a", "x"), ("req-b", "y")], release=False)
 
     assert encoder.calls[0][2] == [0.5, 0.25]
     assert ct._store["hash-b"]["duration"] == 0.25
 
 
-def test_external_ids_resolve_through_an_index_that_follows_eviction(encoder, monkeypatch):
-    monkeypatch.setenv("NEMO_CTC_TIMESTAMP_RETAIN", "1")
+def test_external_ids_resolve_through_an_index_that_follows_forgotten_requests(encoder, monkeypatch):
+    monkeypatch.setattr(ct, "_MAX_TRACKED_REQUESTS", 4)
 
     ct._record_request_hashes([(f"req{i}-0123abcd", f"hash-{i}") for i in range(5)])
 
@@ -307,7 +361,7 @@ def test_only_the_first_tensor_parallel_rank_aligns(encoder, monkeypatch):
     ct._record_request_hashes([("req", "hash-a")])
 
     monkeypatch.setattr(ct, "_aligns_here", lambda: False)
-    assert ct._worker_align_requests(None, [("req", "x")]) == [ct._empty_result()]
+    assert ct._worker_align_requests(None, [("req", "x")], False) == [ct._empty_result()]
     assert encoder.calls == []
 
     monkeypatch.setattr(ct, "_aligns_here", lambda: True)
@@ -347,7 +401,7 @@ def test_runner_hook_names_captures_maps_cache_hits_and_drops_stray_placeholders
                 ct.store_timestamp_inputs(ct.pending_row_ids(count), _inputs(count, 4), [1.0] * count)
             return "encoded"
 
-    def step(new_requests, encoded):
+    def step(new_requests, encoded, freed=()):
         return SimpleNamespace(
             scheduled_new_reqs=[
                 SimpleNamespace(req_id=req_id, mm_features=[SimpleNamespace(identifier=mm_hash)])
@@ -355,6 +409,7 @@ def test_runner_hook_names_captures_maps_cache_hits_and_drops_stray_placeholders
             ],
             hashes=[mm_hash for _, mm_hash in encoded],
             req_ids=[req_id for req_id, _ in encoded],
+            free_encoder_mm_hashes=list(freed),
         )
 
     monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_model_runner", SimpleNamespace(GPUModelRunner=StubRunner))
@@ -373,6 +428,11 @@ def test_runner_hook_names_captures_maps_cache_hits_and_drops_stray_placeholders
     results = ct.align_requests([("req-a", "a"), ("req-b", "b"), ("req-c", "c")])
     assert [_words(result) for result in results] == [["a"], ["b"], ["c"]]
     assert encoder.calls[0][2] == [1.0, 1.0, 1.0]
+
+    # Released, but kept until vLLM evicts the audio from its encoder cache.
+    assert set(ct._store) == {"hash-a", "hash-c"}
+    runner._execute_mm_encoder(step([], [], freed=["hash-a"]))
+    assert list(ct._store) == ["hash-c"]
 
 
 def test_offline_alignment_refuses_a_model_without_timestamps(monkeypatch):
@@ -452,4 +512,4 @@ def test_transcripts_without_speaker_tags_are_reported(encoder, caplog):
 
 def test_requests_without_recorded_audio_are_not_reported_as_evicted(encoder, caplog):
     assert ct.align_requests([("text-only", "<spk:0> hello")]) == [ct._empty_result()]
-    assert "No audio was recorded" in caplog.text and "evicted" not in caplog.text
+    assert "No capture is recorded" in caplog.text and "evicted" not in caplog.text

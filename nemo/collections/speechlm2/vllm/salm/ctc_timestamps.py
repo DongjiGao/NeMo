@@ -36,17 +36,25 @@ The inputs move to pinned host memory without blocking the engine. An ASR state 
 1,280 values per 80 ms frame, far less than the vocabulary-wide CTC output, so the
 copy overlaps with compute instead of stalling it. Once a copy lands, each row is
 compacted to its own valid frames, so retaining it does not keep its whole padded
-batch alive. Retention is local and bounded by ``NEMO_CTC_TIMESTAMP_RETAIN`` entries
-(default: twice the engine's ``max_num_seqs``) and ``NEMO_CTC_TIMESTAMP_RETAIN_GB``
-of host memory (default 8), least recently used first: vLLM frees its encoder-cache
-entry when a request finishes, which is before alignment reads it.
+batch alive.
+
+vLLM's own encoder cache drops a request's claim once prefill has consumed the
+embeddings; a capture is read later, after the request has finished, by a caller vLLM
+does not know about. So each capture records the requests that own it (repeated audio
+shares one through the encoder cache). A capture is deleted once the last of them is
+aligned with ``release=True`` or released through :func:`ctc_release`, and vLLM has
+evicted its audio from the encoder cache: until then a new request with that audio is
+served from the cache and captures nothing, so it needs the old capture. Captures nobody
+releases, such as those of server requests that do not ask for timestamps, are bounded
+only by ``NEMO_CTC_TIMESTAMP_RETAIN_GB`` of host memory (default 8), least recently
+used first.
 
 Alignment runs in the engine process, where the inputs live. Offline callers use
 :func:`ctc_timestamps` (or :func:`ctc_word_timestamps` for words only); a server
 reaches the same code through
-``collective_rpc`` by the names in ``WORKER_ALIGN_METHOD`` and
-``WORKER_ALIGN_BATCH_METHOD``, passing the external request id, which vLLM's
-scheduler knows with a random suffix appended.
+``collective_rpc`` by the names in ``WORKER_ALIGN_METHOD``,
+``WORKER_ALIGN_BATCH_METHOD`` and ``WORKER_RELEASE_METHOD``, passing the external
+request id, which vLLM's scheduler knows with a random suffix appended.
 """
 
 from __future__ import annotations
@@ -60,22 +68,24 @@ from typing import Any
 import torch
 
 from nemo.utils import logging
+from nemo.utils.nemo_logging import LogMode
 
 # Placeholder ids the inputs are stored under before the real hash is known.
 _PENDING_PREFIX = "__nemo_ctc_pending_"
 
-_RETENTION_ENV = "NEMO_CTC_TIMESTAMP_RETAIN"
-# Used until set_default_retention sizes retention from the engine, and as its floor.
-_DEFAULT_RETENTION = 64
-# The entry count alone does not bound memory: an hour of audio keeps on the order of
-# 0.1-0.2 GB of encoder states.
+# Guards against captures nobody aligns or releases; an hour of audio keeps on the
+# order of 0.1-0.2 GB of encoder states.
 _RETENTION_GB_ENV = "NEMO_CTC_TIMESTAMP_RETAIN_GB"
 _DEFAULT_RETENTION_GB = 8.0
 
+# Requests nobody aligns or releases would otherwise stay mapped forever.
+_MAX_TRACKED_REQUESTS = 1 << 16
+
 # Worker method names reached through collective_rpc: one request (a server's
-# transcription hooks) or many (offline LLM callers).
+# transcription hooks), many (offline LLM callers), or releasing without aligning.
 WORKER_ALIGN_METHOD = "nemo_ctc_align_request"
 WORKER_ALIGN_BATCH_METHOD = "nemo_ctc_align_requests"
+WORKER_RELEASE_METHOD = "nemo_ctc_release_requests"
 
 # vLLM forms the scheduler's request id as f"{external_id}-{random_uuid():.8}".
 _INTERNAL_ID_SUFFIX_LEN = 8
@@ -110,6 +120,11 @@ _state = threading.local()
 _registry: dict[str, Any] = {}
 _store: dict[str, dict] = {}
 _request_hashes: dict[str, list[str]] = {}
+# mm_hash -> the requests that still own its capture.
+_hash_owners: dict[str, set[str]] = {}
+# Hashes whose audio vLLM's encoder cache holds. A new request with that audio is
+# served from the cache and captures nothing, so it needs the existing capture.
+_engine_cached: set[str] = set()
 # External request id -> the internal id the scheduler reported for it.
 _external_ids: dict[str, str] = {}
 # Stored rows that still view their forward's padded host buffers, oldest first.
@@ -134,19 +149,6 @@ def register_encoder(encoder: Any) -> None:
 def active_encoder() -> Any:
     """Return the live encoder, or ``None`` when timestamps are not enabled."""
     return _registry.get("encoder")
-
-
-def set_default_retention(max_num_seqs: int) -> None:
-    """Size retention from the engine's concurrency; ``NEMO_CTC_TIMESTAMP_RETAIN`` still wins.
-
-    Twice ``max_num_seqs`` holds every request that can be in flight plus as many
-    finished ones awaiting alignment, so a batch up to that size can be generated in
-    one call and aligned afterwards.
-
-    Args:
-        max_num_seqs (int): The engine's ``scheduler_config.max_num_seqs``.
-    """
-    _registry["retention"] = max(_DEFAULT_RETENTION, 2 * int(max_num_seqs))
 
 
 def require_v1_model_runner(vllm_config: Any) -> None:
@@ -292,34 +294,60 @@ def mm_hashes_for_request(request_id: str) -> list[str]:
 
 
 def _record_request_hashes(pairs) -> None:
-    """Associate a request with the hashes whose inputs belong to it."""
+    """Associate a request with the hashes whose inputs belong to it, and make it an owner."""
     with _lock:
         for req_id, mm_hash in pairs:
             hashes = _request_hashes.setdefault(req_id, [])
             if mm_hash not in hashes:
                 hashes.append(mm_hash)
+            _hash_owners.setdefault(mm_hash, set()).add(req_id)
             external = _external_id(req_id)
             if external is not None:
                 _external_ids[external] = req_id
-        # Entries are tiny but never removed on use, so cap the map on the same
-        # order as the input store.
-        limit = _retention_limit() * 4
-        while len(_request_hashes) > limit:
-            evicted = next(iter(_request_hashes))
-            del _request_hashes[evicted]
-            external = _external_id(evicted)
-            if external is not None and _external_ids.get(external) == evicted:
-                del _external_ids[external]
+        while len(_request_hashes) > _MAX_TRACKED_REQUESTS:
+            _forget_request(next(iter(_request_hashes)))
 
 
-def _retention_limit() -> int:
-    """How many stored entries to hold before evicting the least recently used."""
-    default = _registry.get("retention", _DEFAULT_RETENTION)
-    try:
-        value = int(os.environ.get(_RETENTION_ENV, default))
-    except ValueError:
-        return default
-    return max(1, value)
+def _drop_capture(mm_hash: str) -> None:
+    """Delete a capture and tell compaction to skip it. Must hold ``_lock``."""
+    entry = _store.pop(mm_hash, None)
+    if entry is not None:
+        entry["dropped"] = True
+
+
+def _forget_request(req_id: str) -> None:
+    """Drop a request's claims and delete the captures nobody needs anymore. Must hold ``_lock``."""
+    for mm_hash in _request_hashes.pop(req_id, ()):
+        owners = _hash_owners.get(mm_hash)
+        if owners is None:
+            continue
+        owners.discard(req_id)
+        if not owners:
+            del _hash_owners[mm_hash]
+            if mm_hash not in _engine_cached:
+                _drop_capture(mm_hash)
+    external = _external_id(req_id)
+    if external is not None and _external_ids.get(external) == req_id:
+        del _external_ids[external]
+
+
+def _follow_engine_cache(freed: Sequence[str] = (), encoded: Sequence[str] = ()) -> None:
+    """Track which audio vLLM's encoder cache holds, deleting unowned captures it evicted."""
+    with _lock:
+        for mm_hash in freed:
+            _engine_cached.discard(mm_hash)
+            if mm_hash not in _hash_owners:
+                _drop_capture(mm_hash)
+        _engine_cached.update(encoded)
+
+
+def _release_requests(request_ids: Sequence[str]) -> None:
+    """Drop these requests' claims on their captures, accepting external ids."""
+    with _lock:
+        for request_id in request_ids:
+            key = _resolve_request_id(request_id)
+            if key is not None:
+                _forget_request(key)
 
 
 def _byte_limit() -> int:
@@ -378,32 +406,32 @@ def _discard_pending() -> int:
 
 
 def _trim_store() -> int:
-    """Evict least recently used entries until both the entry count and the byte budget hold.
+    """Evict the least recently used captures while stored inputs exceed the byte budget.
 
-    Nothing else removes entries: alignment reads without taking so that repeated
-    audio, served from vLLM's encoder cache, still finds them. Python dicts preserve
-    insertion order and alignment re-inserts what it reads, so the first keys are the
-    least recently used. The newest entry is kept even when it alone exceeds the
-    byte budget.
+    Captures normally go when their last owner is aligned or released, so this only
+    catches captures nobody releases: outputs an offline caller drops, and in a server
+    every request that does not ask for timestamps. Python dicts preserve insertion
+    order and alignment re-inserts what it keeps, so the first keys are the least
+    recently used. The newest capture is kept even when it alone exceeds the budget.
     """
-    limit, byte_limit = _retention_limit(), _byte_limit()
+    byte_limit = _byte_limit()
     evicted = 0
     with _lock:
         stored = sum(entry["nbytes"] for entry in _store.values())
-        while len(_store) > limit or (stored > byte_limit and len(_store) > 1):
+        while stored > byte_limit and len(_store) > 1:
             entry = _store.pop(next(iter(_store)))
             entry["dropped"] = True
             stored -= entry["nbytes"]
             evicted += 1
     if evicted:
-        logging.debug(
-            "[NeMoSpeechLM] Evicted %d CTC timestamp entries (limits: %d entries, %.1f GB). "
-            "Raise %s or %s if timestamped requests are being dropped.",
-            evicted,
-            limit,
+        # Routine for a server, whose untimestamped requests are never released;
+        # alignment reports each capture it then misses.
+        logging.warning(
+            "[NeMoSpeechLM] Evicting CTC timestamp captures that were never aligned or released to stay under "
+            "%.1f GB (logged once). Offline, align or ctc_release() outputs sooner, or raise %s.",
             byte_limit / 1e9,
-            _RETENTION_ENV,
             _RETENTION_GB_ENV,
+            mode=LogMode.ONCE,
         )
     return evicted
 
@@ -447,12 +475,14 @@ def _empty_result() -> dict:
     return {"words": [], "diarization": [], "speaker_tag_to_diarization_speaker": {}}
 
 
-def align_requests(items: Sequence[tuple[str, str]]) -> list[dict]:
+def align_requests(items: Sequence[tuple[str, str]], release: bool = True) -> list[dict]:
     """Align finished transcripts against their requests' stored inputs.
 
     Args:
         items (Sequence[tuple[str, str]]): ``(request_id, transcript)`` pairs; the
             transcript is aligned exactly as given, speaker tags included.
+        release (bool): Afterwards drop each request's claim on its capture, so the
+            capture can be deleted. Pass ``False`` to align the same requests again.
 
     Returns:
         list[dict]: Per item, ``words`` (``word``/``start``/``end``/``speaker`` in
@@ -460,9 +490,10 @@ def align_requests(items: Sequence[tuple[str, str]]) -> list[dict]:
         ``diarization`` (10 ms Sortformer activity segments, ``speaker`` being the
         Sortformer speaker index; the output to score diarization with), and
         ``speaker_tag_to_diarization_speaker`` linking the two. Empty lists when
-        timestamps are not enabled, when no audio was recorded for the request,
-        when its inputs were evicted, when it has more than one audio item, when
-        the transcript is empty, or when the aligner cannot align it.
+        timestamps are not enabled, when no capture is recorded for the request
+        (no audio, or already released), when its capture was evicted, when it has
+        more than one audio item, when the transcript is empty, or when the aligner
+        cannot align it.
 
     Raises:
         Exception: Any aligner error other than ``ValueError``, which is how the
@@ -490,8 +521,7 @@ def align_requests(items: Sequence[tuple[str, str]]) -> list[dict]:
             if key is None:
                 evicted.append(request_id)
                 continue
-            # Re-insert rather than take: a repeated call for this request, or another
-            # request whose audio hit vLLM's encoder cache, must still find the inputs.
+            # Re-insert to mark it recently used; releasing happens after alignment.
             entry = _store.pop(key)
             _store[key] = entry
             # A snapshot, so compaction on the engine thread cannot swap its tensors
@@ -506,22 +536,20 @@ def align_requests(items: Sequence[tuple[str, str]]) -> list[dict]:
         )
     if no_audio:
         logging.warning(
-            "[NeMoSpeechLM] No audio was recorded for %d of %d requests (first: %s): they carried no audio, "
-            "or the request id is unknown.",
+            "[NeMoSpeechLM] No capture is recorded for %d of %d requests (first: %s): they carried no audio, "
+            "were already aligned or released with release=True, or the request id is unknown.",
             len(no_audio),
             len(items),
             no_audio[0],
         )
     if evicted:
         logging.warning(
-            "[NeMoSpeechLM] CTC timestamp inputs for %d of %d requests (first: %s) were evicted. At most %d "
-            "captures and %.1f GB are kept; align more often or raise %s or %s.",
+            "[NeMoSpeechLM] The captures of %d of %d requests (first: %s) were evicted to stay under %.1f GB; "
+            "align or ctc_release() requests sooner, or raise %s.",
             len(evicted),
             len(items),
             evicted[0],
-            _retention_limit(),
             _byte_limit() / 1e9,
-            _RETENTION_ENV,
             _RETENTION_GB_ENV,
         )
     # t-SOT output always opens with a tag, so a transcript without any lost them in decoding.
@@ -540,12 +568,14 @@ def align_requests(items: Sequence[tuple[str, str]]) -> list[dict]:
         chunk = pending[start : start + _ALIGN_BATCH]
         for (index, _, _), result in zip(chunk, _align_chunk(encoder, chunk, device)):
             results[index] = result
+    if release:
+        _release_requests([request_id for request_id, _ in items])
     return results
 
 
-def align_request(request_id: str, text: str) -> dict:
+def align_request(request_id: str, text: str, release: bool = True) -> dict:
     """Align one finished transcript; see :func:`align_requests`."""
-    return align_requests([(request_id, text)])[0]
+    return align_requests([(request_id, text)], release=release)[0]
 
 
 def _align_chunk(encoder: Any, chunk: list, device: torch.device) -> list[dict]:
@@ -666,35 +696,50 @@ def _aligns_here() -> bool:
 
 
 def _worker_align_request(worker: Any, request_id: str, text: str) -> dict:
-    """``collective_rpc`` entry point: align on the worker that holds the inputs."""
+    """``collective_rpc`` entry point: align on the worker that holds the inputs.
+
+    A server aligns each request once, so the request's capture is released after it.
+    """
     del worker
-    return align_request(request_id, text) if _aligns_here() else _empty_result()
+    if not _aligns_here():
+        _release_requests([request_id])
+        return _empty_result()
+    return align_request(request_id, text)
 
 
-def _worker_align_requests(worker: Any, items: list) -> list[dict]:
+def _worker_align_requests(worker: Any, items: list, release: bool = True) -> list[dict]:
     """``collective_rpc`` entry point: align many finished requests in one call.
 
     Only :func:`ctc_timestamps` calls this, so a model loaded without timestamps is an
     error here; the single-request entry point, which a server calls for every
-    timestamped request, keeps answering with empty results instead.
+    timestamped request, keeps answering with empty results instead. Every rank keeps
+    its own captures, so ranks that do not align still release theirs.
     """
     del worker
     if not _aligns_here():
+        if release:
+            _release_requests([request_id for request_id, _ in items])
         return [_empty_result() for _ in items]
     if active_encoder() is None:
         raise RuntimeError(
             "CTC timestamps are not enabled for this model: its config has no ctc_timestamps.adapter_path "
             "(check the hf_overrides key)."
         )
-    return align_requests([(request_id, text) for request_id, text in items])
+    return align_requests([(request_id, text) for request_id, text in items], release=release)
+
+
+def _worker_release_requests(worker: Any, request_ids: list) -> None:
+    """``collective_rpc`` entry point: release captures that will not be aligned, on every rank."""
+    del worker
+    _release_requests(list(request_ids))
 
 
 def install_worker_align_method() -> None:
-    """Expose alignment to callers outside the engine as worker methods.
+    """Expose alignment and release to callers outside the engine as worker methods.
 
-    ``collective_rpc`` resolves a method name on the worker, so the alignment entry
-    points are attached to vLLM's GPU worker class under ``WORKER_ALIGN_METHOD`` and
-    ``WORKER_ALIGN_BATCH_METHOD``.
+    ``collective_rpc`` resolves a method name on the worker, so the entry points are
+    attached to vLLM's GPU worker class under ``WORKER_ALIGN_METHOD``,
+    ``WORKER_ALIGN_BATCH_METHOD`` and ``WORKER_RELEASE_METHOD``.
     """
     try:
         from vllm.v1.worker.gpu_worker import Worker
@@ -703,13 +748,18 @@ def install_worker_align_method() -> None:
     for name, method in (
         (WORKER_ALIGN_METHOD, _worker_align_request),
         (WORKER_ALIGN_BATCH_METHOD, _worker_align_requests),
+        (WORKER_RELEASE_METHOD, _worker_release_requests),
     ):
         if getattr(Worker, name, None) is not method:
             setattr(Worker, name, method)
 
 
 def ctc_timestamps(
-    llm: Any, outputs: Sequence[Any], texts: Sequence[str] | None = None, chunk_size: int = 256
+    llm: Any,
+    outputs: Sequence[Any],
+    texts: Sequence[str] | None = None,
+    chunk_size: int = 256,
+    release: bool = True,
 ) -> list[dict]:
     """CTC word timestamps and diarization for finished outputs of an offline vLLM ``LLM``.
 
@@ -717,10 +767,10 @@ def ctc_timestamps(
     per ``chunk_size`` outputs. Call it after generation: the RPC runs on the engine
     thread, so aligning while other requests decode would stall them.
 
-    Inputs are held only for the most recent ``NEMO_CTC_TIMESTAMP_RETAIN`` captures
-    (default: twice the engine's ``max_num_seqs``) within ``NEMO_CTC_TIMESTAMP_RETAIN_GB``
-    of host memory (default 8), so align at least that often, e.g. by generating in
-    chunks no larger than the limits, or raise them to cover a whole batch.
+    Each output's capture is deleted once it has been aligned with ``release=True``.
+    Pass ``release=False`` to align the same outputs again, e.g. with ``texts``, and
+    release outputs that will never be aligned with :func:`ctc_release`; captures
+    nobody releases are bounded only by ``NEMO_CTC_TIMESTAMP_RETAIN_GB`` (default 8).
 
     Args:
         llm (Any): The ``vllm.LLM`` that produced ``outputs``, with CTC timestamps enabled.
@@ -730,6 +780,7 @@ def ctc_timestamps(
         texts (Sequence[str] | None): Transcripts to align instead of the generated
             ones, one per output, e.g. a reference or corrected transcript.
         chunk_size (int): Outputs aligned per RPC.
+        release (bool): Delete the outputs' captures after aligning them.
 
     Returns:
         list[dict]: Per output, the result described in :func:`align_requests`.
@@ -747,13 +798,25 @@ def ctc_timestamps(
     for start in range(0, len(items), chunk_size):
         batch = items[start : start + chunk_size]
         # One reply per worker, in rank order; only the first worker aligns.
-        results.extend(llm.collective_rpc(WORKER_ALIGN_BATCH_METHOD, args=(batch,))[0])
+        results.extend(llm.collective_rpc(WORKER_ALIGN_BATCH_METHOD, args=(batch, release))[0])
     return results
 
 
-def ctc_word_timestamps(llm: Any, outputs: Sequence[Any], chunk_size: int = 256) -> list[list[dict]]:
+def ctc_word_timestamps(
+    llm: Any, outputs: Sequence[Any], chunk_size: int = 256, release: bool = True
+) -> list[list[dict]]:
     """Just the word timestamps of :func:`ctc_timestamps`, one list per output."""
-    return [result["words"] for result in ctc_timestamps(llm, outputs, chunk_size=chunk_size)]
+    return [result["words"] for result in ctc_timestamps(llm, outputs, chunk_size=chunk_size, release=release)]
+
+
+def ctc_release(llm: Any, outputs: Sequence[Any]) -> None:
+    """Delete the stored CTC timestamp inputs of outputs that will not be aligned.
+
+    Args:
+        llm (Any): The ``vllm.LLM`` that produced ``outputs``.
+        outputs (Sequence[Any]): Its ``RequestOutput`` objects.
+    """
+    llm.collective_rpc(WORKER_RELEASE_METHOD, args=([out.request_id for out in outputs],))
 
 
 def install_encoder_cache_binding() -> None:
@@ -778,6 +841,9 @@ def install_encoder_cache_binding() -> None:
         # an encoder-cache hit and therefore never reaches the batch below; without
         # this, repeated audio would find no inputs.
         _record_request_hashes(_new_request_hashes(scheduler_output))
+        # vLLM evicting audio only ends cache hits on its capture; owners that have
+        # not been aligned yet keep it.
+        _follow_engine_cache(freed=getattr(scheduler_output, "free_encoder_mm_hashes", ()))
 
         # Encoder runs outside this hook, such as the startup profiling pass on dummy
         # audio, queue placeholders that no scheduled item claims. Left queued they
@@ -789,10 +855,8 @@ def install_encoder_cache_binding() -> None:
         outputs = original(self, scheduler_output, *args, **kwargs)
 
         _rename_pending(mm_hashes)
+        _follow_engine_cache(encoded=mm_hashes)
         _record_request_hashes((req_id, mm_hash) for mm_hash, (req_id, _position) in zip(mm_hashes, mm_lora_refs))
-        # Deliberately NOT mirroring scheduler_output.free_encoder_mm_hashes: vLLM
-        # frees its encoder-cache entry when the request finishes, which is before
-        # alignment reads the inputs. Bound retention here instead.
         _trim_store()
         _compact_ready()
         return outputs
