@@ -410,8 +410,8 @@ class NeMoSpeechLMForConditionalGeneration(
         aligner.speaker_logprob_weight = speaker_prior_weight
 
         set_default_retention(vllm_config.scheduler_config.max_num_seqs)
-        register_encoder(lambda: self.perception.encoder)
-        install_encoder_cache_binding(lambda: self.perception.encoder)
+        register_encoder(encoder)
+        install_encoder_cache_binding()
         logging.info("[NeMoSpeechLM] CTC timestamps enabled from checkpoint config: %s", adapter_path)
 
     # ── audio processing ──

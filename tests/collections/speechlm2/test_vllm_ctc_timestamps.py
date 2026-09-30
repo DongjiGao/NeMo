@@ -86,7 +86,7 @@ def encoder(monkeypatch):
     monkeypatch.setattr(ct, "_uncompacted", deque())
     monkeypatch.setattr(ct, "_state", SimpleNamespace())
     fake = _FakeEncoder()
-    ct.register_encoder(lambda: fake)
+    ct.register_encoder(fake)
     return fake
 
 
@@ -358,7 +358,7 @@ def test_runner_hook_names_captures_maps_cache_hits_and_drops_stray_placeholders
         )
 
     monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_model_runner", SimpleNamespace(GPUModelRunner=StubRunner))
-    ct.install_encoder_cache_binding(lambda: encoder)
+    ct.install_encoder_cache_binding()
     runner = StubRunner()
 
     first = step([("req-a-0123abcd", "hash-a")], [("req-a-0123abcd", "hash-a")])

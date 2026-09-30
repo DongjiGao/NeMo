@@ -118,20 +118,22 @@ _uncompacted: deque[dict] = deque()
 _lock = threading.RLock()
 
 
-def register_encoder(get_encoder) -> None:
+def register_encoder(encoder: Any) -> None:
     """Publish the live encoder, which also turns input capture on.
 
     The transcription hooks are classmethods on the vLLM model interface and never
     receive the model instance. One engine hosts one model per process, so a
-    module-level getter is enough to bridge that.
+    module-level reference is enough to bridge that.
+
+    Args:
+        encoder (Any): The perception encoder; it holds the loaded aligner.
     """
-    _registry["get_encoder"] = get_encoder
+    _registry["encoder"] = encoder
 
 
 def active_encoder() -> Any:
     """Return the live encoder, or ``None`` when timestamps are not enabled."""
-    getter = _registry.get("get_encoder")
-    return getter() if getter is not None else None
+    return _registry.get("encoder")
 
 
 def set_default_retention(max_num_seqs: int) -> None:
@@ -754,12 +756,10 @@ def ctc_word_timestamps(llm: Any, outputs: Sequence[Any], chunk_size: int = 256)
     return [result["words"] for result in ctc_timestamps(llm, outputs, chunk_size=chunk_size)]
 
 
-def install_encoder_cache_binding(get_encoder) -> None:
+def install_encoder_cache_binding() -> None:
     """Rename stored inputs to ``mm_hash`` and record the request-to-hash map.
 
-    Args:
-        get_encoder (Callable[[], Any]): Returns the encoder, or ``None`` when
-            timestamps are not enabled.
+    The hook passes straight through while no encoder is registered.
     """
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -771,7 +771,7 @@ def install_encoder_cache_binding(get_encoder) -> None:
         return
 
     def _execute_mm_encoder(self, scheduler_output, *args, **kwargs):
-        if get_encoder() is None:
+        if active_encoder() is None:
             return original(self, scheduler_output, *args, **kwargs)
 
         # New requests resolve to their hashes here, including those whose audio is
