@@ -74,10 +74,10 @@ from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
     align_request,
     install_worker_align_method,
     pending_row_ids,
+    read_speaker_prior_weight,
     register_encoder,
     require_v1_model_runner,
     set_default_retention,
-    speaker_logprob_weight,
     store_timestamp_inputs,
 )
 
@@ -367,8 +367,8 @@ class NeMoSpeechLMForConditionalGeneration(
             # this run before weights are loaded.
             _apply_encoder_quantization(self.perception, getattr(config, "encoder_quantization", None))
 
-        # The server calls this for every timestamped request, adapter or not;
-        # without one it returns no words and the request fails with a clean 400.
+        # Installed even without an adapter, so a call gets a clear "not enabled" error
+        # (or, from a patched vLLM server, empty results) instead of an unknown method.
         install_worker_align_method()
         self._maybe_enable_ctc_timestamps(getattr(config, "ctc_timestamps", None), vllm_config)
 
@@ -401,13 +401,13 @@ class NeMoSpeechLMForConditionalGeneration(
         if not getattr(encoder, "supports_ctc_timestamp_inputs", False):
             raise ValueError(f"{type(encoder).__name__} cannot produce CTC timestamp inputs.")
         require_v1_model_runner(vllm_config)
-        weight = speaker_logprob_weight(ctc_config)
+        speaker_prior_weight = read_speaker_prior_weight(ctc_config)
         encoder.ctc_timestamp_model_path = adapter_path
         device = next(encoder.parameters()).device
         # Load now rather than on the first timestamped request, so a bad artifact
         # path fails at startup instead of mid-serve.
         aligner = get_ctc_timestamp_aligner(encoder, adapter_path, device)
-        aligner.speaker_logprob_weight = weight
+        aligner.speaker_logprob_weight = speaker_prior_weight
 
         set_default_retention(vllm_config.scheduler_config.max_num_seqs)
         register_encoder(lambda: self.perception.encoder)

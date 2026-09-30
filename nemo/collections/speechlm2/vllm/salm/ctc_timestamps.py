@@ -87,7 +87,7 @@ _ALIGN_BATCH = 16
 # Weight of the Sortformer speaker-activity prior in CTC alignment, overridable per
 # checkpoint as ctc_timestamps.speaker_logprob_weight. The aligner's own default is
 # 0.0, which lets words in overlapped speech drift out of their speaker's turns.
-DEFAULT_SPEAKER_LOGPROB_WEIGHT = 0.25
+DEFAULT_SPEAKER_PRIOR_WEIGHT = 0.25
 
 # CTCTimestampInputs tensor fields: the time axis to trim and pad along, and the
 # lengths field marking its valid frames (None for the lengths fields themselves).
@@ -166,27 +166,28 @@ def require_v1_model_runner(vllm_config: Any) -> None:
         )
 
 
-def speaker_logprob_weight(ctc_config: Any) -> float:
+def read_speaker_prior_weight(ctc_config: Any) -> float:
     """Read the Sortformer prior weight from a checkpoint's ``ctc_timestamps`` block.
 
-    The aligner validates the weight only in its constructor, and the plugin sets it
-    on an aligner that is already built, so it is validated here instead.
+    The config key is ``speaker_logprob_weight``, after the aligner's constructor
+    parameter. The aligner validates it only in that constructor, and the plugin sets
+    it on an aligner that is already built, so it is validated here instead.
 
     Args:
         ctc_config (Any): The ``ctc_timestamps`` block, as a dict or an attribute object.
 
     Returns:
-        float: The configured weight, or ``DEFAULT_SPEAKER_LOGPROB_WEIGHT`` when unset.
+        float: The configured weight, or ``DEFAULT_SPEAKER_PRIOR_WEIGHT`` when unset.
     """
     value = (
         ctc_config.get("speaker_logprob_weight")
         if isinstance(ctc_config, dict)
         else getattr(ctc_config, "speaker_logprob_weight", None)
     )
-    weight = float(DEFAULT_SPEAKER_LOGPROB_WEIGHT if value is None else value)
-    if weight < 0:
-        raise ValueError(f"ctc_timestamps.speaker_logprob_weight must be non-negative; got {weight}.")
-    return weight
+    speaker_prior_weight = float(DEFAULT_SPEAKER_PRIOR_WEIGHT if value is None else value)
+    if speaker_prior_weight < 0:
+        raise ValueError(f"ctc_timestamps.speaker_logprob_weight must be non-negative; got {speaker_prior_weight}.")
+    return speaker_prior_weight
 
 
 def pending_row_ids(count: int) -> list[str]:
