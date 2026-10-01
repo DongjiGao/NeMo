@@ -74,11 +74,11 @@ from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
     active_encoder,
     align_request,
     install_worker_align_method,
-    pending_row_ids,
     read_speaker_prior_weight,
     register_encoder,
     require_v1_model_runner,
-    store_timestamp_inputs,
+    store_alignment_states,
+    take_row_keys,
 )
 
 _AUDIO_INPUT_DTYPE = torch.float32
@@ -164,6 +164,22 @@ def _is_parallel_expert_encoder(module: nn.Module) -> bool:
     return bool(getattr(module, "supports_external_speaker_targets", False)) and callable(
         getattr(module, "online_inference", None)
     )
+
+
+def _require_resampling_rate(perception: Any) -> None:
+    """Refuse a perception module built for a sample rate other than the one audio is resampled to.
+
+    vLLM resamples every request's audio to ``_SAMPLING_RATE`` before the encoder sees it
+    (``NeMoSpeechLMProcessingInfo.get_data_parser``), and audio durations are computed
+    from that rate.
+    """
+    featurizer = getattr(getattr(perception, "preprocessor", None), "featurizer", None)
+    sample_rate = getattr(featurizer, "sample_rate", None)
+    if sample_rate is not None and sample_rate != _SAMPLING_RATE:
+        raise ValueError(
+            f"The perception preprocessor expects {sample_rate} Hz audio, but the NeMo SpeechLM vLLM plugin "
+            f"resamples audio to {_SAMPLING_RATE} Hz."
+        )
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -359,6 +375,7 @@ class NeMoSpeechLMForConditionalGeneration(
 
         with self._mark_tower_model(vllm_config, {"audio"}):
             self.perception = _load_nemo_perception(config.perception)
+            _require_resampling_rate(self.perception)
             pe_encoder_path = getattr(config, "pe_encoder_path", None)
             pe_encoder_config = getattr(config, "pe_encoder_config", None)
             speaker_encoder = getattr(config, "speaker_encoder", None)
@@ -514,32 +531,35 @@ class NeMoSpeechLMForConditionalGeneration(
     def _encode_with_ctc_capture(
         self, audio_signal: torch.Tensor, audio_lengths: torch.Tensor, capture: torch.Tensor | None
     ) -> list[torch.Tensor]:
-        """One encoder forward over the whole audio that also keeps CTC timestamp inputs.
+        """One encoder forward over the whole audio that also keeps each row's alignment states.
 
         Args:
             audio_signal (torch.Tensor): Padded audio, one row per item.
             audio_lengths (torch.Tensor): Valid samples per row.
             capture (torch.Tensor | None): Per row, on the host, whether to keep its
-                inputs; ``None`` keeps every row.
+                alignment states; ``None`` keeps every row.
         """
-        # vLLM passes only tensors here, so the timestamp inputs are stored under
-        # placeholders that ctc_timestamps renames to each item's mm_hash once the
-        # runner announces it. The renaming pairs placeholders with the step's hashes
-        # by position, so rows that are not kept still take one.
-        row_ids = pending_row_ids(audio_signal.shape[0])
-        if capture is not None:
-            row_ids = [row_id if keep else None for row_id, keep in zip(row_ids, capture.tolist())]
+        # vLLM passes only tensors here, so each row's key, its audio's mm_hash, comes
+        # from the runner hook, which lists the step's hashes in encoding order. Every
+        # row takes one, kept or not, so the rest stay paired. Outside the hook (vLLM's
+        # startup profiling pass) there are none: the states are still produced, so
+        # memory is profiled as served, but nothing is stored.
+        row_keys = take_row_keys(audio_signal.shape[0])
+        keep = [True] * audio_signal.shape[0] if capture is None else capture.tolist()
         online = self.perception.encoder.online_inference() if self._uses_pe_encoder else contextlib.nullcontext()
         with online:
-            if all(row_id is None for row_id in row_ids):
+            if not any(keep):
                 audio_embs, audio_emb_lens = self.perception(input_signal=audio_signal, input_signal_length=audio_lengths)
             else:
-                audio_embs, audio_emb_lens, timestamp_inputs = self.perception(
+                durations = audio_lengths.double() / _SAMPLING_RATE
+                audio_embs, audio_emb_lens, alignment_states = self.perception(
                     input_signal=audio_signal,
                     input_signal_length=audio_lengths,
                     return_ctc_timestamp_inputs=True,
                 )
-                store_timestamp_inputs(row_ids, timestamp_inputs, audio_lengths.double() / _SAMPLING_RATE)
+                if row_keys is not None:
+                    row_keys = [key if kept else None for key, kept in zip(row_keys, keep)]
+                    store_alignment_states(row_keys, alignment_states, durations)
         return [emb[:emblen] for emb, emblen in zip(audio_embs, audio_emb_lens)]
 
     def embed_multimodal(self, **kwargs) -> MultiModalEmbeddings:

@@ -70,11 +70,15 @@ def _inputs(batch, frames):
     )
 
 
-def _capture(batch, frames, hashes, durations=None):
-    """Store one forward's inputs and name them as the runner hook would."""
-    row_ids = ct.pending_row_ids(batch)
-    ct.store_timestamp_inputs(row_ids, _inputs(batch, frames), durations or [1.0] * batch)
-    ct._rename_pending(hashes)
+def _capture(batch, frames, hashes, durations=None, inputs=None):
+    """Store one forward's states under its items' hashes, as during a runner-hook step."""
+    ct._begin_step(hashes)
+    ct.store_alignment_states(
+        ct.take_row_keys(batch),
+        _inputs(batch, frames) if inputs is None else inputs,
+        [1.0] * batch if durations is None else durations,
+    )
+    ct._end_step()
 
 
 @pytest.fixture
@@ -119,10 +123,11 @@ def test_cache_hit_request_and_repeated_alignment_find_the_same_inputs(encoder):
     assert _words(ct.align_request("req-2", "c")) == ["c"]
 
 
-def test_placeholders_queued_outside_the_hook_are_discarded(encoder):
-    ct.store_timestamp_inputs(ct.pending_row_ids(1), _inputs(1, 9), [3310.0])
-    assert ct._discard_pending() == 1
+def test_forwards_outside_an_encoder_step_get_no_keys(encoder):
+    # vLLM's startup profiling pass runs the encoder outside the runner hook.
+    assert ct.take_row_keys(1) is None
     _capture(1, 4, ["hash-a"], durations=[0.32])
+    assert ct.take_row_keys(1) is None
     ct._record_request_hashes([("req", "hash-a")])
 
     ct.align_request("req", "word")
@@ -235,14 +240,18 @@ def test_request_with_several_audio_items_gets_no_timestamps(encoder):
     assert [texts for _, texts, _ in encoder.calls] == [["three"]]
 
 
-def test_placeholder_and_hash_count_mismatch_discards_the_forward(encoder):
-    ct.store_timestamp_inputs(ct.pending_row_ids(2), _inputs(2, 4), [1.0, 1.0])
+def test_a_step_whose_rows_do_not_match_its_hashes_keeps_no_captures(encoder, caplog):
+    ct._begin_step(["hash-a", "hash-b"])
+    ct.store_alignment_states(ct.take_row_keys(1), _inputs(1, 4), [1.0])
+    ct._end_step()
+    assert ct._store == {} and "dropping this step's CTC timestamp captures" in caplog.text
 
-    assert ct._rename_pending(["hash-a"]) == 0
-    assert ct._store == {}
+    ct._begin_step(["hash-c"])
+    assert ct.take_row_keys(2) is None
+    ct._end_step()
 
-    _capture(1, 3, ["hash-b"])
-    ct._record_request_hashes([("req", "hash-b")])
+    _capture(1, 3, ["hash-d"])
+    ct._record_request_hashes([("req", "hash-d")])
     assert _words(ct.align_request("req", "ok")) == ["ok"]
 
 
@@ -255,8 +264,7 @@ def test_compaction_trims_each_row_to_its_valid_frames_in_its_own_storage(encode
         diarization_labels=torch.ones(2, 4, 40, dtype=torch.bool),
         diarization_lengths=torch.tensor([40, 24]),
     )
-    ct.store_timestamp_inputs(ct.pending_row_ids(2), inputs, [0.4, 0.24])
-    ct._rename_pending(["hash-a", "hash-b"])
+    _capture(2, 5, ["hash-a", "hash-b"], [0.4, 0.24], inputs=inputs)
 
     assert ct._compact_ready() == 2
     short = ct._store["hash-b"]
@@ -335,8 +343,7 @@ def test_unexpected_alignment_errors_are_raised_not_hidden(encoder):
 
 
 def test_tensor_durations_survive_compaction(encoder):
-    ct.store_timestamp_inputs(ct.pending_row_ids(2), _inputs(2, 4), torch.tensor([0.5, 0.25], dtype=torch.float64))
-    ct._rename_pending(["hash-a", "hash-b"])
+    _capture(2, 4, ["hash-a", "hash-b"], torch.tensor([0.5, 0.25], dtype=torch.float64))
     ct._compact_ready()
     ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b")])
 
@@ -389,7 +396,7 @@ def test_collate_assembles_padded_rows_on_the_gpu(encoder):
     assert torch.count_nonzero(batch.asr_encoded[1, :, 3:]) == 0
 
 
-def test_runner_hook_names_captures_maps_cache_hits_and_drops_stray_placeholders(encoder, monkeypatch):
+def test_runner_hook_keys_captures_by_hash_maps_cache_hits_and_ignores_outside_forwards(encoder, monkeypatch):
     class StubRunner:
         def _batch_mm_inputs_from_scheduler(self, step):
             return step.hashes, None, [(req_id, None) for req_id in step.req_ids]
@@ -398,7 +405,7 @@ def test_runner_hook_names_captures_maps_cache_hits_and_drops_stray_placeholders
             # What _process_audio does for the items vLLM encodes this step.
             if step.hashes:
                 count = len(step.hashes)
-                ct.store_timestamp_inputs(ct.pending_row_ids(count), _inputs(count, 4), [1.0] * count)
+                ct.store_alignment_states(ct.take_row_keys(count), _inputs(count, 4), [1.0] * count)
             return "encoded"
 
     def step(new_requests, encoded, freed=()):
@@ -420,8 +427,8 @@ def test_runner_hook_names_captures_maps_cache_hits_and_drops_stray_placeholders
     assert runner._execute_mm_encoder(first) == "encoded"
     # The same audio again is an encoder-cache hit: scheduled, but never encoded.
     runner._execute_mm_encoder(step([("req-b-0123abcd", "hash-a")], []))
-    # A forward outside the hook, like vLLM's startup profiling pass on dummy audio.
-    ct.store_timestamp_inputs(ct.pending_row_ids(1), _inputs(1, 9), [3310.0])
+    # A forward outside the hook, like vLLM's startup profiling pass on dummy audio, gets no keys.
+    assert ct.take_row_keys(1) is None
     runner._execute_mm_encoder(step([("req-c-0123abcd", "hash-c")], [("req-c-0123abcd", "hash-c")]))
 
     assert set(ct._store) == {"hash-a", "hash-c"} and not ct._uncompacted
@@ -472,6 +479,19 @@ def test_timestamps_refuse_encoder_chunking_outside_the_parallel_expert_encoder(
         model._maybe_enable_ctc_timestamps({"adapter_path": "/adapter.pt"}, SimpleNamespace())
 
 
+def test_perception_built_for_another_sample_rate_is_refused():
+    pytest.importorskip("vllm")
+    from nemo.collections.speechlm2.vllm.salm.model import _require_resampling_rate
+
+    def perception(sample_rate):
+        return SimpleNamespace(preprocessor=SimpleNamespace(featurizer=SimpleNamespace(sample_rate=sample_rate)))
+
+    _require_resampling_rate(SimpleNamespace())
+    _require_resampling_rate(perception(16000))
+    with pytest.raises(ValueError, match="8000 Hz"):
+        _require_resampling_rate(perception(8000))
+
+
 class _FakePerception(nn.Module):
     """A perception module whose encoder is not a ParallelExpertEncoder; records each forward."""
 
@@ -509,23 +529,37 @@ def test_any_encoder_with_the_flag_captures_through_one_unchunked_forward(encode
     pytest.importorskip("vllm")
     model = _model_with_fake_perception()
 
+    ct._begin_step(["hash-a", "hash-b"])
     embeddings = model._process_audio(_audio())
+    ct._end_step()
 
     assert [tuple(e.shape) for e in embeddings] == [(3, 4), (3, 4)]
     assert model.perception.forwards == [((2, 16), True)]
-    assert len(ct._store) == 2 and len(ct._state.pending_queue) == 2
+    assert list(ct._store) == ["hash-a", "hash-b"]
 
 
-def test_items_that_opt_out_keep_their_placeholder_but_store_nothing(encoder):
+def test_a_forward_outside_the_hook_produces_states_but_stores_none(encoder):
     pytest.importorskip("vllm")
     model = _model_with_fake_perception()
 
+    model._process_audio(_audio())
+
+    # Memory is profiled as served, but there is no hash to store anything under.
+    assert model.perception.forwards == [((2, 16), True)]
+    assert ct._store == {}
+
+
+def test_items_that_opt_out_take_their_hash_but_store_nothing(encoder):
+    pytest.importorskip("vllm")
+    model = _model_with_fake_perception()
+
+    ct._begin_step(["hash-a", "hash-b", "hash-c", "hash-d"])
     model._process_audio(_audio([False, True]))
     model._process_audio(_audio([False, False]))
+    ct._end_step()
 
     assert [capture for _, capture in model.perception.forwards] == [True, False]
-    # Placeholders pair with the step's hashes by position, so every item needs one.
-    assert ct._rename_pending(["hash-a", "hash-b", "hash-c", "hash-d"]) == 1
+    # Rows take the step's hashes by position, so an opted-out row still takes one.
     assert list(ct._store) == ["hash-b"] and float(ct._store["hash-b"]["duration"]) == 8 / 16000
 
 

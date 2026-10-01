@@ -25,12 +25,12 @@ between the two points. vLLM makes that awkward in two ways:
 * The scheduler only runs the encoder for audio whose ``mm_hash`` is absent from the
   encoder cache, so a request served from that cache produces no inputs of its own.
 
-Both are solved by keying on ``mm_hash``, the identity vLLM already uses. Inputs are
-stored under positional placeholders during the forward and renamed when the runner
-announces each item's hash, and every new request is mapped to its hashes, so a cache
-hit finds the inputs its audio produced earlier. The hook is ``_execute_mm_encoder``,
-around one call to ``_batch_mm_inputs_from_scheduler``, whose signatures match in vLLM
-0.23 and 0.28.
+Both are solved by keying on ``mm_hash``, the identity vLLM already uses. A hook on
+``_execute_mm_encoder`` reads each step's hashes before the encoder runs and hands them
+to the forward through per-thread state, in the order vLLM encodes the items, so each
+row's inputs are stored under its audio's hash. Every new request is mapped to its
+hashes, so a cache hit finds the inputs its audio produced earlier. The hook calls
+``_batch_mm_inputs_from_scheduler``, whose signature matches in vLLM 0.23 and 0.28.
 
 The inputs move to pinned host memory without blocking the engine. An ASR state is
 1,280 values per 80 ms frame, far less than the vocabulary-wide CTC output, so the
@@ -71,9 +71,6 @@ import torch
 from nemo.utils import logging
 from nemo.utils.nemo_logging import LogMode
 
-# Placeholder ids the inputs are stored under before the real hash is known.
-_PENDING_PREFIX = "__nemo_ctc_pending_"
-
 # Guards against captures nobody aligns or releases; an hour of audio keeps on the
 # order of 0.1-0.2 GB of encoder states.
 _RETENTION_GB_ENV = "NEMO_CTC_TIMESTAMP_RETAIN_GB"
@@ -111,8 +108,8 @@ _FIELDS = (
     ("diarization_lengths", None, None),
 )
 
-# Placeholder bookkeeping stays thread-local: it is produced and consumed within a
-# single _execute_mm_encoder call on the engine thread.
+# The current encoder step's hashes stay thread-local: the hook hands them to the
+# forwards it runs, on the engine thread.
 _state = threading.local()
 
 # Process-wide, unlike _state, and guarded by _lock. With an in-process engine the
@@ -155,7 +152,7 @@ def active_encoder() -> Any:
 def require_v1_model_runner(vllm_config: Any) -> None:
     """Refuse CTC timestamps on vLLM's Model Runner V2.
 
-    Captured inputs are renamed, trimmed and compacted by a hook on the V1 runner's
+    Captured inputs are keyed, trimmed and compacted by a hook on the V1 runner's
     ``GPUModelRunner._execute_mm_encoder``. Under V2, the default from vLLM 0.30 on,
     that hook never runs: nothing would be aligned, and the inputs would pile up in
     host memory.
@@ -195,56 +192,73 @@ def read_speaker_prior_weight(ctc_config: Any) -> float:
     return speaker_prior_weight
 
 
-def pending_row_ids(count: int) -> list[str]:
-    """Return placeholder ids for the items of one encoder forward.
+def take_row_keys(count: int) -> list[str] | None:
+    """Return the ``mm_hash`` of each item in one encoder forward, in item order.
+
+    The hook around vLLM's ``_execute_mm_encoder`` lists the step's hashes before the
+    encoder runs, in the order vLLM encodes the items, and each forward takes the next
+    ``count`` of them.
 
     Args:
         count (int): Number of multimodal items in the forward.
 
     Returns:
-        list[str]: Placeholder ids, in item order.
+        list[str] | None: One hash per item, or ``None`` when nothing should be stored:
+        the forward runs outside the hook (vLLM's startup profiling pass), or it has
+        more items than the step has hashes left.
     """
-    start = getattr(_state, "pending_next", 0)
-    ids = [f"{_PENDING_PREFIX}{start + i}" for i in range(count)]
-    _state.pending_next = start + count
-    _state.pending_queue = getattr(_state, "pending_queue", []) + ids
-    return ids
+    step = getattr(_state, "step", None)
+    if step is None:
+        return None
+    step["rows"] += count
+    if count > len(step["hashes"]):
+        return None
+    keys, step["hashes"] = step["hashes"][:count], step["hashes"][count:]
+    step["taken"].extend(keys)
+    return keys
 
 
-def store_timestamp_inputs(
-    row_ids: Sequence[str | None], inputs: Any, audio_durations: torch.Tensor | Sequence[float]
+def store_alignment_states(
+    row_keys: Sequence[str | None], alignment_states: Any, audio_durations: torch.Tensor | Sequence[float]
 ) -> None:
-    """Keep one forward's ``CTCTimestampInputs`` per item, in host memory.
+    """Keep one forward's alignment states per item, in host memory, under each item's ``mm_hash``.
+
+    The alignment states are the encoder's ``CTCTimestampInputs``: what the deferred CTC
+    head and the aligner read once the transcript is known.
 
     Args:
-        row_ids (Sequence[str | None]): One placeholder id per batch row, from
-            :func:`pending_row_ids`; ``None`` skips the row.
-        inputs (CTCTimestampInputs): The encoder's timestamp inputs for the batch.
+        row_keys (Sequence[str | None]): One ``mm_hash`` per batch row, from
+            :func:`take_row_keys`; ``None`` skips the row.
+        alignment_states (CTCTimestampInputs): The encoder's ``CTCTimestampInputs`` for the batch.
         audio_durations (torch.Tensor | Sequence[float]): Audio duration per row, in
-            seconds. A device tensor is copied along with the inputs, so the forward
+            seconds. A device tensor is copied along with the states, so the forward
             never waits to read it.
     """
     if not isinstance(audio_durations, torch.Tensor):
         audio_durations = torch.tensor(audio_durations, dtype=torch.float64)
-    host = {name: _to_host(getattr(inputs, name)) for name, _, _ in _FIELDS}
+    host = {name: _to_host(getattr(alignment_states, name)) for name, _, _ in _FIELDS}
     durations = _to_host(audio_durations)
     on_device = audio_durations.is_cuda or any(
-        getattr(inputs, name) is not None and getattr(inputs, name).is_cuda for name, _, _ in _FIELDS
+        getattr(alignment_states, name) is not None and getattr(alignment_states, name).is_cuda
+        for name, _, _ in _FIELDS
     )
     # Rows are read only after this event, so the copies never block the forward.
     ready = torch.cuda.current_stream().record_event() if on_device else None
     with _lock:
-        for row, row_id in enumerate(row_ids):
-            if row_id is None:
+        for row, key in enumerate(row_keys):
+            if key is None:
                 continue
             entry = {name: None if tensor is None else tensor[row : row + 1] for name, tensor in host.items()}
             entry.update(
-                diarization_frame_seconds=inputs.diarization_frame_seconds,
+                diarization_frame_seconds=alignment_states.diarization_frame_seconds,
                 duration=durations[row : row + 1],
                 ready=ready,
             )
             entry["nbytes"] = _entry_nbytes(entry)
-            _store[row_id] = entry
+            # Re-encoded audio replaces its older capture and becomes the most recent,
+            # which assigning to the existing key would not do.
+            _drop_capture(key)
+            _store[key] = entry
             _uncompacted.append(entry)
 
 
@@ -363,50 +377,30 @@ def _byte_limit() -> int:
     return int(max(gigabytes, 0.0) * 1e9)
 
 
-def _rename_pending(mm_hashes: list[str]) -> int:
-    """Rename this forward's placeholder entries to their real hashes."""
-    queue = getattr(_state, "pending_queue", None) or []
-    if len(queue) != len(mm_hashes):
-        # Pairing is positional, so unequal counts would attach inputs to another
-        # item's audio; no timestamps are better than wrong ones.
-        logging.warning(
-            "[NeMoSpeechLM] The encoder captured CTC timestamp inputs for %d items but vLLM scheduled %d; "
-            "discarding them.",
-            len(queue),
-            len(mm_hashes),
-        )
-        _discard_pending()
-        return 0
-    renamed = 0
-    # vLLM accumulates encoder outputs in item order and pairs them with mm_hashes
-    # positionally, so the queue head corresponds to the first hash.
-    with _lock:
-        for placeholder, mm_hash in zip(queue, mm_hashes):
-            entry = _store.pop(placeholder, None)
-            if entry is not None:
-                # Re-encoded audio replaces its older entry and becomes the most recent,
-                # which assigning to the existing key would not do.
-                replaced = _store.pop(mm_hash, None)
-                if replaced is not None:
-                    replaced["dropped"] = True
-                _store[mm_hash] = entry
-                renamed += 1
-    _state.pending_queue = []
-    return renamed
+def _begin_step(mm_hashes: Sequence[str]) -> None:
+    """Hand an encoder step's hashes, in encoding order, to the forwards it runs."""
+    _state.step = {"hashes": list(mm_hashes), "scheduled": len(mm_hashes), "rows": 0, "taken": []}
 
 
-def _discard_pending() -> int:
-    """Drop queued placeholder entries that no scheduled item claims."""
-    queue = getattr(_state, "pending_queue", None)
-    if not queue:
-        return 0
+def _end_step() -> None:
+    """Close the encoder step, dropping its captures when its rows did not match its hashes.
+
+    vLLM pairs its own encoder outputs with ``mm_hashes`` by position, and so does
+    :func:`take_row_keys`; a different number of rows means some captures may sit
+    under another item's hash, and no timestamps are better than wrong ones.
+    """
+    step, _state.step = getattr(_state, "step", None), None
+    if step is None or step["rows"] == step["scheduled"]:
+        return
+    logging.warning(
+        "[NeMoSpeechLM] The encoder produced %d rows for %d scheduled audio items; dropping this step's CTC "
+        "timestamp captures.",
+        step["rows"],
+        step["scheduled"],
+    )
     with _lock:
-        for placeholder in queue:
-            entry = _store.pop(placeholder, None)
-            if entry is not None:
-                entry["dropped"] = True
-    _state.pending_queue = []
-    return len(queue)
+        for mm_hash in step["taken"]:
+            _drop_capture(mm_hash)
 
 
 def _trim_store() -> int:
@@ -587,9 +581,9 @@ def _align_chunk(encoder: Any, chunk: list, device: torch.device) -> list[dict]:
     """Run the deferred head and alignment for up to ``_ALIGN_BATCH`` requests."""
     entries = [entry for _, _, entry in chunk]
     try:
-        timestamp_inputs = _collate(entries, device)
+        alignment_states = _collate(entries, device)
         results = encoder.generate_ctc_timestamps(
-            timestamp_inputs=timestamp_inputs,
+            timestamp_inputs=alignment_states,
             sot_transcripts=[text for _, text, _ in chunk],
             # Read only after _collate has waited for the host copies.
             audio_durations=[float(entry["duration"]) for entry in entries],
@@ -825,7 +819,7 @@ def ctc_release(llm: Any, outputs: Sequence[Any]) -> None:
 
 
 def install_encoder_cache_binding() -> None:
-    """Rename stored inputs to ``mm_hash`` and record the request-to-hash map.
+    """Key captured inputs by ``mm_hash`` and record the request-to-hash map.
 
     The hook passes straight through while no encoder is registered.
     """
@@ -850,16 +844,15 @@ def install_encoder_cache_binding() -> None:
         # not been aligned yet keep it.
         _follow_engine_cache(freed=getattr(scheduler_output, "free_encoder_mm_hashes", ()))
 
-        # Encoder runs outside this hook, such as the startup profiling pass on dummy
-        # audio, queue placeholders that no scheduled item claims. Left queued they
-        # would pair with this batch's hashes and shift every entry onto the next
-        # request.
-        _discard_pending()
-
+        # The forward receives only tensors, so it takes its items' hashes from here, in
+        # the order vLLM encodes them.
         mm_hashes, _, mm_lora_refs = self._batch_mm_inputs_from_scheduler(scheduler_output)
-        outputs = original(self, scheduler_output, *args, **kwargs)
+        _begin_step(mm_hashes)
+        try:
+            outputs = original(self, scheduler_output, *args, **kwargs)
+        finally:
+            _end_step()
 
-        _rename_pending(mm_hashes)
         _follow_engine_cache(encoded=mm_hashes)
         _record_request_hashes((req_id, mm_hash) for mm_hash, (req_id, _position) in zip(mm_hashes, mm_lora_refs))
         _trim_store()
