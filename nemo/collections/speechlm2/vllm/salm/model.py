@@ -78,7 +78,7 @@ from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
     register_encoder,
     require_v1_model_runner,
     store_alignment_states,
-    take_row_keys,
+    take_step_hashes,
 )
 
 _AUDIO_INPUT_DTYPE = torch.float32
@@ -539,13 +539,14 @@ class NeMoSpeechLMForConditionalGeneration(
             capture (torch.Tensor | None): Per row, on the host, whether to keep its
                 alignment states; ``None`` keeps every row.
         """
-        # vLLM passes only tensors here, so each row's key, its audio's mm_hash, comes
-        # from the runner hook, which lists the step's hashes in encoding order. Every
-        # row takes one, kept or not, so the rest stay paired. Outside the hook (vLLM's
-        # startup profiling pass) there are none: the states are still produced, so
-        # memory is profiled as served, but nothing is stored.
-        row_keys = take_row_keys(audio_signal.shape[0])
-        keep = [True] * audio_signal.shape[0] if capture is None else capture.tolist()
+        # vLLM passes only tensors here, so each row's mm_hash comes from the runner
+        # hook, which lists the step's hashes in encoding order. Every row takes one,
+        # kept or not, so the rest stay paired. Outside the hook (vLLM's startup
+        # profiling pass) there are none: the states are still produced, so memory is
+        # profiled as served, but nothing is stored.
+        num_audio_items = audio_signal.shape[0]
+        mm_hashes = take_step_hashes(num_audio_items)
+        keep = [True] * num_audio_items if capture is None else capture.tolist()
         online = self.perception.encoder.online_inference() if self._uses_pe_encoder else contextlib.nullcontext()
         with online:
             if not any(keep):
@@ -557,9 +558,9 @@ class NeMoSpeechLMForConditionalGeneration(
                     input_signal_length=audio_lengths,
                     return_ctc_timestamp_inputs=True,
                 )
-                if row_keys is not None:
-                    row_keys = [key if kept else None for key, kept in zip(row_keys, keep)]
-                    store_alignment_states(row_keys, alignment_states, durations)
+                if mm_hashes is not None:
+                    kept_hashes = [mm_hash if kept else None for mm_hash, kept in zip(mm_hashes, keep)]
+                    store_alignment_states(kept_hashes, alignment_states, durations)
         return [emb[:emblen] for emb, emblen in zip(audio_embs, audio_emb_lens)]
 
     def embed_multimodal(self, **kwargs) -> MultiModalEmbeddings:

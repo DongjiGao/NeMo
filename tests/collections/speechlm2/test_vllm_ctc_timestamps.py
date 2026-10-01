@@ -74,7 +74,7 @@ def _capture(batch, frames, hashes, durations=None, inputs=None):
     """Store one forward's states under its items' hashes, as during a runner-hook step."""
     ct._begin_step(hashes)
     ct.store_alignment_states(
-        ct.take_row_keys(batch),
+        ct.take_step_hashes(batch),
         _inputs(batch, frames) if inputs is None else inputs,
         [1.0] * batch if durations is None else durations,
     )
@@ -123,11 +123,11 @@ def test_cache_hit_request_and_repeated_alignment_find_the_same_inputs(encoder):
     assert _words(ct.align_request("req-2", "c")) == ["c"]
 
 
-def test_forwards_outside_an_encoder_step_get_no_keys(encoder):
+def test_forwards_outside_an_encoder_step_get_no_hashes(encoder):
     # vLLM's startup profiling pass runs the encoder outside the runner hook.
-    assert ct.take_row_keys(1) is None
+    assert ct.take_step_hashes(1) is None
     _capture(1, 4, ["hash-a"], durations=[0.32])
-    assert ct.take_row_keys(1) is None
+    assert ct.take_step_hashes(1) is None
     ct._record_request_hashes([("req", "hash-a")])
 
     ct.align_request("req", "word")
@@ -242,12 +242,12 @@ def test_request_with_several_audio_items_gets_no_timestamps(encoder):
 
 def test_a_step_whose_rows_do_not_match_its_hashes_keeps_no_captures(encoder, caplog):
     ct._begin_step(["hash-a", "hash-b"])
-    ct.store_alignment_states(ct.take_row_keys(1), _inputs(1, 4), [1.0])
+    ct.store_alignment_states(ct.take_step_hashes(1), _inputs(1, 4), [1.0])
     ct._end_step()
     assert ct._store == {} and "dropping this step's CTC timestamp captures" in caplog.text
 
     ct._begin_step(["hash-c"])
-    assert ct.take_row_keys(2) is None
+    assert ct.take_step_hashes(2) is None
     ct._end_step()
 
     _capture(1, 3, ["hash-d"])
@@ -405,7 +405,7 @@ def test_runner_hook_keys_captures_by_hash_maps_cache_hits_and_ignores_outside_f
             # What _process_audio does for the items vLLM encodes this step.
             if step.hashes:
                 count = len(step.hashes)
-                ct.store_alignment_states(ct.take_row_keys(count), _inputs(count, 4), [1.0] * count)
+                ct.store_alignment_states(ct.take_step_hashes(count), _inputs(count, 4), [1.0] * count)
             return "encoded"
 
     def step(new_requests, encoded, freed=()):
@@ -427,8 +427,8 @@ def test_runner_hook_keys_captures_by_hash_maps_cache_hits_and_ignores_outside_f
     assert runner._execute_mm_encoder(first) == "encoded"
     # The same audio again is an encoder-cache hit: scheduled, but never encoded.
     runner._execute_mm_encoder(step([("req-b-0123abcd", "hash-a")], []))
-    # A forward outside the hook, like vLLM's startup profiling pass on dummy audio, gets no keys.
-    assert ct.take_row_keys(1) is None
+    # A forward outside the hook, like vLLM's startup profiling pass on dummy audio, gets no hashes.
+    assert ct.take_step_hashes(1) is None
     runner._execute_mm_encoder(step([("req-c-0123abcd", "hash-c")], [("req-c-0123abcd", "hash-c")]))
 
     assert set(ct._store) == {"hash-a", "hash-c"} and not ct._uncompacted

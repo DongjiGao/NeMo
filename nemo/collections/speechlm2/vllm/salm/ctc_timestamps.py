@@ -192,12 +192,15 @@ def read_speaker_prior_weight(ctc_config: Any) -> float:
     return speaker_prior_weight
 
 
-def take_row_keys(count: int) -> list[str] | None:
+def take_step_hashes(count: int) -> list[str] | None:
     """Return the ``mm_hash`` of each item in one encoder forward, in item order.
 
     The hook around vLLM's ``_execute_mm_encoder`` lists the step's hashes before the
     encoder runs, in the order vLLM encodes the items, and each forward takes the next
-    ``count`` of them.
+    ``count`` of them. One step can run several forwards, because vLLM batches
+    consecutive items only while they share a modality and fields, so a forward must
+    leave the rest of the hashes to the forwards after it. An audio-only model
+    normally runs one forward per step.
 
     Args:
         count (int): Number of multimodal items in the forward.
@@ -219,7 +222,7 @@ def take_row_keys(count: int) -> list[str] | None:
 
 
 def store_alignment_states(
-    row_keys: Sequence[str | None], alignment_states: Any, audio_durations: torch.Tensor | Sequence[float]
+    mm_hashes: Sequence[str | None], alignment_states: Any, audio_durations: torch.Tensor | Sequence[float]
 ) -> None:
     """Keep one forward's alignment states per item, in host memory, under each item's ``mm_hash``.
 
@@ -227,8 +230,8 @@ def store_alignment_states(
     head and the aligner read once the transcript is known.
 
     Args:
-        row_keys (Sequence[str | None]): One ``mm_hash`` per batch row, from
-            :func:`take_row_keys`; ``None`` skips the row.
+        mm_hashes (Sequence[str | None]): One ``mm_hash`` per batch row, from
+            :func:`take_step_hashes`; ``None`` skips the row.
         alignment_states (CTCTimestampInputs): The encoder's ``CTCTimestampInputs`` for the batch.
         audio_durations (torch.Tensor | Sequence[float]): Audio duration per row, in
             seconds. A device tensor is copied along with the states, so the forward
@@ -245,8 +248,8 @@ def store_alignment_states(
     # Rows are read only after this event, so the copies never block the forward.
     ready = torch.cuda.current_stream().record_event() if on_device else None
     with _lock:
-        for row, key in enumerate(row_keys):
-            if key is None:
+        for row, mm_hash in enumerate(mm_hashes):
+            if mm_hash is None:
                 continue
             entry = {name: None if tensor is None else tensor[row : row + 1] for name, tensor in host.items()}
             entry.update(
@@ -257,8 +260,8 @@ def store_alignment_states(
             entry["nbytes"] = _entry_nbytes(entry)
             # Re-encoded audio replaces its older capture and becomes the most recent,
             # which assigning to the existing key would not do.
-            _drop_capture(key)
-            _store[key] = entry
+            _drop_capture(mm_hash)
+            _store[mm_hash] = entry
             _uncompacted.append(entry)
 
 
@@ -386,7 +389,7 @@ def _end_step() -> None:
     """Close the encoder step, dropping its captures when its rows did not match its hashes.
 
     vLLM pairs its own encoder outputs with ``mm_hashes`` by position, and so does
-    :func:`take_row_keys`; a different number of rows means some captures may sit
+    :func:`take_step_hashes`; a different number of rows means some captures may sit
     under another item's hash, and no timestamps are better than wrong ones.
     """
     step, _state.step = getattr(_state, "step", None), None
@@ -846,7 +849,7 @@ def install_encoder_cache_binding() -> None:
 
         # The forward receives only tensors, so it takes its items' hashes from here, in
         # the order vLLM encodes them.
-        mm_hashes, _, mm_lora_refs = self._batch_mm_inputs_from_scheduler(scheduler_output)
+        mm_hashes, _, item_refs = self._batch_mm_inputs_from_scheduler(scheduler_output)
         _begin_step(mm_hashes)
         try:
             outputs = original(self, scheduler_output, *args, **kwargs)
@@ -854,7 +857,7 @@ def install_encoder_cache_binding() -> None:
             _end_step()
 
         _follow_engine_cache(encoded=mm_hashes)
-        _record_request_hashes((req_id, mm_hash) for mm_hash, (req_id, _position) in zip(mm_hashes, mm_lora_refs))
+        _record_request_hashes((req_id, mm_hash) for mm_hash, (req_id, _position) in zip(mm_hashes, item_refs))
         _trim_store()
         _compact_ready()
         return outputs
