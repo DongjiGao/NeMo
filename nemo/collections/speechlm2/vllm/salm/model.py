@@ -69,9 +69,7 @@ from nemo.collections.speechlm2.vllm.salm.backends import HybridBackend, make_ba
 from nemo.collections.speechlm2.vllm.salm.config import _AUDIO_PLACEHOLDER
 from nemo.collections.speechlm2.vllm.salm.ctc_serving import aligned_response_format
 from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
-    WORKER_ALIGN_METHOD,
     active_encoder,
-    align_request,
     ctc_adapter_path,
     install_worker_align_method,
     read_speaker_prior_weight,
@@ -117,21 +115,6 @@ _AUDIO_LAST = True
 # validate_language from silently promising languages we have not evaluated;
 # other codes still pass with a warning through get_other_languages.
 _SUPPORTED_LANGUAGES: Mapping[str, str] = {"en": "english"}
-
-# Our timestamps come from CTC alignment rather than the token stream, and the
-# captured rows live in the engine process, so the serving layer has to fetch the
-# alignment from there (transcription_worker_method) and hand it to the hooks.
-# That plumbing is an upstream addition; against a stock vLLM the hooks are
-# either never called or called without it, and the request would fail deep in
-# response assembly with a misleading "did not contain a valid diarized
-# transcript". Advertising the capability only when the plumbing exists turns
-# that into a clean, up-front "not supported for this model" instead.
-try:  # pragma: no cover - depends on the installed vLLM
-    from vllm.model_executor.models.interfaces import SupportsTranscription as _SupportsTranscriptionProto
-
-    _TIMESTAMP_PLUMBING = hasattr(_SupportsTranscriptionProto, "transcription_worker_method")
-except Exception:  # noqa: BLE001
-    _TIMESTAMP_PLUMBING = False
 
 
 def _server_skips_ctc_capture(stt_params: Any) -> bool:
@@ -189,11 +172,9 @@ class NeMoSpeechLMForConditionalGeneration(
     # Timings come from CTC forced alignment over encoder frames rather than from
     # timestamp tokens, so segment-timestamp parsing stays off: the server would
     # otherwise try to read timestamps out of the decoded token stream, where
-    # this model emits none.
+    # this model emits none. ctc_serving serves word timestamps and diarized
+    # transcripts instead, through the hooks below.
     supports_segment_timestamp: ClassVar[bool] = False
-    supports_word_timestamp: ClassVar[bool] = _TIMESTAMP_PLUMBING
-    supports_diarized_transcription: ClassVar[bool] = _TIMESTAMP_PLUMBING
-    transcription_worker_method: ClassVar[str | None] = WORKER_ALIGN_METHOD if _TIMESTAMP_PLUMBING else None
     # The <spk:N> turn tags are special tokens, so default decoding would strip
     # them before alignment.
     keep_special_tokens_for_diarization: ClassVar[bool] = True
@@ -267,7 +248,7 @@ class NeMoSpeechLMForConditionalGeneration(
         return inputs
 
     @classmethod
-    def get_word_timestamps(cls, text: str, request_output: Any = None, worker_output: Any = None) -> Any:
+    def get_word_timestamps(cls, text: str, worker_output: Any = None) -> Any:
         """Return per-word timings for a finished transcription.
 
         Returns ``None`` rather than an empty list when nothing was captured, so
@@ -275,13 +256,13 @@ class NeMoSpeechLMForConditionalGeneration(
         """
         from vllm.entrypoints.speech_to_text.transcription.protocol import TranscriptionWord
 
-        words = cls._aligned_words(text, request_output, worker_output)
+        words = cls._aligned_words(worker_output)
         if not words:
             return None
         return [TranscriptionWord(word=word["word"], start=word["start"], end=word["end"]) for word in words]
 
     @classmethod
-    def parse_diarized_transcript(cls, text: str, request_output: Any = None, worker_output: Any = None) -> Any:
+    def parse_diarized_transcript(cls, text: str, worker_output: Any = None) -> Any:
         """Group aligned words into speaker-attributed segments.
 
         The speaker labels come from the model's own ``<spk:N>`` t-SOT tags, while
@@ -290,7 +271,7 @@ class NeMoSpeechLMForConditionalGeneration(
         """
         from vllm.model_executor.models.interfaces import DiarizedTranscriptionSegment
 
-        words = cls._aligned_words(text, request_output, worker_output)
+        words = cls._aligned_words(worker_output)
         if not words:
             return []
 
@@ -317,19 +298,10 @@ class NeMoSpeechLMForConditionalGeneration(
         flush()
         return segments
 
-    @classmethod
-    def _aligned_words(cls, text: str, request_output: Any, worker_output: Any = None) -> list[dict]:
-        """Return the aligned words for a request.
-
-        Under ``vllm serve`` the engine already aligned them through
-        ``transcription_worker_method``; aligning here only works when the
-        engine shares this process, as with an in-process ``LLM``.
-        """
-        if worker_output is not None:
-            return list(worker_output["words"])
-        if request_output is None or not getattr(request_output, "request_id", None):
-            return []
-        return align_request(request_output.request_id, text)["words"]
+    @staticmethod
+    def _aligned_words(worker_output: Any) -> list[dict]:
+        """Return the words ``ctc_serving`` aligned in the engine for the request; none without an alignment."""
+        return list(worker_output["words"]) if worker_output else []
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -394,8 +366,8 @@ class NeMoSpeechLMForConditionalGeneration(
             # this run before weights are loaded.
             _apply_encoder_quantization(self.perception, getattr(config, "encoder_quantization", None))
 
-        # Installed even without an adapter, so a call gets a clear "not enabled" error
-        # (or, from a patched vLLM server, empty results) instead of an unknown method.
+        # Installed even without an adapter, so ctc_timestamps() gets a clear "not
+        # enabled" error instead of an unknown method.
         install_worker_align_method()
         self._maybe_enable_ctc_timestamps(getattr(config, "ctc_timestamps", None), vllm_config)
 

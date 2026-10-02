@@ -80,11 +80,8 @@ _DEFAULT_RETENTION_GB = 8.0
 # Requests nobody aligns or releases would otherwise stay mapped forever.
 _MAX_TRACKED_REQUESTS = 1 << 16
 
-# Worker method names reached through collective_rpc. Every alignment runs in the
-# batch method; WORKER_ALIGN_METHOD adapts it to vLLM's transcription_worker_method
-# convention of one request per call.
-WORKER_ALIGN_METHOD = "nemo_ctc_align_request"
-WORKER_ALIGN_BATCH_METHOD = "nemo_ctc_align_requests"
+# Worker method names reached through collective_rpc.
+WORKER_ALIGN_METHOD = "nemo_ctc_align_requests"
 WORKER_RELEASE_METHOD = "nemo_ctc_release_requests"
 
 # vLLM forms the scheduler's request id as f"{external_id}-{random_uuid():.8}".
@@ -742,11 +739,6 @@ def _worker_align_requests(worker: Any, items: list, release: bool = True, requi
     return align_requests([(request_id, text) for request_id, text in items], release=release)
 
 
-def _worker_align_request(worker: Any, request_id: str, text: str) -> dict:
-    """:func:`_worker_align_requests` for one request, vLLM's ``transcription_worker_method`` convention."""
-    return _worker_align_requests(worker, [(request_id, text)], require_enabled=False)[0]
-
-
 def _worker_release_requests(worker: Any, request_ids: list) -> None:
     """``collective_rpc`` entry point: release captures that will not be aligned, on every rank."""
     del worker
@@ -757,16 +749,15 @@ def install_worker_align_method() -> None:
     """Expose alignment and release to callers outside the engine as worker methods.
 
     ``collective_rpc`` resolves a method name on the worker, so the entry points are
-    attached to vLLM's GPU worker class under ``WORKER_ALIGN_METHOD``,
-    ``WORKER_ALIGN_BATCH_METHOD`` and ``WORKER_RELEASE_METHOD``.
+    attached to vLLM's GPU worker class under ``WORKER_ALIGN_METHOD`` and
+    ``WORKER_RELEASE_METHOD``.
     """
     try:
         from vllm.v1.worker.gpu_worker import Worker
     except ImportError:  # pragma: no cover - vLLM absent
         return
     for name, method in (
-        (WORKER_ALIGN_METHOD, _worker_align_request),
-        (WORKER_ALIGN_BATCH_METHOD, _worker_align_requests),
+        (WORKER_ALIGN_METHOD, _worker_align_requests),
         (WORKER_RELEASE_METHOD, _worker_release_requests),
     ):
         if getattr(Worker, name, None) is not method:
@@ -800,7 +791,7 @@ def align(
     """
     results: list[dict] = []
     for batch in _rpc_batches(items, chunk_size):
-        results.extend(_aligning_reply(rpc(WORKER_ALIGN_BATCH_METHOD, args=(batch, release, require_enabled))))
+        results.extend(_aligning_reply(rpc(WORKER_ALIGN_METHOD, args=(batch, release, require_enabled))))
     return results
 
 
@@ -814,7 +805,7 @@ async def align_async(
     """:func:`align` for an async engine client, e.g. a server's ``EngineClient.collective_rpc``."""
     results: list[dict] = []
     for batch in _rpc_batches(items, chunk_size):
-        results.extend(_aligning_reply(await rpc(WORKER_ALIGN_BATCH_METHOD, args=(batch, release, require_enabled))))
+        results.extend(_aligning_reply(await rpc(WORKER_ALIGN_METHOD, args=(batch, release, require_enabled))))
     return results
 
 

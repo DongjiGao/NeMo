@@ -205,7 +205,7 @@ def test_ranks_that_do_not_align_still_release_their_captures(encoder, monkeypat
     assert ct._worker_align_requests(None, [("req-a", "x")], False) == [ct._empty_result()]
     assert set(ct._store) == {"hash-a", "hash-b", "hash-c"}
     ct._worker_align_requests(None, [("req-a", "x"), ("req-b", "y")])
-    assert ct._worker_align_request(None, "req-c", "z") == ct._empty_result()
+    assert ct._worker_align_requests(None, [("req-c", "z")], True, False) == [ct._empty_result()]
     assert ct._store == {} and encoder.calls == []
 
 
@@ -213,7 +213,7 @@ def test_offline_api_aligns_repeatedly_then_releases(encoder):
     _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
     ct._record_request_hashes([(f"req-{name}-0123abcd", f"hash-{name}") for name in "abc"])
     methods = {
-        ct.WORKER_ALIGN_BATCH_METHOD: ct._worker_align_requests,
+        ct.WORKER_ALIGN_METHOD: ct._worker_align_requests,
         ct.WORKER_RELEASE_METHOD: ct._worker_release_requests,
     }
     llm = SimpleNamespace(collective_rpc=lambda method, args: [methods[method](None, *args)])
@@ -234,7 +234,7 @@ def test_sync_and_async_clients_send_the_same_rpcs_and_get_the_same_results(enco
     _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
     ct._record_request_hashes([(f"req-{name}-0123abcd", f"hash-{name}") for name in "abc"])
     methods = {
-        ct.WORKER_ALIGN_BATCH_METHOD: ct._worker_align_requests,
+        ct.WORKER_ALIGN_METHOD: ct._worker_align_requests,
         ct.WORKER_RELEASE_METHOD: ct._worker_release_requests,
     }
     sent = []
@@ -487,7 +487,6 @@ def test_offline_alignment_refuses_a_model_without_timestamps(monkeypatch):
     with pytest.raises(RuntimeError, match="not enabled"):
         ct._worker_align_requests(None, [("req", "<spk:0> hi")])
     assert ct._worker_align_requests(None, [("req", "<spk:0> hi")], True, False) == [ct._empty_result()]
-    assert ct._worker_align_request(None, "req", "<spk:0> hi") == ct._empty_result()
 
 
 def test_adapter_on_an_encoder_without_timestamp_support_is_refused():
@@ -697,7 +696,7 @@ def endpoint(encoder, monkeypatch):
     ctc_serving.install_transcription_alignment()
 
     methods = {
-        ct.WORKER_ALIGN_BATCH_METHOD: ct._worker_align_requests,
+        ct.WORKER_ALIGN_METHOD: ct._worker_align_requests,
         ct.WORKER_RELEASE_METHOD: ct._worker_release_requests,
     }
 
@@ -738,7 +737,7 @@ def test_endpoint_aligns_diarized_requests_on_the_json_path_and_releases_their_c
     assert [(s.speaker, s.text, s.start, s.end) for s in response.segments] == [("0", "hi there", 0.1, 0.28)]
     assert response.text == "hi there" and response.duration == 1.5 and response.usage.seconds == 2
     assert seen == {"response_format": "json", "prompt_format": "diarized_json", "skip_special_tokens": False}
-    assert endpoint.rpcs == [ct.WORKER_ALIGN_BATCH_METHOD] and ct._store == {}
+    assert endpoint.rpcs == [ct.WORKER_ALIGN_METHOD] and ct._store == {}
 
 
 def test_endpoint_returns_word_timestamps_for_verbose_json(endpoint):
