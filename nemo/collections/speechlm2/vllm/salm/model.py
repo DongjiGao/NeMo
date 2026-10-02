@@ -67,10 +67,12 @@ from nemo.collections.speechlm2.vllm.salm.audio import (
 )
 from nemo.collections.speechlm2.vllm.salm.backends import HybridBackend, make_backend
 from nemo.collections.speechlm2.vllm.salm.config import _AUDIO_PLACEHOLDER
+from nemo.collections.speechlm2.vllm.salm.ctc_serving import aligned_response_format
 from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
     WORKER_ALIGN_METHOD,
     active_encoder,
     align_request,
+    ctc_adapter_path,
     install_worker_align_method,
     read_speaker_prior_weight,
     register_encoder,
@@ -131,29 +133,16 @@ try:  # pragma: no cover - depends on the installed vLLM
 except Exception:  # noqa: BLE001
     _TIMESTAMP_PLUMBING = False
 
-# With that plumbing the server aligns only these responses; verbose_json only when
-# word timestamps are requested, which get_generation_prompt cannot see.
-_ALIGNED_RESPONSE_FORMATS = ("diarized_json", "verbose_json")
-
-
-def _ctc_adapter_path(ctc_config: Any) -> str | None:
-    """Return the adapter path of a checkpoint's ``ctc_timestamps`` block, if any."""
-    if not ctc_config:
-        return None
-    if isinstance(ctc_config, dict):
-        return ctc_config.get("adapter_path")
-    return getattr(ctc_config, "adapter_path", None)
-
 
 def _server_skips_ctc_capture(stt_params: Any) -> bool:
     """Whether a transcription request's audio should not be captured for CTC timestamps.
 
-    A capture that the server never aligns would stay in the engine until the byte cap
-    evicts it.
+    The endpoint aligns only the requests ``ctc_serving`` takes over; a capture the
+    server never aligns would stay in the engine until the byte cap evicts it.
     """
-    if not _ctc_adapter_path(getattr(stt_params.model_config.hf_config, "ctc_timestamps", None)):
+    if not ctc_adapter_path(getattr(stt_params.model_config.hf_config, "ctc_timestamps", None)):
         return False
-    return not (_TIMESTAMP_PLUMBING and getattr(stt_params, "response_format", None) in _ALIGNED_RESPONSE_FORMATS)
+    return aligned_response_format() is None
 
 
 def _is_parallel_expert_encoder(module: nn.Module) -> bool:
@@ -232,8 +221,9 @@ class NeMoSpeechLMForConditionalGeneration(
 
         ``diarized_json`` requests get the t-SOT prompt, which is what makes the
         model emit speaker tags; everything else gets the measured verbatim prompt.
-        With CTC timestamps enabled, requests whose response the server never aligns
-        opt out of timestamp capture through ``mm_processor_kwargs``.
+        vLLM does not pass the response format, so it comes from ``ctc_serving`` for
+        the requests the endpoint aligns. With CTC timestamps enabled, all other
+        requests opt out of timestamp capture through ``mm_processor_kwargs``.
 
         Returns a text prompt rather than token ids on purpose: the multimodal
         processor splits on ``<|audio|>`` and expands each locator into the
@@ -249,7 +239,8 @@ class NeMoSpeechLMForConditionalGeneration(
         if task_type != "transcribe":
             raise ValueError(f"NeMo SpeechLM supports transcription only, got task_type={task_type!r}.")
 
-        diarized = getattr(stt_params, "response_format", None) == "diarized_json"
+        response_format = aligned_response_format() or getattr(stt_params, "response_format", None)
+        diarized = response_format == "diarized_json"
         text = _SOT_PROMPT if diarized else _TRANSCRIBE_PROMPT
         content = f"{text} {_AUDIO_PLACEHOLDER}" if _AUDIO_LAST else f"{_AUDIO_PLACEHOLDER}\n{text}"
 
@@ -418,7 +409,7 @@ class NeMoSpeechLMForConditionalGeneration(
         Off unless configured: capture costs throughput and retains rows, so a
         deployment that does not want timestamps should not pay for them.
         """
-        adapter_path = _ctc_adapter_path(ctc_config)
+        adapter_path = ctc_adapter_path(ctc_config)
         if not adapter_path:
             return
 

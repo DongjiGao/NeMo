@@ -164,3 +164,7 @@ def register():
     from nemo.collections.speechlm2.vllm.salm.runtime_compat import install_prompt_contract
 
     install_prompt_contract()
+
+    from nemo.collections.speechlm2.vllm.salm.ctc_serving import install_transcription_alignment
+
+    install_transcription_alignment()

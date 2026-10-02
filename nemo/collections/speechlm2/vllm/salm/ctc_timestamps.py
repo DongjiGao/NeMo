@@ -194,6 +194,19 @@ def read_speaker_prior_weight(ctc_config: Any) -> float:
     return speaker_prior_weight
 
 
+def ctc_adapter_path(ctc_config: Any) -> str | None:
+    """Return the adapter path of a checkpoint's ``ctc_timestamps`` block; set means timestamps are on.
+
+    Args:
+        ctc_config (Any): The ``ctc_timestamps`` block, as a dict or an attribute object.
+    """
+    if not ctc_config:
+        return None
+    if isinstance(ctc_config, dict):
+        return ctc_config.get("adapter_path")
+    return getattr(ctc_config, "adapter_path", None)
+
+
 def take_step_hashes(count: int) -> list[str] | None:
     """Return the ``mm_hash`` of each item in one encoder forward, in item order.
 

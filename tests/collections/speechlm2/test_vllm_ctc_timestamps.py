@@ -637,33 +637,151 @@ def test_processor_marks_the_audio_of_requests_that_opt_out_of_capture():
     assert processor._get_mm_fields_config(None, {})["capture_ctc_timestamps"].field.keep_on_cpu
 
 
-def test_server_requests_opt_out_of_capture_unless_their_response_is_aligned(monkeypatch):
+def test_server_requests_opt_out_of_capture_unless_the_endpoint_aligns_them(monkeypatch):
     pytest.importorskip("vllm")
     import vllm.tokenizers
 
+    from nemo.collections.speechlm2.vllm.salm import ctc_serving
     from nemo.collections.speechlm2.vllm.salm import model as salm_model
 
     template = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: messages[0]["content"])
     monkeypatch.setattr(vllm.tokenizers, "cached_tokenizer_from_config", lambda model_config: template)
 
-    def processor_kwargs(response_format, adapter_path="/adapter.pt"):
+    def prompt(aligned_format=None, adapter_path="/adapter.pt"):
         hf_config = SimpleNamespace(ctc_timestamps={"adapter_path": adapter_path} if adapter_path else None)
-        params = SimpleNamespace(
-            task_type="transcribe",
-            response_format=response_format,
-            audio=None,
-            model_config=SimpleNamespace(hf_config=hf_config),
-        )
-        return salm_model.NeMoSpeechLMForConditionalGeneration.get_generation_prompt(params).get("mm_processor_kwargs")
+        params = SimpleNamespace(task_type="transcribe", audio=None, model_config=SimpleNamespace(hf_config=hf_config))
+        aligned = None if aligned_format is None else ctc_serving._AlignedRequest(aligned_format, False)
+        token = ctc_serving._current.set(aligned)
+        try:
+            return salm_model.NeMoSpeechLMForConditionalGeneration.get_generation_prompt(params)
+        finally:
+            ctc_serving._current.reset(token)
 
-    opted_out = {"capture_ctc_timestamps": False}
-    monkeypatch.setattr(salm_model, "_TIMESTAMP_PLUMBING", True)
-    formats = ("json", "text", "verbose_json", "diarized_json")
-    assert [processor_kwargs(f) for f in formats] == [opted_out, opted_out, None, None]
-    assert processor_kwargs("json", adapter_path=None) is None
-    # A server without the alignment plumbing aligns nothing.
-    monkeypatch.setattr(salm_model, "_TIMESTAMP_PLUMBING", False)
-    assert processor_kwargs("diarized_json") == opted_out
+    assert prompt()["mm_processor_kwargs"] == {"capture_ctc_timestamps": False}
+    assert "mm_processor_kwargs" not in prompt("verbose_json")
+    diarized = prompt("diarized_json")
+    assert "mm_processor_kwargs" not in diarized and "<spk:0>" in diarized["prompt"]
+    assert "mm_processor_kwargs" not in prompt(adapter_path=None)
+
+
+@pytest.fixture
+def endpoint(encoder, monkeypatch):
+    """vLLM's transcription endpoint wrapped by ctc_serving, with generation stubbed and the real store."""
+    pytest.importorskip("vllm")
+    from vllm.entrypoints.speech_to_text.base import serving
+    from vllm.entrypoints.speech_to_text.transcription import protocol
+
+    from nemo.collections.speechlm2.vllm.salm import ctc_serving
+    from nemo.collections.speechlm2.vllm.salm.model import NeMoSpeechLMForConditionalGeneration
+
+    script, seen, rpcs = {}, {}, []
+
+    async def generate(self, audio_data, request, raw_request, response_class, stream_generator_method):
+        # vLLM's path for a non-streaming request with one engine input.
+        seen["response_format"] = request.response_format
+        await self._preprocess_speech_to_text(request=request, audio_data=audio_data, request_id="transcribe-req")
+        seen["skip_special_tokens"] = request.to_sampling_params(64, {}).skip_special_tokens
+        if script["cancel"]:
+            raise asyncio.CancelledError
+        return protocol.TranscriptionResponse(text=script["transcript"], usage={"type": "duration", "seconds": 2})
+
+    async def preprocess(self, request, audio_data, request_id):
+        seen["prompt_format"] = ctc_serving.aligned_response_format()
+        return ["engine input"], 1.5, [0.0]
+
+    monkeypatch.setattr(serving.SpeechToTextBaseServing, "_create_speech_to_text", generate)
+    monkeypatch.setattr(serving.SpeechToTextBaseServing, "_preprocess_speech_to_text", preprocess)
+    monkeypatch.setattr(
+        protocol.TranscriptionRequest, "to_sampling_params", protocol.TranscriptionRequest.to_sampling_params
+    )
+    ctc_serving.install_transcription_alignment()
+
+    methods = {
+        ct.WORKER_ALIGN_BATCH_METHOD: ct._worker_align_requests,
+        ct.WORKER_RELEASE_METHOD: ct._worker_release_requests,
+    }
+
+    async def collective_rpc(method, args):
+        rpcs.append(method)
+        return [methods[method](None, *args)]
+
+    class _Endpoint(serving.SpeechToTextBaseServing):
+        def __init__(self, adapter_path):
+            self.task_type = "transcribe"
+            self.model_config = SimpleNamespace(
+                hf_config=SimpleNamespace(ctc_timestamps={"adapter_path": adapter_path})
+            )
+            self.model_cls = NeMoSpeechLMForConditionalGeneration
+            self.engine_client = SimpleNamespace(collective_rpc=collective_rpc)
+
+    def transcribe(response_format, transcript, cancel=False, adapter_path="/adapter.pt", **fields):
+        script.update(transcript=transcript, cancel=cancel)
+        seen.clear()
+        rpcs.clear()
+        request = protocol.TranscriptionRequest.model_construct(response_format=response_format, **fields)
+        coroutine = _Endpoint(adapter_path)._create_speech_to_text(
+            audio_data=b"", request=request, raw_request=None, response_class=None, stream_generator_method=None
+        )
+        response = asyncio.run(coroutine)
+        assert request.response_format == response_format
+        return response, seen
+
+    return SimpleNamespace(transcribe=transcribe, rpcs=rpcs)
+
+
+def test_endpoint_aligns_diarized_requests_on_the_json_path_and_releases_their_capture(endpoint):
+    _capture(1, 4, ["hash-a"])
+    ct._record_request_hashes([("transcribe-req-0123abcd", "hash-a")])
+
+    response, seen = endpoint.transcribe("diarized_json", "hi there")
+
+    assert [(s.speaker, s.text, s.start, s.end) for s in response.segments] == [("0", "hi there", 0.1, 0.28)]
+    assert response.text == "hi there" and response.duration == 1.5 and response.usage.seconds == 2
+    assert seen == {"response_format": "json", "prompt_format": "diarized_json", "skip_special_tokens": False}
+    assert endpoint.rpcs == [ct.WORKER_ALIGN_BATCH_METHOD] and ct._store == {}
+
+
+def test_endpoint_returns_word_timestamps_for_verbose_json(endpoint):
+    _capture(1, 4, ["hash-a"])
+    ct._record_request_hashes([("transcribe-req-0123abcd", "hash-a")])
+
+    response, seen = endpoint.transcribe("verbose_json", "hi there", timestamp_granularities=["word"])
+
+    assert [(w.word, w.start, w.end) for w in response.words] == [("hi", 0.1, 0.18), ("there", 0.2, 0.28)]
+    assert response.language == "en" and response.duration == 1.5 and response.segments is None
+    assert seen == {"response_format": "json", "prompt_format": "verbose_json", "skip_special_tokens": True}
+
+
+def test_endpoint_leaves_requests_without_timestamps_to_vllm(endpoint):
+    cases = [
+        ("json", {}),
+        ("text", {}),
+        ("verbose_json", {"timestamp_granularities": ["segment"]}),
+        ("diarized_json", {"adapter_path": None}),
+    ]
+    for response_format, fields in cases:
+        response, seen = endpoint.transcribe(response_format, "hi", **fields)
+
+        assert type(response).__name__ == "TranscriptionResponse"
+        assert seen["response_format"] == response_format and seen["prompt_format"] is None
+        assert endpoint.rpcs == []
+
+
+def test_endpoint_releases_the_capture_of_a_cancelled_request(endpoint):
+    _capture(1, 4, ["hash-a"])
+    ct._record_request_hashes([("transcribe-req-0123abcd", "hash-a")])
+
+    with pytest.raises(asyncio.CancelledError):
+        endpoint.transcribe("diarized_json", "hi", cancel=True)
+
+    assert endpoint.rpcs == [ct.WORKER_RELEASE_METHOD] and ct._store == {}
+
+
+def test_endpoint_refuses_timestamps_with_streaming_or_beam_search(endpoint):
+    for fields in ({"stream": True}, {"use_beam_search": True}):
+        response, seen = endpoint.transcribe("diarized_json", "hi", **fields)
+
+        assert "neither streaming nor beam search" in response.error.message and seen == {}
 
 
 def test_transcripts_without_speaker_tags_are_reported(encoder, caplog):
