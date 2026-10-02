@@ -14,6 +14,7 @@
 
 """The vLLM plugin's per-request store for deferred CTC timestamp inputs, on CPU."""
 
+import asyncio
 import sys
 from collections import deque
 from types import SimpleNamespace
@@ -227,6 +228,44 @@ def test_offline_api_aligns_repeatedly_then_releases(encoder):
 
     ct.ctc_release(llm, [SimpleNamespace(request_id="req-c")])
     assert ct._store == {}
+
+
+def test_sync_and_async_clients_send_the_same_rpcs_and_get_the_same_results(encoder):
+    _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
+    ct._record_request_hashes([(f"req-{name}-0123abcd", f"hash-{name}") for name in "abc"])
+    methods = {
+        ct.WORKER_ALIGN_BATCH_METHOD: ct._worker_align_requests,
+        ct.WORKER_RELEASE_METHOD: ct._worker_release_requests,
+    }
+    sent = []
+
+    def rpc(method, args):
+        sent.append((method, args))
+        reply = methods[method](None, *args)
+        # Every rank replies; only the first one aligns.
+        other_rank = None if reply is None else [ct._empty_result() for _ in reply]
+        return [reply, other_rank]
+
+    async def rpc_async(method, args):
+        return rpc(method, args)
+
+    items = [("req-a", "a"), ("req-b", "b c"), ("req-c", "d")]
+    sync = ct.align(rpc, items, release=False, chunk_size=2)
+    sync_sent = sent[:]
+    sent.clear()
+    via_async = asyncio.run(ct.align_async(rpc_async, items, release=False, chunk_size=2))
+
+    assert via_async == sync
+    assert [_words(result) for result in sync] == [["a"], ["b", "c"], ["d"]]
+    assert sent == sync_sent and [len(args[0]) for _, args in sent] == [2, 1]
+
+    asyncio.run(ct.release_captures_async(rpc_async, ["req-a", "req-b"]))
+    assert list(ct._store) == ["hash-c"]
+    ct.release_captures(rpc, ["req-c"])
+    assert ct._store == {}
+
+    with pytest.raises(ValueError, match="chunk_size"):
+        ct.align(rpc, items, chunk_size=0)
 
 
 def test_request_with_several_audio_items_gets_no_timestamps(encoder):
@@ -447,6 +486,7 @@ def test_offline_alignment_refuses_a_model_without_timestamps(monkeypatch):
 
     with pytest.raises(RuntimeError, match="not enabled"):
         ct._worker_align_requests(None, [("req", "<spk:0> hi")])
+    assert ct._worker_align_requests(None, [("req", "<spk:0> hi")], True, False) == [ct._empty_result()]
     assert ct._worker_align_request(None, "req", "<spk:0> hi") == ct._empty_result()
 
 

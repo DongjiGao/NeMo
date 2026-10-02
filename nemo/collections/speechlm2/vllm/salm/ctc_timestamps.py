@@ -50,12 +50,13 @@ which the server's prompt hook sets for responses it never aligns. Captures nobo
 releases are bounded only by ``NEMO_CTC_TIMESTAMP_RETAIN_GB`` of host memory
 (default 8), least recently used first.
 
-Alignment runs in the engine process, where the inputs live. Offline callers use
-:func:`ctc_timestamps` (or :func:`ctc_word_timestamps` for words only); a server
-reaches the same code through
-``collective_rpc`` by the names in ``WORKER_ALIGN_METHOD``,
-``WORKER_ALIGN_BATCH_METHOD`` and ``WORKER_RELEASE_METHOD``, passing the external
-request id, which vLLM's scheduler knows with a random suffix appended.
+Alignment runs in the engine process, where the inputs live, in one worker method
+that both modes reach through ``collective_rpc``. The client functions :func:`align`
+and :func:`release_captures` call it from a synchronous ``LLM``, which is what
+:func:`ctc_timestamps`, :func:`ctc_word_timestamps` and :func:`ctc_release` do;
+:func:`align_async` and :func:`release_captures_async` call it from a server's async
+engine client. Callers pass the external request id, which vLLM's scheduler knows
+with a random suffix appended.
 """
 
 from __future__ import annotations
@@ -79,8 +80,9 @@ _DEFAULT_RETENTION_GB = 8.0
 # Requests nobody aligns or releases would otherwise stay mapped forever.
 _MAX_TRACKED_REQUESTS = 1 << 16
 
-# Worker method names reached through collective_rpc: one request (a server's
-# transcription hooks), many (offline LLM callers), or releasing without aligning.
+# Worker method names reached through collective_rpc. Every alignment runs in the
+# batch method; WORKER_ALIGN_METHOD adapts it to vLLM's transcription_worker_method
+# convention of one request per call.
 WORKER_ALIGN_METHOD = "nemo_ctc_align_request"
 WORKER_ALIGN_BATCH_METHOD = "nemo_ctc_align_requests"
 WORKER_RELEASE_METHOD = "nemo_ctc_release_requests"
@@ -697,37 +699,39 @@ def _aligns_here() -> bool:
         return True
 
 
-def _worker_align_request(worker: Any, request_id: str, text: str) -> dict:
-    """``collective_rpc`` entry point: align on the worker that holds the inputs.
+def _worker_align_requests(worker: Any, items: list, release: bool = True, require_enabled: bool = True) -> list[dict]:
+    """``collective_rpc`` entry point for both modes: align finished requests where their inputs live.
 
-    A server aligns each request once, so the request's capture is released after it.
-    """
-    del worker
-    if not _aligns_here():
-        _release_requests([request_id])
-        return _empty_result()
-    return align_request(request_id, text)
+    Every rank keeps its own captures, so ranks that do not align still release theirs.
 
+    Args:
+        worker (Any): The vLLM worker the method is attached to; unused.
+        items (list): ``(request_id, transcript)`` pairs; a server sends one.
+        release (bool): Afterwards drop each request's claim on its capture.
+        require_enabled (bool): Raise when the model was loaded without timestamps. A
+            server, which asks for every timestamped request, passes ``False`` to get
+            empty results instead.
 
-def _worker_align_requests(worker: Any, items: list, release: bool = True) -> list[dict]:
-    """``collective_rpc`` entry point: align many finished requests in one call.
-
-    Only :func:`ctc_timestamps` calls this, so a model loaded without timestamps is an
-    error here; the single-request entry point, which a server calls for every
-    timestamped request, keeps answering with empty results instead. Every rank keeps
-    its own captures, so ranks that do not align still release theirs.
+    Returns:
+        list[dict]: Per item, the result described in :func:`align_requests`; empty
+        on ranks that do not align.
     """
     del worker
     if not _aligns_here():
         if release:
             _release_requests([request_id for request_id, _ in items])
         return [_empty_result() for _ in items]
-    if active_encoder() is None:
+    if require_enabled and active_encoder() is None:
         raise RuntimeError(
             "CTC timestamps are not enabled for this model: its config has no ctc_timestamps.adapter_path "
             "(check the hf_overrides key)."
         )
     return align_requests([(request_id, text) for request_id, text in items], release=release)
+
+
+def _worker_align_request(worker: Any, request_id: str, text: str) -> dict:
+    """:func:`_worker_align_requests` for one request, vLLM's ``transcription_worker_method`` convention."""
+    return _worker_align_requests(worker, [(request_id, text)], require_enabled=False)[0]
 
 
 def _worker_release_requests(worker: Any, request_ids: list) -> None:
@@ -754,6 +758,79 @@ def install_worker_align_method() -> None:
     ):
         if getattr(Worker, name, None) is not method:
             setattr(Worker, name, method)
+
+
+def align(
+    rpc: Any,
+    items: Sequence[tuple[str, str]],
+    release: bool = True,
+    require_enabled: bool = True,
+    chunk_size: int = 256,
+) -> list[dict]:
+    """Align finished requests through an engine's ``collective_rpc``, one RPC per ``chunk_size`` items.
+
+    The client side shared by both modes; :func:`align_async` is the same for an async
+    engine client. Each RPC runs on the engine thread, so aligning while other requests
+    decode stalls them for its duration.
+
+    Args:
+        rpc (Any): The engine's ``collective_rpc``, e.g. ``LLM.collective_rpc``.
+        items (Sequence[tuple[str, str]]): ``(request_id, transcript)`` pairs, with the
+            external request ids the caller sees.
+        release (bool): Drop each request's claim on its capture after aligning it.
+        require_enabled (bool): Raise when the model was loaded without timestamps,
+            instead of returning empty results.
+        chunk_size (int): Items aligned per RPC.
+
+    Returns:
+        list[dict]: Per item, the result described in :func:`align_requests`.
+    """
+    results: list[dict] = []
+    for batch in _rpc_batches(items, chunk_size):
+        results.extend(_aligning_reply(rpc(WORKER_ALIGN_BATCH_METHOD, args=(batch, release, require_enabled))))
+    return results
+
+
+async def align_async(
+    rpc: Any,
+    items: Sequence[tuple[str, str]],
+    release: bool = True,
+    require_enabled: bool = True,
+    chunk_size: int = 256,
+) -> list[dict]:
+    """:func:`align` for an async engine client, e.g. a server's ``EngineClient.collective_rpc``."""
+    results: list[dict] = []
+    for batch in _rpc_batches(items, chunk_size):
+        results.extend(_aligning_reply(await rpc(WORKER_ALIGN_BATCH_METHOD, args=(batch, release, require_enabled))))
+    return results
+
+
+def release_captures(rpc: Any, request_ids: Sequence[str]) -> None:
+    """Release requests that will not be aligned, on every rank, through ``collective_rpc``.
+
+    Their captures are deleted once no other request or vLLM's encoder cache needs them.
+
+    Args:
+        rpc (Any): The engine's ``collective_rpc``, e.g. ``LLM.collective_rpc``.
+        request_ids (Sequence[str]): External request ids.
+    """
+    rpc(WORKER_RELEASE_METHOD, args=(list(request_ids),))
+
+
+async def release_captures_async(rpc: Any, request_ids: Sequence[str]) -> None:
+    """:func:`release_captures` for an async engine client."""
+    await rpc(WORKER_RELEASE_METHOD, args=(list(request_ids),))
+
+
+def _rpc_batches(items: Sequence[tuple[str, str]], chunk_size: int) -> list[list[tuple[str, str]]]:
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be at least 1; got {chunk_size}.")
+    return [list(items[start : start + chunk_size]) for start in range(0, len(items), chunk_size)]
+
+
+def _aligning_reply(replies: list) -> list[dict]:
+    """The aligning worker's results: ``collective_rpc`` returns one reply per worker, in rank order."""
+    return replies[0]
 
 
 def ctc_timestamps(
@@ -796,12 +873,7 @@ def ctc_timestamps(
     items = [
         (out.request_id, out.outputs[0].text if texts is None else texts[index]) for index, out in enumerate(outputs)
     ]
-    results: list[dict] = []
-    for start in range(0, len(items), chunk_size):
-        batch = items[start : start + chunk_size]
-        # One reply per worker, in rank order; only the first worker aligns.
-        results.extend(llm.collective_rpc(WORKER_ALIGN_BATCH_METHOD, args=(batch, release))[0])
-    return results
+    return align(llm.collective_rpc, items, release=release, chunk_size=chunk_size)
 
 
 def ctc_word_timestamps(
@@ -820,7 +892,7 @@ def ctc_release(llm: Any, outputs: Sequence[Any]) -> None:
         llm (Any): The ``vllm.LLM`` that produced ``outputs``.
         outputs (Sequence[Any]): Its ``RequestOutput`` objects.
     """
-    llm.collective_rpc(WORKER_RELEASE_METHOD, args=([out.request_id for out in outputs],))
+    release_captures(llm.collective_rpc, [out.request_id for out in outputs])
 
 
 def install_encoder_cache_binding() -> None:
