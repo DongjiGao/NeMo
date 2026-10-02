@@ -588,11 +588,6 @@ def align_finished_requests(finished: Sequence[tuple[str, str]], *, release: boo
     return results
 
 
-def align_finished_request(request_id: str, text: str, *, release: bool) -> dict:
-    """Align one finished request; see :func:`align_finished_requests`."""
-    return align_finished_requests([(request_id, text)], release=release)[0]
-
-
 def _align_chunk(encoder: Any, chunk: list, device: torch.device) -> list[dict]:
     """Run the deferred head and alignment for up to ``_ALIGN_BATCH`` requests."""
     entries = [entry for _, _, entry in chunk]
