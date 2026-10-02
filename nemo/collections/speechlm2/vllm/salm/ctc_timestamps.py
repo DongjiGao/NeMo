@@ -812,7 +812,9 @@ def ctc_word_timestamps(
 
 
 def ctc_release(llm: Any, outputs: Sequence[Any]) -> None:
-    """Delete the stored CTC timestamp inputs of outputs that will not be aligned.
+    """Release outputs that will not be aligned.
+
+    Their captures are deleted once no other request or vLLM's encoder cache needs them.
 
     Args:
         llm (Any): The ``vllm.LLM`` that produced ``outputs``.
