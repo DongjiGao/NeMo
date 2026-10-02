@@ -52,8 +52,6 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, init_vllm_regist
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
-from nemo.utils import logging
-
 from nemo.collections.speechlm2.parts.encoder_chunking import encode_audio_with_optional_chunking
 from nemo.collections.speechlm2.vllm.salm.audio import (
     _SAMPLING_RATE,
@@ -63,9 +61,9 @@ from nemo.collections.speechlm2.vllm.salm.audio import (
     NeMoSpeechLMProcessingInfo,
     _apply_encoder_quantization,
     _load_nemo_perception,
-    _prepare_prequantized_encoder,
     _maybe_mount_independent_speaker_encoder,
     _maybe_mount_pe_encoder,
+    _prepare_prequantized_encoder,
 )
 from nemo.collections.speechlm2.vllm.salm.backends import HybridBackend, make_backend
 from nemo.collections.speechlm2.vllm.salm.config import _AUDIO_PLACEHOLDER
@@ -80,6 +78,7 @@ from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
     store_alignment_states,
     take_step_hashes,
 )
+from nemo.utils import logging
 
 _AUDIO_INPUT_DTYPE = torch.float32
 _PERCEPTION_DTYPE = torch.bfloat16
@@ -126,9 +125,7 @@ _SUPPORTED_LANGUAGES: Mapping[str, str] = {"en": "english"}
 # transcript". Advertising the capability only when the plumbing exists turns
 # that into a clean, up-front "not supported for this model" instead.
 try:  # pragma: no cover - depends on the installed vLLM
-    from vllm.model_executor.models.interfaces import (
-        SupportsTranscription as _SupportsTranscriptionProto,
-    )
+    from vllm.model_executor.models.interfaces import SupportsTranscription as _SupportsTranscriptionProto
 
     _TIMESTAMP_PLUMBING = hasattr(_SupportsTranscriptionProto, "transcription_worker_method")
 except Exception:  # noqa: BLE001
@@ -213,9 +210,7 @@ class NeMoSpeechLMForConditionalGeneration(
     keep_special_tokens_for_diarization: ClassVar[bool] = True
 
     @classmethod
-    def get_speech_to_text_config(
-        cls, model_config: Any, task_type: Literal["transcribe", "translate"]
-    ) -> Any:
+    def get_speech_to_text_config(cls, model_config: Any, task_type: Literal["transcribe", "translate"]) -> Any:
         """Describe audio handling for the /v1/audio/transcriptions endpoint.
 
         Chunking is disabled: a ParallelExpertEncoder runs its own
@@ -287,17 +282,12 @@ class NeMoSpeechLMForConditionalGeneration(
         Returns ``None`` rather than an empty list when nothing was captured, so
         the response omits ``words`` instead of asserting the audio had none.
         """
-        from vllm.entrypoints.speech_to_text.transcription.protocol import (
-            TranscriptionWord,
-        )
+        from vllm.entrypoints.speech_to_text.transcription.protocol import TranscriptionWord
 
         words = cls._aligned_words(text, request_output, worker_output)
         if not words:
             return None
-        return [
-            TranscriptionWord(word=word["word"], start=word["start"], end=word["end"])
-            for word in words
-        ]
+        return [TranscriptionWord(word=word["word"], start=word["start"], end=word["end"]) for word in words]
 
     @classmethod
     def parse_diarized_transcript(cls, text: str, request_output: Any = None, worker_output: Any = None) -> Any:
@@ -550,7 +540,9 @@ class NeMoSpeechLMForConditionalGeneration(
         online = self.perception.encoder.online_inference() if self._uses_pe_encoder else contextlib.nullcontext()
         with online:
             if not any(keep):
-                audio_embs, audio_emb_lens = self.perception(input_signal=audio_signal, input_signal_length=audio_lengths)
+                audio_embs, audio_emb_lens = self.perception(
+                    input_signal=audio_signal, input_signal_length=audio_lengths
+                )
             else:
                 durations = audio_lengths.double() / _SAMPLING_RATE
                 audio_embs, audio_emb_lens, alignment_states = self.perception(
@@ -600,9 +592,7 @@ class NeMoSpeechLMForConditionalGeneration(
         # Between the cast and the load on purpose. The cast is dtype-blind and
         # would turn fp8 buffers back into bfloat16, while the load needs the fp8
         # parameters to already exist or it reports weight_scale as unexpected.
-        _prepare_prequantized_encoder(
-            self.perception, getattr(self.config, "encoder_quantization", None)
-        )
+        _prepare_prequantized_encoder(self.perception, getattr(self.config, "encoder_quantization", None))
         incompatible = self.perception.load_state_dict(perception_weights, strict=False)
 
         from nemo.collections.speechlm2.modules.perception import IndependentDualEncoder
