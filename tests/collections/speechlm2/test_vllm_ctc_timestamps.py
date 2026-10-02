@@ -102,7 +102,7 @@ def test_external_request_id_resolves_and_rows_from_two_forwards_are_padded(enco
     _capture(1, 3, ["hash-b"], durations=[0.24])
     ct._record_request_hashes([("req-a-0123abcd", "hash-a"), ("req-b-89abcdef", "hash-b")])
 
-    results = ct.align_requests([("req-a", "one two"), ("req-b", "three")])
+    results = ct.align_finished_requests([("req-a", "one two"), ("req-b", "three")], release=True)
 
     assert [_words(result) for result in results] == [["one", "two"], ["three"]]
     inputs, texts, durations = encoder.calls[0]
@@ -120,8 +120,9 @@ def test_cache_hit_request_and_repeated_alignment_find_the_same_inputs(encoder):
     repeat = SimpleNamespace(req_id="req-2", mm_features=[SimpleNamespace(identifier="hash-a")])
     ct._record_request_hashes(ct._new_request_hashes(SimpleNamespace(scheduled_new_reqs=[first, repeat])))
 
-    assert ct.align_request("req-1", "a b", release=False) == ct.align_request("req-1", "a b")
-    assert _words(ct.align_request("req-2", "c")) == ["c"]
+    kept = ct.align_finished_request("req-1", "a b", release=False)
+    assert kept == ct.align_finished_request("req-1", "a b", release=True)
+    assert _words(ct.align_finished_request("req-2", "c", release=True)) == ["c"]
 
 
 def test_forwards_outside_an_encoder_step_get_no_hashes(encoder):
@@ -131,7 +132,7 @@ def test_forwards_outside_an_encoder_step_get_no_hashes(encoder):
     assert ct.take_step_hashes(1) is None
     ct._record_request_hashes([("req", "hash-a")])
 
-    ct.align_request("req", "word")
+    ct.align_finished_request("req", "word", release=True)
 
     assert encoder.calls[0][0].asr_encoded.shape[-1] == 4
     assert encoder.calls[0][2] == [0.32]
@@ -141,11 +142,11 @@ def test_a_shared_capture_is_deleted_once_its_last_owner_is_aligned(encoder, cap
     _capture(1, 4, ["hash-a"])
     ct._record_request_hashes([("req-1", "hash-a"), ("req-2", "hash-a")])
 
-    assert _words(ct.align_request("req-1", "a")) == ["a"]
-    assert "hash-a" in ct._store and ct.align_request("req-1", "a") == ct._empty_result()
+    assert _words(ct.align_finished_request("req-1", "a", release=True)) == ["a"]
+    assert "hash-a" in ct._store and ct.align_finished_request("req-1", "a", release=True) == ct._empty_result()
     assert "already aligned or released" in caplog.text
 
-    assert _words(ct.align_request("req-2", "b")) == ["b"]
+    assert _words(ct.align_finished_request("req-2", "b", release=True)) == ["b"]
     assert ct._store == {} and ct._hash_owners == {} and ct._request_hashes == {}
 
 
@@ -154,15 +155,15 @@ def test_an_unowned_capture_lives_while_vllm_caches_its_audio(encoder):
     ct._follow_engine_cache(encoded=["hash-a", "hash-b"])
     ct._record_request_hashes([("req-1", "hash-a"), ("req-2", "hash-b")])
 
-    ct.align_request("req-1", "a")
+    ct.align_finished_request("req-1", "a", release=True)
     # A later request with the same audio is an encoder-cache hit and captures nothing.
     ct._record_request_hashes([("req-3", "hash-a")])
-    assert _words(ct.align_request("req-3", "c")) == ["c"]
+    assert _words(ct.align_finished_request("req-3", "c", release=True)) == ["c"]
     assert "hash-a" in ct._store
 
     ct._follow_engine_cache(freed=["hash-a", "hash-b"])
     assert list(ct._store) == ["hash-b"]
-    ct.align_request("req-2", "b")
+    ct.align_finished_request("req-2", "b", release=True)
     assert ct._store == {}
 
 
@@ -170,7 +171,7 @@ def test_one_unalignable_transcript_does_not_cost_the_batch(encoder):
     _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
     ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b"), ("req-c", "hash-c")])
 
-    results = ct.align_requests([("req-a", "x"), ("req-b", "unalignable"), ("req-c", "y z")])
+    results = ct.align_finished_requests([("req-a", "x"), ("req-b", "unalignable"), ("req-c", "y z")], release=True)
 
     assert [_words(result) for result in results] == [["x"], [], ["y", "z"]]
 
@@ -179,7 +180,7 @@ def test_diarization_segments_and_speaker_mapping_pass_through(encoder):
     _capture(1, 4, ["hash-a"])
     ct._record_request_hashes([("req", "hash-a")])
 
-    result = ct.align_request("req", "<spk:0> hi")
+    result = ct.align_finished_request("req", "<spk:0> hi", release=True)
 
     assert result["diarization"] == [{"speaker": 1, "start": 0.05, "end": 0.93}]
     assert result["speaker_tag_to_diarization_speaker"] == {"0": 1}
@@ -190,23 +191,44 @@ def test_release_false_keeps_captures_until_the_worker_releases_them(encoder):
     _capture(2, 4, ["hash-a", "hash-b"])
     ct._record_request_hashes([("req-a-0123abcd", "hash-a"), ("req-b-0123abcd", "hash-b")])
 
-    ct.align_requests([("req-a", "x"), ("req-b", "y")], release=False)
+    ct.align_finished_requests([("req-a", "x"), ("req-b", "y")], release=False)
     assert set(ct._store) == {"hash-a", "hash-b"}
 
     ct._worker_release_requests(None, ["req-a", "req-b", "never-seen"])
     assert ct._store == {} and ct._request_hashes == {} and ct._external_ids == {}
 
 
-def test_ranks_that_do_not_align_still_release_their_captures(encoder, monkeypatch):
-    _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
-    ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b"), ("req-c", "hash-c")])
-    monkeypatch.setattr(ct, "_aligns_here", lambda: False)
+def test_ranks_that_hold_no_captures_still_encode_but_store_nothing(encoder, monkeypatch):
+    class StubRunner:
+        def _batch_mm_inputs_from_scheduler(self, step):
+            return step.hashes, None, [(req_id, None) for req_id in step.req_ids]
 
-    assert ct._worker_align_requests(None, [("req-a", "x")], False) == [ct._empty_result()]
-    assert set(ct._store) == {"hash-a", "hash-b", "hash-c"}
-    ct._worker_align_requests(None, [("req-a", "x"), ("req-b", "y")])
-    assert ct._worker_align_requests(None, [("req-c", "z")], True, False) == [ct._empty_result()]
-    assert ct._store == {} and encoder.calls == []
+        def _execute_mm_encoder(self, step):
+            # What _encode_with_ctc_capture does: the forward always runs, and states
+            # are stored only under the step's hashes.
+            count = len(step.hashes)
+            hashes = ct.take_step_hashes(count)
+            if hashes is not None:
+                ct.store_alignment_states(hashes, _inputs(count, 4), [1.0] * count)
+            return "encoded"
+
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_model_runner", SimpleNamespace(GPUModelRunner=StubRunner))
+    ct.install_encoder_cache_binding()
+    monkeypatch.setattr(ct, "_holds_captures", lambda: False)
+    step = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(req_id="req-a-0123abcd", mm_features=[SimpleNamespace(identifier="hash-a")])
+        ],
+        hashes=["hash-a"],
+        req_ids=["req-a-0123abcd"],
+        free_encoder_mm_hashes=[],
+    )
+
+    assert StubRunner()._execute_mm_encoder(step) == "encoded"
+
+    assert ct._store == {} and ct._request_hashes == {}
+    assert ct._worker_align_requests(None, [("req-a", "x")]) == [ct._empty_result()]
+    assert encoder.calls == []
 
 
 def test_offline_api_aligns_repeatedly_then_releases(encoder):
@@ -272,7 +294,7 @@ def test_request_with_several_audio_items_gets_no_timestamps(encoder):
     _capture(2, 4, ["hash-a", "hash-b"])
     ct._record_request_hashes([("two-clips", "hash-a"), ("two-clips", "hash-b"), ("one-clip", "hash-b")])
 
-    results = ct.align_requests([("two-clips", "one two"), ("one-clip", "three")])
+    results = ct.align_finished_requests([("two-clips", "one two"), ("one-clip", "three")], release=True)
 
     assert results[0] == ct._empty_result()
     assert _words(results[1]) == ["three"]
@@ -291,7 +313,7 @@ def test_a_step_whose_rows_do_not_match_its_hashes_keeps_no_captures(encoder, ca
 
     _capture(1, 3, ["hash-d"])
     ct._record_request_hashes([("req", "hash-d")])
-    assert _words(ct.align_request("req", "ok")) == ["ok"]
+    assert _words(ct.align_finished_request("req", "ok", release=True)) == ["ok"]
 
 
 def test_compaction_trims_each_row_to_its_valid_frames_in_its_own_storage(encoder):
@@ -315,7 +337,7 @@ def test_compaction_trims_each_row_to_its_valid_frames_in_its_own_storage(encode
     assert torch.equal(asr[0], inputs.asr_encoded[1, :, :3])
 
     ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b")])
-    ct.align_requests([("req-a", "one"), ("req-b", "two")])
+    ct.align_finished_requests([("req-a", "one"), ("req-b", "two")], release=True)
     collated = encoder.calls[0][0]
     assert collated.asr_encoded.shape == (2, 4, 5)
     assert collated.diarization_labels[0].all()
@@ -378,7 +400,7 @@ def test_unexpected_alignment_errors_are_raised_not_hidden(encoder):
     ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b")])
 
     with pytest.raises(RuntimeError, match="kernel failure"):
-        ct.align_requests([("req-a", "fine"), ("req-b", "crash")])
+        ct.align_finished_requests([("req-a", "fine"), ("req-b", "crash")], release=True)
 
 
 def test_tensor_durations_survive_compaction(encoder):
@@ -386,7 +408,7 @@ def test_tensor_durations_survive_compaction(encoder):
     ct._compact_ready()
     ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b")])
 
-    ct.align_requests([("req-a", "x"), ("req-b", "y")], release=False)
+    ct.align_finished_requests([("req-a", "x"), ("req-b", "y")], release=False)
 
     assert encoder.calls[0][2] == [0.5, 0.25]
     assert ct._store["hash-b"]["duration"] == 0.25
@@ -406,11 +428,11 @@ def test_only_the_first_tensor_parallel_rank_aligns(encoder, monkeypatch):
     _capture(1, 4, ["hash-a"])
     ct._record_request_hashes([("req", "hash-a")])
 
-    monkeypatch.setattr(ct, "_aligns_here", lambda: False)
+    monkeypatch.setattr(ct, "_holds_captures", lambda: False)
     assert ct._worker_align_requests(None, [("req", "x")], False) == [ct._empty_result()]
     assert encoder.calls == []
 
-    monkeypatch.setattr(ct, "_aligns_here", lambda: True)
+    monkeypatch.setattr(ct, "_holds_captures", lambda: True)
     assert _words(ct._worker_align_requests(None, [("req", "x")])[0]) == ["x"]
 
 
@@ -418,7 +440,7 @@ def test_output_times_are_rounded_to_milliseconds(encoder):
     _capture(1, 4, ["hash-a"])
     ct._record_request_hashes([("req", "hash-a")])
 
-    words = ct.align_request("req", "a b c")["words"]
+    words = ct.align_finished_request("req", "a b c", release=True)["words"]
 
     assert [(w["start"], w["end"]) for w in words] == [(0.1, 0.18), (0.2, 0.28), (0.3, 0.38)]
 
@@ -471,7 +493,7 @@ def test_runner_hook_keys_captures_by_hash_maps_cache_hits_and_ignores_outside_f
     runner._execute_mm_encoder(step([("req-c-0123abcd", "hash-c")], [("req-c-0123abcd", "hash-c")]))
 
     assert set(ct._store) == {"hash-a", "hash-c"} and not ct._uncompacted
-    results = ct.align_requests([("req-a", "a"), ("req-b", "b"), ("req-c", "c")])
+    results = ct.align_finished_requests([("req-a", "a"), ("req-b", "b"), ("req-c", "c")], release=True)
     assert [_words(result) for result in results] == [["a"], ["b"], ["c"]]
     assert encoder.calls[0][2] == [1.0, 1.0, 1.0]
 
@@ -787,11 +809,11 @@ def test_transcripts_without_speaker_tags_are_reported(encoder, caplog):
     _capture(1, 4, ["hash-a"])
     ct._record_request_hashes([("req", "hash-a")])
 
-    ct.align_request("req", "hello world")
+    ct.align_finished_request("req", "hello world", release=True)
 
     assert "no <spk:N> speaker tags" in caplog.text
 
 
 def test_requests_without_recorded_audio_are_not_reported_as_evicted(encoder, caplog):
-    assert ct.align_requests([("text-only", "<spk:0> hello")]) == [ct._empty_result()]
+    assert ct.align_finished_requests([("text-only", "<spk:0> hello")], release=True) == [ct._empty_result()]
     assert "No capture is recorded" in caplog.text and "evicted" not in caplog.text

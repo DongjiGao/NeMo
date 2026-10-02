@@ -489,12 +489,13 @@ def _empty_result() -> dict:
     return {"words": [], "diarization": [], "speaker_tag_to_diarization_speaker": {}}
 
 
-def align_requests(items: Sequence[tuple[str, str]], release: bool = True) -> list[dict]:
-    """Align finished transcripts against their requests' stored inputs.
+def align_finished_requests(finished: Sequence[tuple[str, str]], *, release: bool) -> list[dict]:
+    """Align the transcripts of finished requests against the inputs captured while they ran.
 
     Args:
-        items (Sequence[tuple[str, str]]): ``(request_id, transcript)`` pairs; the
-            transcript is aligned exactly as given, speaker tags included.
+        finished (Sequence[tuple[str, str]]): ``(request_id, transcript)`` pairs of
+            requests that have finished generating; the transcript is aligned exactly
+            as given, speaker tags included.
         release (bool): Afterwards drop each request's claim on its capture, so the
             capture can be deleted. Pass ``False`` to align the same requests again.
 
@@ -513,13 +514,13 @@ def align_requests(items: Sequence[tuple[str, str]], release: bool = True) -> li
         Exception: Any aligner error other than ``ValueError``, which is how the
             aligner rejects a transcript it cannot align.
     """
-    results: list[dict] = [_empty_result() for _ in items]
+    results: list[dict] = [_empty_result() for _ in finished]
     encoder = active_encoder()
     if encoder is None:
         return results
     pending, no_audio, multi_audio, evicted = [], [], [], []
     with _lock:
-        for index, (request_id, text) in enumerate(items):
+        for index, (request_id, text) in enumerate(finished):
             if not text.strip():
                 continue
             hashes = mm_hashes_for_request(request_id)
@@ -553,7 +554,7 @@ def align_requests(items: Sequence[tuple[str, str]], release: bool = True) -> li
             "[NeMoSpeechLM] No capture is recorded for %d of %d requests (first: %s): they carried no audio, "
             "were already aligned or released with release=True, or the request id is unknown.",
             len(no_audio),
-            len(items),
+            len(finished),
             no_audio[0],
         )
     if evicted:
@@ -561,13 +562,13 @@ def align_requests(items: Sequence[tuple[str, str]], release: bool = True) -> li
             "[NeMoSpeechLM] The captures of %d of %d requests (first: %s) were evicted to stay under %.1f GB; "
             "align or ctc_release() requests sooner, or raise %s.",
             len(evicted),
-            len(items),
+            len(finished),
             evicted[0],
             _byte_limit() / 1e9,
             _RETENTION_GB_ENV,
         )
     # t-SOT output always opens with a tag, so a transcript without any lost them in decoding.
-    untagged = [items[index][0] for index, text, _ in pending if "<spk:" not in text]
+    untagged = [finished[index][0] for index, text, _ in pending if "<spk:" not in text]
     if untagged:
         logging.warning(
             "[NeMoSpeechLM] %d of %d transcripts have no <spk:N> speaker tags (first: %s) and are aligned as "
@@ -583,13 +584,13 @@ def align_requests(items: Sequence[tuple[str, str]], release: bool = True) -> li
         for (index, _, _), result in zip(chunk, _align_chunk(encoder, chunk, device)):
             results[index] = result
     if release:
-        _release_requests([request_id for request_id, _ in items])
+        _release_requests([request_id for request_id, _ in finished])
     return results
 
 
-def align_request(request_id: str, text: str, release: bool = True) -> dict:
-    """Align one finished transcript; see :func:`align_requests`."""
-    return align_requests([(request_id, text)], release=release)[0]
+def align_finished_request(request_id: str, text: str, *, release: bool) -> dict:
+    """Align one finished request; see :func:`align_finished_requests`."""
+    return align_finished_requests([(request_id, text)], release=release)[0]
 
 
 def _align_chunk(encoder: Any, chunk: list, device: torch.device) -> list[dict]:
@@ -648,7 +649,7 @@ def _collate_field(tensors: list[torch.Tensor], time_axis: int | None, device: t
 
 
 def _public_result(result: dict) -> dict:
-    """Plain, serializable view of one aligner result (see :func:`align_requests`).
+    """Plain, serializable view of one aligner result (see :func:`align_finished_requests`).
 
     Times are rounded to milliseconds; further digits are float noise from frame
     arithmetic.
@@ -692,12 +693,12 @@ def _new_request_hashes(scheduler_output: Any):
                 yield new_req.req_id, mm_hash
 
 
-def _aligns_here() -> bool:
-    """Whether this worker aligns.
+def _holds_captures() -> bool:
+    """Whether this worker stores captures and aligns them.
 
-    Every tensor-parallel rank of the first pipeline stage runs the encoder and holds
-    the same inputs, so only its rank 0 aligns; ``collective_rpc`` lists that worker's
-    reply first. Outside an initialized engine, as in unit tests, every caller aligns.
+    Every tensor-parallel rank of the first pipeline stage runs the encoder on the same
+    audio, so only its rank 0 keeps the inputs and aligns; ``collective_rpc`` lists that
+    worker's reply first. Outside an initialized engine, as in unit tests, every caller does.
     """
     try:
         from vllm.distributed.parallel_state import get_pp_group, get_tp_group
@@ -712,35 +713,34 @@ def _aligns_here() -> bool:
 def _worker_align_requests(worker: Any, items: list, release: bool = True, require_enabled: bool = True) -> list[dict]:
     """``collective_rpc`` entry point for both modes: align finished requests where their inputs live.
 
-    Every rank keeps its own captures, so ranks that do not align still release theirs.
+    ``collective_rpc`` calls every worker; the ones that hold no captures answer with
+    empty results, which callers skip.
 
     Args:
         worker (Any): The vLLM worker the method is attached to; unused.
-        items (list): ``(request_id, transcript)`` pairs; a server sends one.
+        items (list): ``(request_id, transcript)`` pairs of finished requests; a server
+            sends one.
         release (bool): Afterwards drop each request's claim on its capture.
         require_enabled (bool): Raise when the model was loaded without timestamps. A
             server, which asks for every timestamped request, passes ``False`` to get
             empty results instead.
 
     Returns:
-        list[dict]: Per item, the result described in :func:`align_requests`; empty
-        on ranks that do not align.
+        list[dict]: Per item, the result described in :func:`align_finished_requests`.
     """
     del worker
-    if not _aligns_here():
-        if release:
-            _release_requests([request_id for request_id, _ in items])
+    if not _holds_captures():
         return [_empty_result() for _ in items]
     if require_enabled and active_encoder() is None:
         raise RuntimeError(
             "CTC timestamps are not enabled for this model: its config has no ctc_timestamps.adapter_path "
             "(check the hf_overrides key)."
         )
-    return align_requests([(request_id, text) for request_id, text in items], release=release)
+    return align_finished_requests([(request_id, text) for request_id, text in items], release=release)
 
 
 def _worker_release_requests(worker: Any, request_ids: list) -> None:
-    """``collective_rpc`` entry point: release captures that will not be aligned, on every rank."""
+    """``collective_rpc`` entry point: release captures that will not be aligned."""
     del worker
     _release_requests(list(request_ids))
 
@@ -787,7 +787,7 @@ def align(
         chunk_size (int): Items aligned per RPC.
 
     Returns:
-        list[dict]: Per item, the result described in :func:`align_requests`.
+        list[dict]: Per item, the result described in :func:`align_finished_requests`.
     """
     results: list[dict] = []
     for batch in _rpc_batches(items, chunk_size):
@@ -810,7 +810,7 @@ async def align_async(
 
 
 def release_captures(rpc: Any, request_ids: Sequence[str]) -> None:
-    """Release requests that will not be aligned, on every rank, through ``collective_rpc``.
+    """Release requests that will not be aligned, through ``collective_rpc``.
 
     Their captures are deleted once no other request or vLLM's encoder cache needs them.
 
@@ -866,7 +866,7 @@ def ctc_timestamps(
         release (bool): Delete the outputs' captures after aligning them.
 
     Returns:
-        list[dict]: Per output, the result described in :func:`align_requests`.
+        list[dict]: Per output, the result described in :func:`align_finished_requests`.
 
     Raises:
         RuntimeError: When ``llm`` was loaded without CTC timestamps, e.g. because the
@@ -914,7 +914,9 @@ def install_encoder_cache_binding() -> None:
         return
 
     def _execute_mm_encoder(self, scheduler_output, *args, **kwargs):
-        if active_encoder() is None:
+        # Other tensor-parallel ranks run the same encoder forward but take no hashes,
+        # so they store nothing.
+        if active_encoder() is None or not _holds_captures():
             return original(self, scheduler_output, *args, **kwargs)
 
         # New requests resolve to their hashes here, including those whose audio is
