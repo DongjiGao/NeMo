@@ -33,8 +33,8 @@ Requires NeMo toolkit for the audio encoder:
 """
 
 import contextlib
-from collections.abc import Iterable, Mapping
-from typing import Any, ClassVar, Literal
+from collections.abc import Iterable
+from typing import Any
 
 import torch
 from torch import nn
@@ -45,7 +45,6 @@ from vllm.model_executor.models.interfaces import (
     SupportsMambaPrefixCaching,
     SupportsMultiModal,
     SupportsPP,
-    SupportsTranscription,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.utils import AutoWeightsLoader, init_vllm_registered_model, maybe_prefix
@@ -67,7 +66,6 @@ from nemo.collections.speechlm2.vllm.salm.audio import (
 )
 from nemo.collections.speechlm2.vllm.salm.backends import HybridBackend, make_backend
 from nemo.collections.speechlm2.vllm.salm.config import _AUDIO_PLACEHOLDER
-from nemo.collections.speechlm2.vllm.salm.ctc_serving import aligned_response_format
 from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
     active_encoder,
     ctc_adapter_path,
@@ -82,50 +80,6 @@ from nemo.utils import logging
 
 _AUDIO_INPUT_DTYPE = torch.float32
 _PERCEPTION_DTYPE = torch.bfloat16
-
-# The prompt the reported ASR-leaderboard numbers were measured with. Serving has
-# to render the same one or its WER will not match the published figures: the
-# "Omit accidental repetitions" clause is what suppresses runaway decoding, and
-# dropping the /no_think system turn lets the model emit reasoning instead of a
-# transcript.
-_TRANSCRIBE_PROMPT = (
-    "Produce a verbatim transcript of the audio. Preserve named entities, "
-    "abbreviations, numbers, dates, measurements, acronyms, and technical terms "
-    "as clearly as possible. Keep the same language as spoken and do not "
-    "translate. Omit accidental repetitions."
-)
-
-# The multi-speaker (t-SOT) prompt of the multispeaker-sot benchmark. Speaker
-# segments need the <spk:N> turn tags only this prompt produces; the verbatim
-# prompt above yields untagged text, which aligns as a single speaker.
-_SOT_PROMPT = (
-    "Transcribe this audio. Include all spoken words and verbal fillers. Write numbers as spoken. "
-    "Use no punctuation and no capitalization. Start every speaker turn with a speaker tag such as "
-    "<spk:0>, <spk:1>, <spk:2>, etc.; assign one stable tag per speaker and keep speaker identities "
-    "consistent. Output only the speaker-tagged transcript."
-)
-
-# runtime_compat enforces locator placement for the chat path: text, one ASCII
-# space, then a final <|audio|>. get_generation_prompt bypasses chat rendering,
-# so it has to reproduce that layout itself or the two entry points would
-# disagree on the prompt for the same model.
-_AUDIO_LAST = True
-
-# Nemotron Speech is English-first. Declaring only what we have measured keeps
-# validate_language from silently promising languages we have not evaluated;
-# other codes still pass with a warning through get_other_languages.
-_SUPPORTED_LANGUAGES: Mapping[str, str] = {"en": "english"}
-
-
-def _server_skips_ctc_capture(stt_params: Any) -> bool:
-    """Whether a transcription request's audio should not be captured for CTC timestamps.
-
-    The endpoint aligns only the requests ``ctc_serving`` takes over; a capture the
-    server never aligns would stay in the engine until the byte cap evicts it.
-    """
-    if not ctc_adapter_path(getattr(stt_params.model_config.hf_config, "ctc_timestamps", None)):
-        return False
-    return aligned_response_format() is None
 
 
 def _is_parallel_expert_encoder(module: nn.Module) -> bool:
@@ -162,146 +116,8 @@ class NeMoSpeechLMForConditionalGeneration(
     SupportsPP,
     IsHybrid,
     SupportsMambaPrefixCaching,
-    SupportsTranscription,
 ):
     """Backbone-agnostic NeMo SpeechLM. Composition with a backend handles per-backbone details."""
-
-    supported_languages: ClassVar[Mapping[str, str]] = _SUPPORTED_LANGUAGES
-    supports_transcription: ClassVar[Literal[True]] = True
-
-    # Timings come from CTC forced alignment over encoder frames rather than from
-    # timestamp tokens, so segment-timestamp parsing stays off: the server would
-    # otherwise try to read timestamps out of the decoded token stream, where
-    # this model emits none. ctc_serving serves word timestamps and diarized
-    # transcripts instead, through the hooks below.
-    supports_segment_timestamp: ClassVar[bool] = False
-    # The <spk:N> turn tags are special tokens, so default decoding would strip
-    # them before alignment.
-    keep_special_tokens_for_diarization: ClassVar[bool] = True
-
-    @classmethod
-    def get_speech_to_text_config(cls, model_config: Any, task_type: Literal["transcribe", "translate"]) -> Any:
-        """Describe audio handling for the /v1/audio/transcriptions endpoint.
-
-        Chunking is disabled: a ParallelExpertEncoder runs its own
-        context-preserving window over the full audio, and letting the endpoint
-        pre-split would both duplicate that and fragment the CTC frame grid the
-        timestamps are derived from.
-        """
-        from vllm.config import SpeechToTextConfig
-
-        return SpeechToTextConfig(
-            sample_rate=_SAMPLING_RATE,
-            max_audio_clip_s=None,
-            min_energy_split_window_size=None,
-        )
-
-    @classmethod
-    def get_generation_prompt(cls, stt_params: Any) -> Any:
-        """Render the transcription prompt for one audio chunk.
-
-        ``diarized_json`` requests get the t-SOT prompt, which is what makes the
-        model emit speaker tags; everything else gets the measured verbatim prompt.
-        vLLM does not pass the response format, so it comes from ``ctc_serving`` for
-        the requests the endpoint aligns. With CTC timestamps enabled, all other
-        requests opt out of timestamp capture through ``mm_processor_kwargs``.
-
-        Returns a text prompt rather than token ids on purpose: the multimodal
-        processor splits on ``<|audio|>`` and expands each locator into the
-        estimated audio-token count, so pre-tokenizing here would skip that
-        expansion and the embedding merge would not line up.
-        """
-        try:
-            from vllm.tokenizers import cached_tokenizer_from_config
-        except ImportError:  # older vLLM layout
-            from vllm.transformers_utils.tokenizer import cached_tokenizer_from_config
-
-        task_type = getattr(stt_params, "task_type", "transcribe")
-        if task_type != "transcribe":
-            raise ValueError(f"NeMo SpeechLM supports transcription only, got task_type={task_type!r}.")
-
-        response_format = aligned_response_format() or getattr(stt_params, "response_format", None)
-        diarized = response_format == "diarized_json"
-        text = _SOT_PROMPT if diarized else _TRANSCRIBE_PROMPT
-        content = f"{text} {_AUDIO_PLACEHOLDER}" if _AUDIO_LAST else f"{_AUDIO_PLACEHOLDER}\n{text}"
-
-        tokenizer = cached_tokenizer_from_config(stt_params.model_config)
-        try:
-            prompt = tokenizer.apply_chat_template(
-                [{"role": "user", "content": content}],
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-        except TypeError:
-            # Older templates do not accept enable_thinking; the /no_think
-            # directive in the prompt text is the fallback guard.
-            prompt = tokenizer.apply_chat_template(
-                [{"role": "user", "content": content}],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-
-        inputs = {"prompt": prompt, "multi_modal_data": {"audio": stt_params.audio}}
-        if _server_skips_ctc_capture(stt_params):
-            inputs["mm_processor_kwargs"] = {"capture_ctc_timestamps": False}
-        return inputs
-
-    @classmethod
-    def get_word_timestamps(cls, text: str, worker_output: Any = None) -> Any:
-        """Return per-word timings for a finished transcription.
-
-        Returns ``None`` rather than an empty list when nothing was captured, so
-        the response omits ``words`` instead of asserting the audio had none.
-        """
-        from vllm.entrypoints.speech_to_text.transcription.protocol import TranscriptionWord
-
-        words = cls._aligned_words(worker_output)
-        if not words:
-            return None
-        return [TranscriptionWord(word=word["word"], start=word["start"], end=word["end"]) for word in words]
-
-    @classmethod
-    def parse_diarized_transcript(cls, text: str, worker_output: Any = None) -> Any:
-        """Group aligned words into speaker-attributed segments.
-
-        The speaker labels come from the model's own ``<spk:N>`` t-SOT tags, while
-        the boundaries come from CTC alignment, so a segment closes whenever the
-        speaker changes rather than on punctuation or silence.
-        """
-        from vllm.model_executor.models.interfaces import DiarizedTranscriptionSegment
-
-        words = cls._aligned_words(worker_output)
-        if not words:
-            return []
-
-        segments: list[DiarizedTranscriptionSegment] = []
-        run: list[dict] = []
-
-        def flush() -> None:
-            if not run:
-                return
-            segments.append(
-                DiarizedTranscriptionSegment(
-                    start=run[0]["start"],
-                    end=run[-1]["end"],
-                    speaker=run[0]["speaker"],
-                    text=" ".join(word["word"] for word in run).strip(),
-                )
-            )
-
-        for word in words:
-            if run and word["speaker"] != run[0]["speaker"]:
-                flush()
-                run = []
-            run.append(word)
-        flush()
-        return segments
-
-    @staticmethod
-    def _aligned_words(worker_output: Any) -> list[dict]:
-        """Return the words ``ctc_serving`` aligned in the engine for the request; none without an alignment."""
-        return list(worker_output["words"]) if worker_output else []
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

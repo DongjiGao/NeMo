@@ -45,10 +45,9 @@ shares one through the encoder cache). A capture is deleted once the last of the
 aligned with ``release=True`` or released through :func:`ctc_release`, and vLLM has
 evicted its audio from the encoder cache: until then a new request with that audio is
 served from the cache and captures nothing, so it needs the old capture. A request can
-also opt out of capture with ``mm_processor_kwargs={"capture_ctc_timestamps": False}``,
-which the server's prompt hook sets for responses it never aligns. Captures nobody
-releases are bounded only by ``NEMO_CTC_TIMESTAMP_RETAIN_GB`` of host memory
-(default 8), least recently used first.
+also opt out of capture with ``mm_processor_kwargs={"capture_ctc_timestamps": False}``.
+Captures nobody releases are bounded only by ``NEMO_CTC_TIMESTAMP_RETAIN_GB`` of host
+memory (default 8), least recently used first.
 
 Alignment runs in the engine process, where the inputs live, in one worker method
 that both modes reach through ``collective_rpc``. The client functions :func:`align`
@@ -133,7 +132,7 @@ _lock = threading.RLock()
 def register_encoder(encoder: Any) -> None:
     """Publish the live encoder, which also turns input capture on.
 
-    The transcription hooks are classmethods on the vLLM model interface and never
+    The runner hook and the worker methods reached through ``collective_rpc`` never
     receive the model instance. One engine hosts one model per process, so a
     module-level reference is enough to bridge that.
 
@@ -422,8 +421,8 @@ def _trim_store() -> int:
     """Evict the least recently used captures while stored inputs exceed the byte budget.
 
     Captures normally go when their last owner is aligned or released, so this only
-    catches captures nobody releases: outputs an offline caller drops, and in a server
-    aborted requests and ``verbose_json`` requests without word timestamps. Python
+    catches captures nobody releases: outputs an offline caller drops, and every request
+    to a server, where nothing aligns them. Python
     dicts preserve insertion order and alignment re-inserts what it keeps, so the first
     keys are the least recently used. The newest capture is kept even when it alone
     exceeds the budget.
