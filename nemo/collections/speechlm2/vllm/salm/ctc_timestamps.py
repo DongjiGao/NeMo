@@ -14,6 +14,9 @@
 
 """Keep CTC timestamp inputs per request inside vLLM and align finished transcripts.
 
+Only requests that opt in keep anything: they set ``"capture_ctc_timestamps": True`` in
+vLLM's ``mm_processor_kwargs``, which ``LLM.chat`` and ``LLM.generate`` take.
+
 The encoder returns ``CTCTimestampInputs`` (ASR states, Sortformer speaker
 probabilities, 10 ms diarization labels) from the same forward that feeds the LLM,
 and runs the CTC head only when a finished transcript is aligned, in
@@ -44,10 +47,9 @@ does not know about. So each capture records the requests that own it (repeated 
 shares one through the encoder cache). A capture is deleted once the last of them is
 aligned with ``release=True`` or released through :func:`ctc_release`, and vLLM has
 evicted its audio from the encoder cache: until then a new request with that audio is
-served from the cache and captures nothing, so it needs the old capture. A request can
-also opt out of capture with ``mm_processor_kwargs={"capture_ctc_timestamps": False}``.
-Captures nobody releases are bounded only by ``NEMO_CTC_TIMESTAMP_RETAIN_GB`` of host
-memory (default 8), least recently used first.
+served from the cache and captures nothing, so it needs the old capture. Captures
+nobody releases are bounded only by ``NEMO_CTC_TIMESTAMP_RETAIN_GB`` of host memory
+(default 8), least recently used first.
 
 Alignment runs in the engine process, where the inputs live, in one worker method
 that both modes reach through ``collective_rpc``. The client functions :func:`align`
@@ -421,8 +423,8 @@ def _trim_store() -> int:
     """Evict the least recently used captures while stored inputs exceed the byte budget.
 
     Captures normally go when their last owner is aligned or released, so this only
-    catches captures nobody releases: outputs an offline caller drops, and every request
-    to a server, where nothing aligns them. Python
+    catches captures nobody releases: outputs an offline caller drops, and opted-in
+    requests to a server, where nothing aligns them. Python
     dicts preserve insertion order and alignment re-inserts what it keeps, so the first
     keys are the least recently used. The newest capture is kept even when it alone
     exceeds the budget.
@@ -550,8 +552,9 @@ def align_finished_requests(finished: Sequence[tuple[str, str]], *, release: boo
         )
     if no_audio:
         logging.warning(
-            "[NeMoSpeechLM] No capture is recorded for %d of %d requests (first: %s): they carried no audio, "
-            "were already aligned or released with release=True, or the request id is unknown.",
+            "[NeMoSpeechLM] No capture is recorded for %d of %d requests (first: %s): they did not opt in with "
+            'mm_processor_kwargs={"capture_ctc_timestamps": True}, carried no audio, were already aligned or '
+            "released with release=True, or the request id is unknown.",
             len(no_audio),
             len(finished),
             no_audio[0],
@@ -851,7 +854,8 @@ def ctc_timestamps(
 
     Args:
         llm (Any): The ``vllm.LLM`` that produced ``outputs``, with CTC timestamps enabled.
-        outputs (Sequence[Any]): Its ``RequestOutput`` objects, one audio item each.
+        outputs (Sequence[Any]): Its ``RequestOutput`` objects, one audio item each,
+            generated with ``mm_processor_kwargs={"capture_ctc_timestamps": True}``.
             Decode speaker-tagged prompts with ``skip_special_tokens=False`` so
             ``<spk:N>`` reaches the aligner.
         texts (Sequence[str] | None): Transcripts to align instead of the generated

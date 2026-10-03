@@ -628,7 +628,7 @@ def test_items_that_opt_out_take_their_hash_but_store_nothing(encoder):
     assert list(ct._store) == ["hash-b"] and float(ct._store["hash-b"]["duration"]) == 8 / 16000
 
 
-def test_processor_marks_the_audio_of_requests_that_opt_out_of_capture():
+def test_processor_marks_the_audio_of_requests_that_opt_into_capture():
     pytest.importorskip("vllm")
     from nemo.collections.speechlm2.vllm.salm.audio import NeMoSpeechLMMultiModalProcessor
 
@@ -656,10 +656,28 @@ def test_processor_marks_the_audio_of_requests_that_opt_out_of_capture():
         )
         return result["capture_ctc_timestamps"].tolist()
 
-    assert capture_flags({}) == [True, True]
-    assert capture_flags({"capture_ctc_timestamps": False}) == [False, False]
+    assert capture_flags({}) == [False, False]
+    assert capture_flags({"capture_ctc_timestamps": True}) == [True, True]
     # Read on the host while encoding, where a device copy would need a sync.
     assert processor._get_mm_fields_config(None, {})["capture_ctc_timestamps"].field.keep_on_cpu
+
+
+def test_startup_profiling_inputs_opt_into_capture(monkeypatch):
+    pytest.importorskip("vllm")
+    from vllm.multimodal.processing.dummy_inputs import BaseDummyInputsBuilder
+
+    from nemo.collections.speechlm2.vllm.salm.audio import NeMoSpeechLMDummyInputsBuilder
+
+    monkeypatch.setattr(
+        BaseDummyInputsBuilder,
+        "get_dummy_processor_inputs",
+        lambda self, seq_len, mm_counts, mm_options: SimpleNamespace(hf_processor_mm_kwargs={}),
+    )
+    builder = object.__new__(NeMoSpeechLMDummyInputsBuilder)
+
+    inputs = builder.get_dummy_processor_inputs(64, {"audio": 1}, {})
+
+    assert inputs.hf_processor_mm_kwargs == {"capture_ctc_timestamps": True}
 
 
 def test_transcripts_without_speaker_tags_are_reported(encoder, caplog):
