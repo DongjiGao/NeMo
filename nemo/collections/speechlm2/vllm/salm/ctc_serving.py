@@ -27,9 +27,11 @@ format: ``words``, ``diarization`` and ``speaker_tag_to_diarization_speaker``. v
 chat route serves the request itself, API-key check included; every other request
 passes through untouched.
 
-Speaker tags reach the aligner only when the prompt asks for them and the request sets
-``"skip_special_tokens": false``. Streaming and ``n`` above 1 are refused for opted-in
-requests. A request that fails, is cancelled or cannot be aligned releases its capture.
+Speaker tags reach the aligner only when the model writes them and the request keeps
+them with ``"skip_special_tokens": false``. The middleware does not read the prompt: a
+transcript without tags is aligned as one speaker, with a warning. Streaming and ``n``
+above 1 are refused for opted-in requests. A request that fails, is cancelled or cannot
+be aligned releases its capture.
 """
 
 from __future__ import annotations
@@ -71,8 +73,8 @@ async def ctc_timestamp_middleware(request: Any, call_next: Any) -> Any:
     payload = _opted_in(await request.body())
     if payload is None:
         return await call_next(request)
-    n = payload.get("n")
-    if payload.get("stream") or (isinstance(n, int) and n > 1):
+    num_completion_choices = payload.get("n")
+    if payload.get("stream") or (isinstance(num_completion_choices, int) and num_completion_choices > 1):
         return _error("CTC timestamps support neither streaming nor n > 1.")
 
     request_id = _engine_request_id(request, payload)
@@ -100,7 +102,8 @@ async def ctc_timestamp_middleware(request: Any, call_next: Any) -> Any:
 
 def _opted_in(body: bytes) -> dict | None:
     """The request's JSON when it opts into capture, read as the processor reads the flag; else ``None``."""
-    # Chat requests often carry megabytes of base64 audio; only parse those that can opt in.
+    # A quick filter, not the decision: a body that never mentions the flag cannot opt in,
+    # so most requests skip parsing their megabytes of base64 audio. The parsed check below decides.
     if _OPT_IN.encode() not in body:
         return None
     try:

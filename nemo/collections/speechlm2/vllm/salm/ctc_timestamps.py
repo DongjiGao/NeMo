@@ -570,12 +570,12 @@ def align_finished_requests(finished: Sequence[tuple[str, str]], *, release: boo
             _byte_limit() / 1e9,
             _RETENTION_GB_ENV,
         )
-    # t-SOT output always opens with a tag, so a transcript without any lost them in decoding.
+    # A transcript without any tag is aligned as one speaker: the model wrote none, or decoding removed them.
     untagged = [finished[index][0] for index, text, _ in pending if "<spk:" not in text]
     if untagged:
         logging.warning(
             "[NeMoSpeechLM] %d of %d transcripts have no <spk:N> speaker tags (first: %s) and are aligned as "
-            "one speaker; decode with skip_special_tokens=False to keep them.",
+            "one speaker: the model wrote none, or skip_special_tokens=True removed them.",
             len(untagged),
             len(pending),
             untagged[0],
