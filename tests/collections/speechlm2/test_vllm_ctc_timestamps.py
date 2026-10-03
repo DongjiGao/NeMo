@@ -730,7 +730,7 @@ def server(encoder):
         rpcs.clear()
         return client.post(path, json=body, headers=headers or {})
 
-    return SimpleNamespace(post=post, script=script, rpcs=rpcs, hf_config=hf_config)
+    return SimpleNamespace(post=post, script=script, rpcs=rpcs, hf_config=hf_config, app=app)
 
 
 def test_an_opted_in_chat_completion_gets_ctc_timestamps_and_releases_its_capture(server):
@@ -792,6 +792,30 @@ def test_an_alignment_failure_releases_the_capture_and_answers_500(server):
 
     assert response.status_code == 500 and response.json()["error"]["message"] == "kernel failure"
     assert server.rpcs == [ct.WORKER_ALIGN_METHOD, ct.WORKER_RELEASE_METHOD] and ct._store == {}
+
+
+def test_a_cancelled_chat_completion_releases_its_capture(server):
+    from starlette.requests import Request
+
+    from nemo.collections.speechlm2.vllm.salm.ctc_serving import ctc_timestamp_middleware
+
+    body = b'{"model": "hr9a", "messages": [], "mm_processor_kwargs": {"capture_ctc_timestamps": true}}'
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def call_next(request):
+        # The client goes away after the engine captured the request's audio.
+        request_id = "chatcmpl-" + dict(request.scope["headers"])[b"x-request-id"].decode()
+        _capture(1, 4, ["hash-cancelled"])
+        ct._record_request_hashes([(f"{request_id}-0123abcd", "hash-cancelled")])
+        raise asyncio.CancelledError
+
+    scope = {"type": "http", "method": "POST", "path": "/v1/chat/completions", "headers": [], "app": server.app}
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(ctc_timestamp_middleware(Request(scope, receive), call_next))
+
+    assert server.rpcs == [ct.WORKER_RELEASE_METHOD] and ct._store == {}
 
 
 def test_transcripts_without_speaker_tags_are_reported(encoder, caplog):
