@@ -306,7 +306,7 @@ class NeMoSpeechLMForConditionalGeneration(
             audio_signal (torch.Tensor): Padded audio, one row per item.
             audio_lengths (torch.Tensor): Valid samples per row.
             capture (torch.Tensor | None): Per row, on the host, whether to keep its
-                alignment states; ``None`` keeps every row.
+                alignment states; ``None`` keeps no row, as for a request that did not opt in.
         """
         # vLLM passes only tensors here, so each row's mm_hash comes from the runner
         # hook, which lists the step's hashes in encoding order. Every row takes one,
@@ -315,7 +315,7 @@ class NeMoSpeechLMForConditionalGeneration(
         # profiled as served, but nothing is stored.
         num_audio_items = audio_signal.shape[0]
         mm_hashes = take_step_hashes(num_audio_items)
-        keep = [True] * num_audio_items if capture is None else capture.tolist()
+        keep = [False] * num_audio_items if capture is None else capture.tolist()
         online = self.perception.encoder.online_inference() if self._uses_pe_encoder else contextlib.nullcontext()
         with online:
             if not any(keep):

@@ -595,7 +595,7 @@ def test_any_encoder_with_the_flag_captures_through_one_unchunked_forward(encode
     model = _model_with_fake_perception()
 
     ct._begin_step(["hash-a", "hash-b"])
-    embeddings = model._process_audio(_audio())
+    embeddings = model._process_audio(_audio([True, True]))
     ct._end_step()
 
     assert [tuple(e.shape) for e in embeddings] == [(3, 4), (3, 4)]
@@ -607,7 +607,7 @@ def test_a_forward_outside_the_hook_produces_states_but_stores_none(encoder):
     pytest.importorskip("vllm")
     model = _model_with_fake_perception()
 
-    model._process_audio(_audio())
+    model._process_audio(_audio([True, True]))
 
     # Memory is profiled as served, but there is no hash to store anything under.
     assert model.perception.forwards == [((2, 16), True)]
@@ -618,12 +618,14 @@ def test_items_that_opt_out_take_their_hash_but_store_nothing(encoder):
     pytest.importorskip("vllm")
     model = _model_with_fake_perception()
 
-    ct._begin_step(["hash-a", "hash-b", "hash-c", "hash-d"])
+    ct._begin_step(["hash-a", "hash-b", "hash-c", "hash-d", "hash-e", "hash-f"])
     model._process_audio(_audio([False, True]))
     model._process_audio(_audio([False, False]))
+    # Audio that arrives without a flag counts as not opted in.
+    model._process_audio(_audio())
     ct._end_step()
 
-    assert [capture for _, capture in model.perception.forwards] == [True, False]
+    assert [capture for _, capture in model.perception.forwards] == [True, False, False]
     # Rows take the step's hashes by position, so an opted-out row still takes one.
     assert list(ct._store) == ["hash-b"] and float(ct._store["hash-b"]["duration"]) == 8 / 16000
 
