@@ -16,6 +16,7 @@
 
 import asyncio
 import sys
+import threading
 from collections import deque
 from types import SimpleNamespace
 
@@ -27,33 +28,39 @@ from nemo.collections.asr.modules.parallel_expert_encoder import CTCTimestampInp
 from nemo.collections.speechlm2.vllm.salm import ctc_timestamps as ct
 
 
-class _FakeEncoder(nn.Module):
-    """Records collated inputs and returns one word per token of each transcript."""
+class _FakeAligner:
+    """Records collated inputs; its prepared batches align to one word per token of each transcript."""
 
     def __init__(self):
-        super().__init__()
-        self.weight = nn.Parameter(torch.zeros(1))
+        self.ctc_decoder = nn.Linear(1, 1)
         self.calls = []
 
-    def generate_ctc_timestamps(self, timestamp_inputs, sot_transcripts, audio_durations):
+    def prepare_from_inputs(self, timestamp_inputs, sot_transcripts, audio_durations):
         self.calls.append((timestamp_inputs, list(sot_transcripts), list(audio_durations)))
-        if any("unalignable" in text for text in sot_transcripts):
-            raise ValueError("tokenizer disagreement")
         if any("crash" in text for text in sot_transcripts):
             raise RuntimeError("kernel failure")
-        return [
-            {
-                "speaker_word_timestamps": {
-                    0: [
-                        {"word": word, "speaker": 0, "start": 0.1 * (index + 1), "end": 0.1 * (index + 1) + 0.08}
-                        for index, word in enumerate(text.split())
-                    ]
-                },
-                "diarization_timestamps": [{"speaker": 1, "start": 0.05, "end": 0.93}],
-                "speaker_tag_to_sortformer_column": {0: 1},
-            }
-            for text in sot_transcripts
-        ]
+        return {"records": [{"text": text, "ctc_log_probs": torch.zeros(1, 2)} for text in sot_transcripts]}
+
+
+def _align_fake_batch(prepared):
+    """Stands in for align_prepared_batch on a _FakeAligner batch, which arrives with its tensors intact."""
+    records = prepared["records"]
+    assert all(isinstance(record["ctc_log_probs"], torch.Tensor) for record in records)
+    if any("unalignable" in record["text"] for record in records):
+        raise ValueError("tokenizer disagreement")
+    return [
+        {
+            "speaker_word_timestamps": {
+                0: [
+                    {"word": word, "speaker": 0, "start": 0.1 * (index + 1), "end": 0.1 * (index + 1) + 0.08}
+                    for index, word in enumerate(record["text"].split())
+                ]
+            },
+            "diarization_timestamps": [{"speaker": 1, "start": 0.05, "end": 0.93}],
+            "speaker_tag_to_sortformer_column": {0: 1},
+        }
+        for record in records
+    ]
 
 
 def _words(result):
@@ -87,7 +94,7 @@ def _align_one(request_id, text, *, release):
 
 
 @pytest.fixture
-def encoder(monkeypatch):
+def aligner(monkeypatch):
     monkeypatch.setattr(ct, "_store", {})
     monkeypatch.setattr(ct, "_request_hashes", {})
     monkeypatch.setattr(ct, "_hash_owners", {})
@@ -96,12 +103,13 @@ def encoder(monkeypatch):
     monkeypatch.setattr(ct, "_registry", {})
     monkeypatch.setattr(ct, "_uncompacted", deque())
     monkeypatch.setattr(ct, "_state", SimpleNamespace())
-    fake = _FakeEncoder()
-    ct.register_encoder(fake)
+    monkeypatch.setattr("nemo.collections.speechlm2.parts.ctc_timestamp_utils.align_prepared_batch", _align_fake_batch)
+    fake = _FakeAligner()
+    ct.register_aligner(fake)
     return fake
 
 
-def test_external_request_id_resolves_and_rows_from_two_forwards_are_padded(encoder):
+def test_external_request_id_resolves_and_rows_from_two_forwards_are_padded(aligner):
     _capture(1, 5, ["hash-a"], durations=[0.4])
     _capture(1, 3, ["hash-b"], durations=[0.24])
     ct._record_request_hashes([("req-a-0123abcd", "hash-a"), ("req-b-89abcdef", "hash-b")])
@@ -109,7 +117,7 @@ def test_external_request_id_resolves_and_rows_from_two_forwards_are_padded(enco
     results = ct.align_finished_requests([("req-a", "one two"), ("req-b", "three")], release=True)
 
     assert [_words(result) for result in results] == [["one", "two"], ["three"]]
-    inputs, texts, durations = encoder.calls[0]
+    inputs, texts, durations = aligner.calls[0]
     assert texts == ["one two", "three"] and durations == [0.4, 0.24]
     assert inputs.asr_encoded.shape == (2, 4, 5)
     assert inputs.asr_encoded_lengths.tolist() == [5, 3]
@@ -118,7 +126,7 @@ def test_external_request_id_resolves_and_rows_from_two_forwards_are_padded(enco
     assert torch.count_nonzero(inputs.asr_encoded[1, :, 3:]) == 0
 
 
-def test_cache_hit_request_and_repeated_alignment_find_the_same_inputs(encoder):
+def test_cache_hit_request_and_repeated_alignment_find_the_same_inputs(aligner):
     _capture(1, 4, ["hash-a"])
     first = SimpleNamespace(req_id="req-1", mm_features=[SimpleNamespace(identifier="hash-a")])
     repeat = SimpleNamespace(req_id="req-2", mm_features=[SimpleNamespace(identifier="hash-a")])
@@ -129,7 +137,7 @@ def test_cache_hit_request_and_repeated_alignment_find_the_same_inputs(encoder):
     assert _words(_align_one("req-2", "c", release=True)) == ["c"]
 
 
-def test_forwards_outside_an_encoder_step_get_no_hashes(encoder):
+def test_forwards_outside_an_encoder_step_get_no_hashes(aligner):
     # vLLM's startup profiling pass runs the encoder outside the runner hook.
     assert ct.take_step_hashes(1) is None
     _capture(1, 4, ["hash-a"], durations=[0.32])
@@ -138,11 +146,11 @@ def test_forwards_outside_an_encoder_step_get_no_hashes(encoder):
 
     _align_one("req", "word", release=True)
 
-    assert encoder.calls[0][0].asr_encoded.shape[-1] == 4
-    assert encoder.calls[0][2] == [0.32]
+    assert aligner.calls[0][0].asr_encoded.shape[-1] == 4
+    assert aligner.calls[0][2] == [0.32]
 
 
-def test_a_shared_capture_is_deleted_once_its_last_owner_is_aligned(encoder, caplog):
+def test_a_shared_capture_is_deleted_once_its_last_owner_is_aligned(aligner, caplog):
     _capture(1, 4, ["hash-a"])
     ct._record_request_hashes([("req-1", "hash-a"), ("req-2", "hash-a")])
 
@@ -154,7 +162,7 @@ def test_a_shared_capture_is_deleted_once_its_last_owner_is_aligned(encoder, cap
     assert ct._store == {} and ct._hash_owners == {} and ct._request_hashes == {}
 
 
-def test_an_unowned_capture_lives_while_vllm_caches_its_audio(encoder):
+def test_an_unowned_capture_lives_while_vllm_caches_its_audio(aligner):
     _capture(2, 4, ["hash-a", "hash-b"])
     ct._follow_engine_cache(encoded=["hash-a", "hash-b"])
     ct._record_request_hashes([("req-1", "hash-a"), ("req-2", "hash-b")])
@@ -171,7 +179,7 @@ def test_an_unowned_capture_lives_while_vllm_caches_its_audio(encoder):
     assert ct._store == {}
 
 
-def test_one_unalignable_transcript_does_not_cost_the_batch(encoder):
+def test_one_unalignable_transcript_does_not_cost_the_batch(aligner):
     _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
     ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b"), ("req-c", "hash-c")])
 
@@ -180,7 +188,7 @@ def test_one_unalignable_transcript_does_not_cost_the_batch(encoder):
     assert [_words(result) for result in results] == [["x"], [], ["y", "z"]]
 
 
-def test_diarization_segments_and_speaker_mapping_pass_through(encoder):
+def test_diarization_segments_and_speaker_mapping_pass_through(aligner):
     _capture(1, 4, ["hash-a"])
     ct._record_request_hashes([("req", "hash-a")])
 
@@ -191,7 +199,7 @@ def test_diarization_segments_and_speaker_mapping_pass_through(encoder):
     assert result["words"][0]["speaker"] == "0"
 
 
-def test_release_false_keeps_captures_until_the_worker_releases_them(encoder):
+def test_release_false_keeps_captures_until_the_worker_releases_them(aligner):
     _capture(2, 4, ["hash-a", "hash-b"])
     ct._record_request_hashes([("req-a-0123abcd", "hash-a"), ("req-b-0123abcd", "hash-b")])
 
@@ -202,7 +210,7 @@ def test_release_false_keeps_captures_until_the_worker_releases_them(encoder):
     assert ct._store == {} and ct._request_hashes == {} and ct._external_ids == {}
 
 
-def test_ranks_that_hold_no_captures_still_encode_but_store_nothing(encoder, monkeypatch):
+def test_ranks_that_hold_no_captures_still_encode_but_store_nothing(aligner, monkeypatch):
     class StubRunner:
         def _batch_mm_inputs_from_scheduler(self, step):
             return step.hashes, None, [(req_id, None) for req_id in step.req_ids]
@@ -231,15 +239,15 @@ def test_ranks_that_hold_no_captures_still_encode_but_store_nothing(encoder, mon
     assert StubRunner()._execute_mm_encoder(step) == "encoded"
 
     assert ct._store == {} and ct._request_hashes == {}
-    assert ct._worker_align_requests(None, [("req-a", "x")]) == [ct._empty_result()]
-    assert encoder.calls == []
+    assert ct._worker_prepare_requests(None, [("req-a", "x")]) == {"count": 1, "batches": []}
+    assert aligner.calls == []
 
 
-def test_offline_api_aligns_repeatedly_then_releases(encoder):
+def test_offline_api_aligns_repeatedly_then_releases(aligner):
     _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
     ct._record_request_hashes([(f"req-{name}-0123abcd", f"hash-{name}") for name in "abc"])
     methods = {
-        ct.WORKER_ALIGN_METHOD: ct._worker_align_requests,
+        ct.WORKER_PREPARE_METHOD: ct._worker_prepare_requests,
         ct.WORKER_RELEASE_METHOD: ct._worker_release_requests,
     }
     llm = SimpleNamespace(collective_rpc=lambda method, args: [methods[method](None, *args)])
@@ -256,11 +264,11 @@ def test_offline_api_aligns_repeatedly_then_releases(encoder):
     assert ct._store == {}
 
 
-def test_sync_and_async_clients_send_the_same_rpcs_and_get_the_same_results(encoder):
+def test_sync_and_async_clients_send_the_same_rpcs_and_get_the_same_results(aligner):
     _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
     ct._record_request_hashes([(f"req-{name}-0123abcd", f"hash-{name}") for name in "abc"])
     methods = {
-        ct.WORKER_ALIGN_METHOD: ct._worker_align_requests,
+        ct.WORKER_PREPARE_METHOD: ct._worker_prepare_requests,
         ct.WORKER_RELEASE_METHOD: ct._worker_release_requests,
     }
     sent = []
@@ -268,8 +276,8 @@ def test_sync_and_async_clients_send_the_same_rpcs_and_get_the_same_results(enco
     def rpc(method, args):
         sent.append((method, args))
         reply = methods[method](None, *args)
-        # Every rank replies; only the first one aligns.
-        other_rank = None if reply is None else [ct._empty_result() for _ in reply]
+        # Every rank replies; only the first one prepares.
+        other_rank = None if reply is None else {"count": reply["count"], "batches": []}
         return [reply, other_rank]
 
     async def rpc_async(method, args):
@@ -294,7 +302,64 @@ def test_sync_and_async_clients_send_the_same_rpcs_and_get_the_same_results(enco
         ct.align(rpc, items, chunk_size=0)
 
 
-def test_request_with_several_audio_items_gets_no_timestamps(encoder):
+def test_async_alignment_runs_off_the_event_loop_thread(aligner, monkeypatch):
+    _capture(1, 4, ["hash-a"])
+    ct._record_request_hashes([("req-a-0123abcd", "hash-a")])
+    threads = []
+
+    def align_and_record_thread(prepared):
+        threads.append(threading.current_thread())
+        return _align_fake_batch(prepared)
+
+    monkeypatch.setattr(
+        "nemo.collections.speechlm2.parts.ctc_timestamp_utils.align_prepared_batch", align_and_record_thread
+    )
+
+    async def rpc(method, args):
+        return [ct._worker_prepare_requests(None, *args)]
+
+    (result,) = asyncio.run(ct.align_async(rpc, [("req-a", "a b")]))
+
+    assert _words(result) == ["a", "b"]
+    assert threads and threads[0] is not threading.main_thread()
+
+
+def test_a_prepared_reply_survives_vllms_rpc_serialization(aligner):
+    pytest.importorskip("vllm")
+    from vllm.v1.engine import UtilityOutput
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, UtilityResult
+
+    _capture(1, 4, ["hash-a"])
+    ct._record_request_hashes([("req-a-0123abcd", "hash-a")])
+    reply = ct._worker_prepare_requests(None, [("req-a", "a b")])
+
+    # How a collective_rpc result travels from the engine process to the client.
+    sent = MsgpackEncoder().encode(UtilityOutput(call_id=1, result=UtilityResult(reply)))
+    received = MsgpackDecoder(UtilityOutput).decode(sent).result.result
+
+    assert _words(ct._align_reply([received])[0]) == ["a", "b"]
+
+
+def test_packed_worker_replies_carry_bytes_and_rebuild_their_tensors():
+    reply = {
+        "values": torch.arange(6.0).reshape(2, 3),
+        "flags": torch.tensor([[True, False]]),
+        "nested": [torch.zeros(0, 3)],
+        "text": "x",
+        "missing": None,
+    }
+
+    packed = ct._pack(reply)
+    unpacked = ct._unpack(packed)
+
+    assert isinstance(packed["values"]["data"], bytes)
+    assert torch.equal(unpacked["values"], reply["values"])
+    assert torch.equal(unpacked["flags"], reply["flags"]) and unpacked["flags"].dtype == torch.bool
+    assert unpacked["nested"][0].shape == (0, 3)
+    assert unpacked["text"] == "x" and unpacked["missing"] is None
+
+
+def test_request_with_several_audio_items_gets_no_timestamps(aligner):
     _capture(2, 4, ["hash-a", "hash-b"])
     ct._record_request_hashes([("two-clips", "hash-a"), ("two-clips", "hash-b"), ("one-clip", "hash-b")])
 
@@ -302,10 +367,10 @@ def test_request_with_several_audio_items_gets_no_timestamps(encoder):
 
     assert results[0] == ct._empty_result()
     assert _words(results[1]) == ["three"]
-    assert [texts for _, texts, _ in encoder.calls] == [["three"]]
+    assert [texts for _, texts, _ in aligner.calls] == [["three"]]
 
 
-def test_a_step_whose_rows_do_not_match_its_hashes_keeps_no_captures(encoder, caplog):
+def test_a_step_whose_rows_do_not_match_its_hashes_keeps_no_captures(aligner, caplog):
     ct._begin_step(["hash-a", "hash-b"])
     ct.store_alignment_states(ct.take_step_hashes(1), _inputs(1, 4), [1.0])
     ct._end_step()
@@ -320,7 +385,7 @@ def test_a_step_whose_rows_do_not_match_its_hashes_keeps_no_captures(encoder, ca
     assert _words(_align_one("req", "ok", release=True)) == ["ok"]
 
 
-def test_compaction_trims_each_row_to_its_valid_frames_in_its_own_storage(encoder):
+def test_compaction_trims_each_row_to_its_valid_frames_in_its_own_storage(aligner):
     inputs = CTCTimestampInputs(
         asr_encoded=torch.randn(2, 4, 5),
         asr_encoded_lengths=torch.tensor([5, 3]),
@@ -342,13 +407,13 @@ def test_compaction_trims_each_row_to_its_valid_frames_in_its_own_storage(encode
 
     ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b")])
     ct.align_finished_requests([("req-a", "one"), ("req-b", "two")], release=True)
-    collated = encoder.calls[0][0]
+    collated = aligner.calls[0][0]
     assert collated.asr_encoded.shape == (2, 4, 5)
     assert collated.diarization_labels[0].all()
     assert torch.count_nonzero(collated.diarization_labels[1, :, 24:]) == 0
 
 
-def test_evicted_rows_are_not_compacted(encoder, monkeypatch):
+def test_evicted_rows_are_not_compacted(aligner, monkeypatch):
     monkeypatch.setenv("NEMO_CTC_TIMESTAMP_RETAIN_GB", "0")
     _capture(2, 4, ["hash-a", "hash-b"])
 
@@ -372,7 +437,7 @@ def test_model_runner_v2_is_refused():
         ct.require_v1_model_runner(SimpleNamespace(use_v2_model_runner=True))
 
 
-def test_byte_budget_evicts_least_recently_used_but_keeps_the_newest(encoder, monkeypatch, caplog):
+def test_byte_budget_evicts_least_recently_used_but_keeps_the_newest(aligner, monkeypatch, caplog):
     monkeypatch.setattr(ct.logging, "once_logged", set())
     _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
     ct._compact_ready()
@@ -389,7 +454,7 @@ def test_byte_budget_evicts_least_recently_used_but_keeps_the_newest(encoder, mo
     assert caplog.text.count("Evicting CTC timestamp captures") == 1
 
 
-def test_reencoded_audio_replaces_its_entry_as_the_most_recent(encoder):
+def test_reencoded_audio_replaces_its_entry_as_the_most_recent(aligner):
     _capture(1, 4, ["hash-a"])
     first = ct._store["hash-a"]
     _capture(1, 4, ["hash-b"])
@@ -399,7 +464,7 @@ def test_reencoded_audio_replaces_its_entry_as_the_most_recent(encoder):
     assert first["dropped"] and ct._store["hash-a"]["asr_encoded"].shape[-1] == 3
 
 
-def test_unexpected_alignment_errors_are_raised_not_hidden(encoder):
+def test_unexpected_alignment_errors_are_raised_not_hidden(aligner):
     _capture(2, 4, ["hash-a", "hash-b"])
     ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b")])
 
@@ -407,18 +472,18 @@ def test_unexpected_alignment_errors_are_raised_not_hidden(encoder):
         ct.align_finished_requests([("req-a", "fine"), ("req-b", "crash")], release=True)
 
 
-def test_tensor_durations_survive_compaction(encoder):
+def test_tensor_durations_survive_compaction(aligner):
     _capture(2, 4, ["hash-a", "hash-b"], torch.tensor([0.5, 0.25], dtype=torch.float64))
     ct._compact_ready()
     ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b")])
 
     ct.align_finished_requests([("req-a", "x"), ("req-b", "y")], release=False)
 
-    assert encoder.calls[0][2] == [0.5, 0.25]
+    assert aligner.calls[0][2] == [0.5, 0.25]
     assert ct._store["hash-b"]["duration"] == 0.25
 
 
-def test_external_ids_resolve_through_an_index_that_follows_forgotten_requests(encoder, monkeypatch):
+def test_external_ids_resolve_through_an_index_that_follows_forgotten_requests(aligner, monkeypatch):
     monkeypatch.setattr(ct, "_MAX_TRACKED_REQUESTS", 4)
 
     ct._record_request_hashes([(f"req{i}-0123abcd", f"hash-{i}") for i in range(5)])
@@ -428,19 +493,19 @@ def test_external_ids_resolve_through_an_index_that_follows_forgotten_requests(e
     assert ct._external_ids == {f"req{i}": f"req{i}-0123abcd" for i in range(1, 5)}
 
 
-def test_only_the_first_tensor_parallel_rank_aligns(encoder, monkeypatch):
+def test_only_the_first_tensor_parallel_rank_prepares(aligner, monkeypatch):
     _capture(1, 4, ["hash-a"])
     ct._record_request_hashes([("req", "hash-a")])
 
     monkeypatch.setattr(ct, "_holds_captures", lambda: False)
-    assert ct._worker_align_requests(None, [("req", "x")], False) == [ct._empty_result()]
-    assert encoder.calls == []
+    assert ct._worker_prepare_requests(None, [("req", "x")], False) == {"count": 1, "batches": []}
+    assert aligner.calls == []
 
     monkeypatch.setattr(ct, "_holds_captures", lambda: True)
-    assert _words(ct._worker_align_requests(None, [("req", "x")])[0]) == ["x"]
+    assert _words(ct._align_reply([ct._worker_prepare_requests(None, [("req", "x")])])[0]) == ["x"]
 
 
-def test_output_times_are_rounded_to_milliseconds(encoder):
+def test_output_times_are_rounded_to_milliseconds(aligner):
     _capture(1, 4, ["hash-a"])
     ct._record_request_hashes([("req", "hash-a")])
 
@@ -450,7 +515,7 @@ def test_output_times_are_rounded_to_milliseconds(encoder):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_collate_assembles_padded_rows_on_the_gpu(encoder):
+def test_collate_assembles_padded_rows_on_the_gpu(aligner):
     _capture(1, 5, ["hash-a"])
     _capture(1, 3, ["hash-b"])
 
@@ -461,7 +526,7 @@ def test_collate_assembles_padded_rows_on_the_gpu(encoder):
     assert torch.count_nonzero(batch.asr_encoded[1, :, 3:]) == 0
 
 
-def test_runner_hook_keys_captures_by_hash_maps_cache_hits_and_ignores_outside_forwards(encoder, monkeypatch):
+def test_runner_hook_keys_captures_by_hash_maps_cache_hits_and_ignores_outside_forwards(aligner, monkeypatch):
     class StubRunner:
         def _batch_mm_inputs_from_scheduler(self, step):
             return step.hashes, None, [(req_id, None) for req_id in step.req_ids]
@@ -499,7 +564,7 @@ def test_runner_hook_keys_captures_by_hash_maps_cache_hits_and_ignores_outside_f
     assert set(ct._store) == {"hash-a", "hash-c"} and not ct._uncompacted
     results = ct.align_finished_requests([("req-a", "a"), ("req-b", "b"), ("req-c", "c")], release=True)
     assert [_words(result) for result in results] == [["a"], ["b"], ["c"]]
-    assert encoder.calls[0][2] == [1.0, 1.0, 1.0]
+    assert aligner.calls[0][2] == [1.0, 1.0, 1.0]
 
     # Released, but kept until vLLM evicts the audio from its encoder cache.
     assert set(ct._store) == {"hash-a", "hash-c"}
@@ -511,8 +576,8 @@ def test_offline_alignment_refuses_a_model_without_timestamps(monkeypatch):
     monkeypatch.setattr(ct, "_registry", {})
 
     with pytest.raises(RuntimeError, match="not enabled"):
-        ct._worker_align_requests(None, [("req", "<spk:0> hi")])
-    assert ct._worker_align_requests(None, [("req", "<spk:0> hi")], True, False) == [ct._empty_result()]
+        ct._worker_prepare_requests(None, [("req", "<spk:0> hi")])
+    assert ct._worker_prepare_requests(None, [("req", "<spk:0> hi")], True, False) == {"count": 1, "batches": []}
 
 
 def test_adapter_on_an_encoder_without_timestamp_support_is_refused():
@@ -590,7 +655,7 @@ def _audio(capture=None):
     )
 
 
-def test_any_encoder_with_the_flag_captures_through_one_unchunked_forward(encoder):
+def test_any_encoder_with_the_flag_captures_through_one_unchunked_forward(aligner):
     pytest.importorskip("vllm")
     model = _model_with_fake_perception()
 
@@ -603,7 +668,7 @@ def test_any_encoder_with_the_flag_captures_through_one_unchunked_forward(encode
     assert list(ct._store) == ["hash-a", "hash-b"]
 
 
-def test_a_forward_outside_the_hook_produces_states_but_stores_none(encoder):
+def test_a_forward_outside_the_hook_produces_states_but_stores_none(aligner):
     pytest.importorskip("vllm")
     model = _model_with_fake_perception()
 
@@ -614,7 +679,7 @@ def test_a_forward_outside_the_hook_produces_states_but_stores_none(encoder):
     assert ct._store == {}
 
 
-def test_items_that_opt_out_take_their_hash_but_store_nothing(encoder):
+def test_items_that_opt_out_take_their_hash_but_store_nothing(aligner):
     pytest.importorskip("vllm")
     model = _model_with_fake_perception()
 
@@ -683,7 +748,7 @@ def test_startup_profiling_inputs_opt_into_capture(monkeypatch):
 
 
 @pytest.fixture
-def server(encoder):
+def server(aligner):
     """The chat middleware in front of a stand-in for vLLM's chat route, over a stub engine and the real store."""
     pytest.importorskip("vllm")
     import uuid
@@ -695,7 +760,7 @@ def server(encoder):
     from nemo.collections.speechlm2.vllm.salm.ctc_serving import ctc_timestamp_middleware
 
     workers = {
-        ct.WORKER_ALIGN_METHOD: ct._worker_align_requests,
+        ct.WORKER_PREPARE_METHOD: ct._worker_prepare_requests,
         ct.WORKER_RELEASE_METHOD: ct._worker_release_requests,
     }
     script = {"transcript": "hi there", "status": 200, "id_prefix": "chatcmpl-"}
@@ -748,7 +813,7 @@ def test_an_opted_in_chat_completion_gets_ctc_timestamps_and_releases_its_captur
         ("there", 0.2, 0.28, "0"),
     ]
     assert timestamps["diarization"] == [{"speaker": 1, "start": 0.05, "end": 0.93}]
-    assert server.rpcs == [ct.WORKER_ALIGN_METHOD] and ct._store == {}
+    assert server.rpcs == [ct.WORKER_PREPARE_METHOD] and ct._store == {}
 
 
 def test_chat_requests_without_the_opt_in_pass_through_untouched(server):
@@ -777,7 +842,7 @@ def test_alignment_uses_the_request_id_vllm_reports(server, caplog):
 
     assert response.json()["id"].startswith("chat-ctc-") and response.json()["ctc_timestamps"]["words"]
     assert "not the predicted" in caplog.text
-    assert server.rpcs == [ct.WORKER_ALIGN_METHOD] and ct._store == {}
+    assert server.rpcs == [ct.WORKER_PREPARE_METHOD] and ct._store == {}
 
 
 def test_opted_in_requests_refuse_streaming_and_n_above_1(server):
@@ -804,7 +869,7 @@ def test_an_alignment_failure_releases_the_capture_and_answers_500(server):
     response = server.post()
 
     assert response.status_code == 500 and response.json()["error"]["message"] == "kernel failure"
-    assert server.rpcs == [ct.WORKER_ALIGN_METHOD, ct.WORKER_RELEASE_METHOD] and ct._store == {}
+    assert server.rpcs == [ct.WORKER_PREPARE_METHOD, ct.WORKER_RELEASE_METHOD] and ct._store == {}
 
 
 def test_a_cancelled_chat_completion_releases_its_capture(server):
@@ -831,7 +896,7 @@ def test_a_cancelled_chat_completion_releases_its_capture(server):
     assert server.rpcs == [ct.WORKER_RELEASE_METHOD] and ct._store == {}
 
 
-def test_transcripts_without_speaker_tags_are_reported(encoder, caplog):
+def test_transcripts_without_speaker_tags_are_reported(aligner, caplog):
     _capture(1, 4, ["hash-a"])
     ct._record_request_hashes([("req", "hash-a")])
 
@@ -840,6 +905,6 @@ def test_transcripts_without_speaker_tags_are_reported(encoder, caplog):
     assert "no <spk:N> speaker tags" in caplog.text
 
 
-def test_requests_without_recorded_audio_are_not_reported_as_evicted(encoder, caplog):
+def test_requests_without_recorded_audio_are_not_reported_as_evicted(aligner, caplog):
     assert ct.align_finished_requests([("text-only", "<spk:0> hello")], release=True) == [ct._empty_result()]
     assert "No capture is recorded" in caplog.text and "evicted" not in caplog.text

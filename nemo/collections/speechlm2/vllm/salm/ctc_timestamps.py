@@ -19,10 +19,10 @@ vLLM's ``mm_processor_kwargs``, offline in ``LLM.chat`` or ``LLM.generate`` and 
 in the chat completion request body.
 
 The encoder returns ``CTCTimestampInputs`` (ASR states, Sortformer speaker
-probabilities, 10 ms diarization labels) from the same forward that feeds the LLM,
-and runs the CTC head only when a finished transcript is aligned, in
-``ParallelExpertEncoder.generate_ctc_timestamps``. This module holds those inputs
-between the two points. vLLM makes that awkward in two ways:
+probabilities, 10 ms diarization labels) from the same forward that feeds the LLM; the
+CTC head runs only when a finished transcript is aligned, in the checkpoint's
+``MultiSpeakerSOTWordTimestampAligner``. This module holds those inputs between the two
+points. vLLM makes that awkward in two ways:
 
 * ``embed_multimodal(**mm_kwargs_batch)`` receives only tensors, so the inputs have
   no request id or ``mm_hash`` to be keyed by when they are produced.
@@ -52,17 +52,22 @@ served from the cache and captures nothing, so it needs the old capture. Capture
 nobody releases are bounded only by ``NEMO_CTC_TIMESTAMP_RETAIN_GB`` of host memory
 (default 8), least recently used first.
 
-Alignment runs in the engine process, where the inputs live, in one worker method
-that both modes reach through ``collective_rpc``. The client functions :func:`align`
-and :func:`release_captures` call it from a synchronous ``LLM``, which is what
+Alignment is split where its work changes kind. The engine process, where the inputs
+live, runs the CTC head on the device and keeps only the log-prob columns each
+transcript's tokens use (:func:`prepare_finished_requests`), in one worker method that
+both modes reach through ``collective_rpc``. The caller then runs the CPU-bound
+alignment search on that compact batch (:func:`align_prepared_requests`), so the engine
+is busy only for the head. The client functions :func:`align` and
+:func:`release_captures` serve a synchronous ``LLM``, which is what
 :func:`ctc_timestamps`, :func:`ctc_word_timestamps` and :func:`ctc_release` do;
-:func:`align_async` and :func:`release_captures_async` call it from a server's async
-engine client, which is what ``ctc_serving`` does. Callers pass the external request
-id, which vLLM's scheduler knows with a random suffix appended.
+:func:`align_async` and :func:`release_captures_async` serve a server's async engine
+client, which is what ``ctc_serving`` does. Callers pass the external request id, which
+vLLM's scheduler knows with a random suffix appended.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 from collections import deque
@@ -83,8 +88,13 @@ _DEFAULT_RETENTION_GB = 8.0
 _MAX_TRACKED_REQUESTS = 1 << 16
 
 # Worker method names reached through collective_rpc.
-WORKER_ALIGN_METHOD = "nemo_ctc_align_requests"
+WORKER_PREPARE_METHOD = "nemo_ctc_prepare_requests"
 WORKER_RELEASE_METHOD = "nemo_ctc_release_requests"
+
+# Marks a tensor packed as dtype, shape and bytes in a worker reply. vLLM rebuilds
+# tensors in a collective_rpc result only with VLLM_ALLOW_INSECURE_SERIALIZATION; bytes
+# always arrive intact.
+_PACKED_TENSOR = "__tensor__"
 
 # vLLM forms the scheduler's request id as f"{external_id}-{random_uuid():.8}".
 _INTERNAL_ID_SUFFIX_LEN = 8
@@ -132,22 +142,22 @@ _uncompacted: deque[dict] = deque()
 _lock = threading.RLock()
 
 
-def register_encoder(encoder: Any) -> None:
-    """Publish the live encoder, which also turns input capture on.
+def register_aligner(aligner: Any) -> None:
+    """Publish the checkpoint's CTC timestamp aligner, which also turns input capture on.
 
     The runner hook and the worker methods reached through ``collective_rpc`` never
     receive the model instance. One engine hosts one model per process, so a
     module-level reference is enough to bridge that.
 
     Args:
-        encoder (Any): The perception encoder; it holds the loaded aligner.
+        aligner (Any): The ``MultiSpeakerSOTWordTimestampAligner`` holding the deferred CTC head.
     """
-    _registry["encoder"] = encoder
+    _registry["aligner"] = aligner
 
 
-def active_encoder() -> Any:
-    """Return the live encoder, or ``None`` when timestamps are not enabled."""
-    return _registry.get("encoder")
+def active_aligner() -> Any:
+    """Return the CTC timestamp aligner, or ``None`` when timestamps are not enabled."""
+    return _registry.get("aligner")
 
 
 def require_v1_model_runner(vllm_config: Any) -> None:
@@ -494,6 +504,9 @@ def _empty_result() -> dict:
 def align_finished_requests(finished: Sequence[tuple[str, str]], *, release: bool) -> list[dict]:
     """Align the transcripts of finished requests against the inputs captured while they ran.
 
+    :func:`prepare_finished_requests` followed by :func:`align_prepared_requests`, in one
+    process.
+
     Args:
         finished (Sequence[tuple[str, str]]): ``(request_id, transcript)`` pairs of
             requests that have finished generating; the transcript is aligned exactly
@@ -516,10 +529,33 @@ def align_finished_requests(finished: Sequence[tuple[str, str]], *, release: boo
         Exception: Any aligner error other than ``ValueError``, which is how the
             aligner rejects a transcript it cannot align.
     """
-    results: list[dict] = [_empty_result() for _ in finished]
-    encoder = active_encoder()
-    if encoder is None:
-        return results
+    return align_prepared_requests(prepare_finished_requests(finished, release=release))
+
+
+def prepare_finished_requests(finished: Sequence[tuple[str, str]], *, release: bool) -> dict:
+    """Run the deferred CTC head for finished requests and keep what aligning them needs.
+
+    The half of :func:`align_finished_requests` that needs the captured inputs, the CTC head
+    and the tokenizer, so it runs where the inputs live. Each prepared batch holds, per
+    request, only the log-prob columns its transcript's tokens use; once prepared, the
+    captures are no longer needed.
+
+    Args:
+        finished (Sequence[tuple[str, str]]): As in :func:`align_finished_requests`.
+        release (bool): Afterwards drop each request's claim on its capture.
+
+    Returns:
+        dict: ``count``, the number of items, and ``batches``: each ``items``, the indices
+        it covers, and ``prepared``, a batch for :func:`align_prepared_requests`. Items in
+        no batch get empty results.
+
+    Raises:
+        Exception: Any error other than ``ValueError`` while preparing.
+    """
+    reply = {"count": len(finished), "batches": []}
+    aligner = active_aligner()
+    if aligner is None:
+        return reply
     pending, no_audio, multi_audio, evicted = [], [], [], []
     with _lock:
         for index, (request_id, text) in enumerate(finished):
@@ -538,7 +574,7 @@ def align_finished_requests(finished: Sequence[tuple[str, str]], *, release: boo
             if key is None:
                 evicted.append(request_id)
                 continue
-            # Re-insert to mark it recently used; releasing happens after alignment.
+            # Re-insert to mark it recently used; releasing happens after preparing.
             entry = _store.pop(key)
             _store[key] = entry
             # A snapshot, so compaction on the engine thread cannot swap its tensors
@@ -581,37 +617,105 @@ def align_finished_requests(finished: Sequence[tuple[str, str]], *, release: boo
             untagged[0],
         )
 
-    device = next(encoder.parameters()).device
+    device = next(aligner.ctc_decoder.parameters()).device
     for start in range(0, len(pending), _ALIGN_BATCH):
-        chunk = pending[start : start + _ALIGN_BATCH]
-        for (index, _, _), result in zip(chunk, _align_chunk(encoder, chunk, device)):
-            results[index] = result
+        for items, prepared in _prepare_chunk(aligner, pending[start : start + _ALIGN_BATCH], device):
+            reply["batches"].append({"items": items, "prepared": prepared})
     if release:
         _release_requests([request_id for request_id, _ in finished])
+    return reply
+
+
+def align_prepared_requests(reply: dict) -> list[dict]:
+    """Align the batches :func:`prepare_finished_requests` prepared, in any process.
+
+    Needs no model, tokenizer or device, so a caller can run the CPU-bound alignment search
+    outside the engine.
+
+    Args:
+        reply (dict): The reply of :func:`prepare_finished_requests`.
+
+    Returns:
+        list[dict]: Per item, the result described in :func:`align_finished_requests`.
+
+    Raises:
+        Exception: Any aligner error other than ``ValueError``.
+    """
+    results: list[dict] = [_empty_result() for _ in range(reply["count"])]
+    for batch in reply["batches"]:
+        for index, result in zip(batch["items"], _align_batch(batch["prepared"])):
+            if result is not None:
+                results[index] = _public_result(result)
     return results
 
 
-def _align_chunk(encoder: Any, chunk: list, device: torch.device) -> list[dict]:
-    """Run the deferred head and alignment for up to ``_ALIGN_BATCH`` requests."""
+def _prepare_chunk(aligner: Any, chunk: list, device: torch.device) -> list[tuple[list[int], dict]]:
+    """Run the deferred head for up to ``_ALIGN_BATCH`` requests and prepare their alignment."""
     entries = [entry for _, _, entry in chunk]
     try:
-        alignment_states = _collate(entries, device)
-        results = encoder.generate_ctc_timestamps(
-            timestamp_inputs=alignment_states,
-            sot_transcripts=[text for _, text, _ in chunk],
+        prepared = aligner.prepare_from_inputs(
+            _collate(entries, device),
+            [text for _, text, _ in chunk],
             # Read only after _collate has waited for the host copies.
-            audio_durations=[float(entry["duration"]) for entry in entries],
+            [float(entry["duration"]) for entry in entries],
         )
     except Exception as error:  # noqa: BLE001
         if len(chunk) > 1:
             # Retry one by one, so that a single bad transcript, or a batch too large
             # for device memory, does not cost the rest their timestamps.
-            return [_align_chunk(encoder, [item], device)[0] for item in chunk]
+            return [batch for item in chunk for batch in _prepare_chunk(aligner, [item], device)]
         if not isinstance(error, ValueError):
             raise
         logging.warning("[NeMoSpeechLM] CTC alignment failed: %s", error)
-        return [_empty_result()]
-    return [_public_result(result) for result in results]
+        return []
+    return [([index for index, _, _ in chunk], prepared)]
+
+
+def _align_batch(prepared: dict) -> list[dict | None]:
+    """Align one prepared batch; ``None`` for a request the aligner rejects."""
+    from nemo.collections.speechlm2.parts.ctc_timestamp_utils import align_prepared_batch
+
+    try:
+        return align_prepared_batch(prepared)
+    except Exception as error:  # noqa: BLE001
+        if len(prepared["records"]) > 1:
+            # Retry one by one, so that a single unalignable transcript does not cost the
+            # rest their timestamps.
+            return [_align_batch({**prepared, "records": [record]})[0] for record in prepared["records"]]
+        if not isinstance(error, ValueError):
+            raise
+        logging.warning("[NeMoSpeechLM] CTC alignment failed: %s", error)
+        return [None]
+
+
+def _pack(value: Any) -> Any:
+    """Replace every tensor in a worker reply with its dtype, shape and bytes."""
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu().contiguous()
+        return {
+            _PACKED_TENSOR: [str(tensor.dtype).removeprefix("torch."), list(tensor.shape)],
+            "data": tensor.numpy().tobytes(),
+        }
+    if isinstance(value, dict):
+        return {key: _pack(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_pack(item) for item in value]
+    return value
+
+
+def _unpack(value: Any) -> Any:
+    """Rebuild the tensors :func:`_pack` replaced."""
+    if isinstance(value, dict):
+        if _PACKED_TENSOR in value:
+            dtype_name, shape = value[_PACKED_TENSOR]
+            dtype = getattr(torch, dtype_name)
+            if not value["data"]:
+                return torch.empty(shape, dtype=dtype)
+            return torch.frombuffer(bytearray(value["data"]), dtype=dtype).reshape(shape)
+        return {key: _unpack(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_unpack(item) for item in value]
+    return value
 
 
 def _collate(entries: list[dict], device: torch.device) -> Any:
@@ -692,10 +796,10 @@ def _new_request_hashes(scheduler_output: Any):
 
 
 def _holds_captures() -> bool:
-    """Whether this worker stores captures and aligns them.
+    """Whether this worker stores captures and prepares them for alignment.
 
     Every tensor-parallel rank of the first pipeline stage runs the encoder on the same
-    audio, so only its rank 0 keeps the inputs and aligns; ``collective_rpc`` lists that
+    audio, so only its rank 0 keeps the inputs and prepares them; ``collective_rpc`` lists that
     worker's reply first. Outside an initialized engine, as in unit tests, every caller does.
     """
     try:
@@ -708,11 +812,11 @@ def _holds_captures() -> bool:
         return True
 
 
-def _worker_align_requests(worker: Any, items: list, release: bool = True, require_enabled: bool = True) -> list[dict]:
-    """``collective_rpc`` entry point for both modes: align finished requests where their inputs live.
+def _worker_prepare_requests(worker: Any, items: list, release: bool = True, require_enabled: bool = True) -> dict:
+    """``collective_rpc`` entry point for both modes: prepare finished requests where their inputs live.
 
-    ``collective_rpc`` calls every worker; the ones that hold no captures answer with
-    empty results, which callers skip.
+    ``collective_rpc`` calls every worker; the ones that hold no captures answer with no
+    batches, which callers skip.
 
     Args:
         worker (Any): The vLLM worker the method is attached to; unused.
@@ -724,17 +828,18 @@ def _worker_align_requests(worker: Any, items: list, release: bool = True, requi
             empty results instead.
 
     Returns:
-        list[dict]: Per item, the result described in :func:`align_finished_requests`.
+        dict: The reply of :func:`prepare_finished_requests`, with its tensors packed so
+        that ``collective_rpc`` returns them intact.
     """
     del worker
     if not _holds_captures():
-        return [_empty_result() for _ in items]
-    if require_enabled and active_encoder() is None:
+        return {"count": len(items), "batches": []}
+    if require_enabled and active_aligner() is None:
         raise RuntimeError(
             "CTC timestamps are not enabled for this model: its config has no ctc_timestamps.adapter_path "
             "(check the hf_overrides key)."
         )
-    return align_finished_requests([(request_id, text) for request_id, text in items], release=release)
+    return _pack(prepare_finished_requests([(request_id, text) for request_id, text in items], release=release))
 
 
 def _worker_release_requests(worker: Any, request_ids: list) -> None:
@@ -743,11 +848,11 @@ def _worker_release_requests(worker: Any, request_ids: list) -> None:
     _release_requests(list(request_ids))
 
 
-def install_worker_align_method() -> None:
-    """Expose alignment and release to callers outside the engine as worker methods.
+def install_worker_methods() -> None:
+    """Expose preparing and releasing to callers outside the engine as worker methods.
 
     ``collective_rpc`` resolves a method name on the worker, so the entry points are
-    attached to vLLM's GPU worker class under ``WORKER_ALIGN_METHOD`` and
+    attached to vLLM's GPU worker class under ``WORKER_PREPARE_METHOD`` and
     ``WORKER_RELEASE_METHOD``.
     """
     try:
@@ -755,7 +860,7 @@ def install_worker_align_method() -> None:
     except ImportError:  # pragma: no cover - vLLM absent
         return
     for name, method in (
-        (WORKER_ALIGN_METHOD, _worker_align_requests),
+        (WORKER_PREPARE_METHOD, _worker_prepare_requests),
         (WORKER_RELEASE_METHOD, _worker_release_requests),
     ):
         if getattr(Worker, name, None) is not method:
@@ -772,8 +877,8 @@ def align(
     """Align finished requests through an engine's ``collective_rpc``, one RPC per ``chunk_size`` items.
 
     The client side shared by both modes; :func:`align_async` is the same for an async
-    engine client. Each RPC runs on the engine thread, so aligning while other requests
-    decode stalls them for its duration.
+    engine client. Each RPC runs the deferred CTC head on the engine thread, which stalls
+    requests decoding meanwhile for that long; the alignment search then runs here.
 
     Args:
         rpc (Any): The engine's ``collective_rpc``, e.g. ``LLM.collective_rpc``.
@@ -789,7 +894,7 @@ def align(
     """
     results: list[dict] = []
     for batch in _rpc_batches(items, chunk_size):
-        results.extend(_aligning_reply(rpc(WORKER_ALIGN_METHOD, args=(batch, release, require_enabled))))
+        results.extend(_align_reply(rpc(WORKER_PREPARE_METHOD, args=(batch, release, require_enabled))))
     return results
 
 
@@ -800,10 +905,15 @@ async def align_async(
     require_enabled: bool = True,
     chunk_size: int = 256,
 ) -> list[dict]:
-    """:func:`align` for an async engine client, e.g. a server's ``EngineClient.collective_rpc``."""
+    """:func:`align` for an async engine client, e.g. a server's ``EngineClient.collective_rpc``.
+
+    The alignment search runs in a worker thread, so the event loop keeps serving other
+    requests meanwhile.
+    """
     results: list[dict] = []
     for batch in _rpc_batches(items, chunk_size):
-        results.extend(_aligning_reply(await rpc(WORKER_ALIGN_METHOD, args=(batch, release, require_enabled))))
+        replies = await rpc(WORKER_PREPARE_METHOD, args=(batch, release, require_enabled))
+        results.extend(await asyncio.to_thread(_align_reply, replies))
     return results
 
 
@@ -830,9 +940,9 @@ def _rpc_batches(items: Sequence[tuple[str, str]], chunk_size: int) -> list[list
     return [list(items[start : start + chunk_size]) for start in range(0, len(items), chunk_size)]
 
 
-def _aligning_reply(replies: list) -> list[dict]:
-    """The aligning worker's results: ``collective_rpc`` returns one reply per worker, in rank order."""
-    return replies[0]
+def _align_reply(replies: list) -> list[dict]:
+    """Align the preparing worker's reply; ``collective_rpc`` returns one reply per worker, in rank order."""
+    return align_prepared_requests(_unpack(replies[0]))
 
 
 def ctc_timestamps(
@@ -844,9 +954,10 @@ def ctc_timestamps(
 ) -> list[dict]:
     """CTC word timestamps and diarization for finished outputs of an offline vLLM ``LLM``.
 
-    Alignment runs in the engine process, where the stored inputs live, with one RPC
-    per ``chunk_size`` outputs. Call it after generation: the RPC runs on the engine
-    thread, so aligning while other requests decode would stall them.
+    The engine runs the deferred CTC head where the stored inputs live, with one RPC per
+    ``chunk_size`` outputs, and the alignment search then runs in this process. Call it
+    after generation: the RPC runs on the engine thread, so preparing while other
+    requests decode would stall them.
 
     Each output's capture is deleted once it has been aligned with ``release=True``.
     Pass ``release=False`` to align the same outputs again, e.g. with ``texts``, and
@@ -915,7 +1026,7 @@ def install_encoder_cache_binding() -> None:
     def _execute_mm_encoder(self, scheduler_output, *args, **kwargs):
         # Other tensor-parallel ranks run the same encoder forward but take no hashes,
         # so they store nothing.
-        if active_encoder() is None or not _holds_captures():
+        if active_aligner() is None or not _holds_captures():
             return original(self, scheduler_output, *args, **kwargs)
 
         # New requests resolve to their hashes here, including those whose audio is

@@ -67,11 +67,11 @@ from nemo.collections.speechlm2.vllm.salm.audio import (
 from nemo.collections.speechlm2.vllm.salm.backends import HybridBackend, make_backend
 from nemo.collections.speechlm2.vllm.salm.config import _AUDIO_PLACEHOLDER
 from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
-    active_encoder,
+    active_aligner,
     ctc_adapter_path,
-    install_worker_align_method,
+    install_worker_methods,
     read_speaker_prior_weight,
-    register_encoder,
+    register_aligner,
     require_v1_model_runner,
     store_alignment_states,
     take_step_hashes,
@@ -184,7 +184,7 @@ class NeMoSpeechLMForConditionalGeneration(
 
         # Installed even without an adapter, so ctc_timestamps() gets a clear "not
         # enabled" error instead of an unknown method.
-        install_worker_align_method()
+        install_worker_methods()
         self._maybe_enable_ctc_timestamps(getattr(config, "ctc_timestamps", None), vllm_config)
 
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
@@ -223,7 +223,7 @@ class NeMoSpeechLMForConditionalGeneration(
         aligner = get_ctc_timestamp_aligner(encoder, adapter_path, device)
         aligner.speaker_logprob_weight = speaker_prior_weight
 
-        register_encoder(encoder)
+        register_aligner(aligner)
         install_encoder_cache_binding()
         logging.info("[NeMoSpeechLM] CTC timestamps enabled from checkpoint config: %s", adapter_path)
 
@@ -276,7 +276,7 @@ class NeMoSpeechLMForConditionalGeneration(
         # inference over the full audio, so it bypasses the chunking helper, and so
         # does CTC timestamp capture, whose inputs cover one forward.
         with torch.no_grad():
-            if active_encoder() is not None:
+            if active_aligner() is not None:
                 audio_embeds = self._encode_with_ctc_capture(
                     audio_signal, audio_lengths, audio_input.capture_ctc_timestamps
                 )
