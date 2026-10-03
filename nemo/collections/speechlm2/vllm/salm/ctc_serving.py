@@ -1,0 +1,168 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Attach CTC word timestamps to chat completions served by ``vllm serve``.
+
+A chat completion request opts into CTC timestamps with vLLM's own extension field,
+``"mm_processor_kwargs": {"capture_ctc_timestamps": true}``, so the engine keeps the
+audio's alignment inputs while it generates. Start the server with::
+
+    vllm serve ... --middleware nemo.collections.speechlm2.vllm.salm.ctc_serving.ctc_timestamp_middleware
+
+and :func:`ctc_timestamp_middleware` aligns the finished transcript of such a request
+through :func:`align_async`, the same worker method offline callers reach, and adds
+the result to the response as a top-level ``ctc_timestamps`` field in the offline
+format: ``words``, ``diarization`` and ``speaker_tag_to_diarization_speaker``. vLLM's
+chat route serves the request itself, API-key check included; every other request
+passes through untouched.
+
+Speaker tags reach the aligner only when the model writes them and the request keeps
+them with ``"skip_special_tokens": false``. The middleware does not read the prompt: a
+transcript without tags is aligned as one speaker, with a warning. Streaming and ``n``
+above 1 are refused for opted-in requests. A request that fails, is cancelled or cannot
+be aligned releases its capture.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import uuid
+from http import HTTPStatus
+from typing import Any
+
+from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import align_async, ctc_adapter_path, release_captures_async
+from nemo.utils import logging
+from nemo.utils.nemo_logging import LogMode
+
+_CHAT_PATH = "/v1/chat/completions"
+_OPT_IN = "capture_ctc_timestamps"
+
+
+async def ctc_timestamp_middleware(request: Any, call_next: Any) -> Any:
+    """Attach CTC timestamps to the chat completions that opted in; pass every other request to vLLM.
+
+    Args:
+        request (Any): The incoming Starlette request.
+        call_next (Any): The rest of the app, vLLM's routes included.
+
+    Returns:
+        Any: vLLM's response, with ``ctc_timestamps`` added for an opted-in request.
+    """
+    engine = getattr(request.app.state, "engine_client", None)
+    path = request.scope["path"].removeprefix(request.scope.get("root_path", ""))
+    if (
+        request.method != "POST"
+        or path != _CHAT_PATH
+        or engine is None
+        or not ctc_adapter_path(getattr(engine.model_config.hf_config, "ctc_timestamps", None))
+    ):
+        return await call_next(request)
+    # Reading the body here keeps it replayable for vLLM's route.
+    payload = _opted_in(await request.body())
+    if payload is None:
+        return await call_next(request)
+    num_completion_choices = payload.get("n")
+    if payload.get("stream") or (isinstance(num_completion_choices, int) and num_completion_choices > 1):
+        return _error("CTC timestamps support neither streaming nor n > 1.")
+
+    request_id = _engine_request_id(request, payload)
+    try:
+        response = await call_next(request)
+        if response.status_code != HTTPStatus.OK:
+            await _release(engine, request_id)
+            return response
+        completion = json.loads(b"".join([chunk async for chunk in response.body_iterator]))
+        request_id = _reported_request_id(completion, request_id)
+        text = completion["choices"][0]["message"]["content"] or ""
+        (result,) = await align_async(engine.collective_rpc, [(request_id, text)], require_enabled=False)
+    except BaseException as error:
+        # Alignment releases the capture; a request that stops before it releases it here.
+        await _release(engine, request_id)
+        if not isinstance(error, Exception):
+            raise
+        logging.error("[NeMoSpeechLM] CTC timestamps for chat request %s failed: %s", request_id, error)
+        return _error(error, "InternalServerError", HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    completion["ctc_timestamps"] = result
+    headers = {name: value for name, value in response.headers.items() if name.lower() != "content-length"}
+    return _json(completion, response.status_code, headers)
+
+
+def _opted_in(body: bytes) -> dict | None:
+    """The request's JSON when it opts into capture, read as the processor reads the flag; else ``None``."""
+    # A quick filter, not the decision: a body that never mentions the flag cannot opt in,
+    # so most requests skip parsing their megabytes of base64 audio. The parsed check below decides.
+    if _OPT_IN.encode() not in body:
+        return None
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return None
+    kwargs = payload.get("mm_processor_kwargs") if isinstance(payload, dict) else None
+    return payload if isinstance(kwargs, dict) and bool(kwargs.get(_OPT_IN, False)) else None
+
+
+def _engine_request_id(request: Any, payload: dict) -> str:
+    """The engine request id vLLM's chat route will use, set up front so a failure can release its capture.
+
+    vLLM takes ``chatcmpl-`` plus the ``X-Request-Id`` header, else the body's
+    ``request_id``. With neither, the middleware adds the header.
+    """
+    base = request.headers.get("x-request-id") or payload.get("request_id")
+    if not base:
+        base = f"ctc-{uuid.uuid4().hex}"
+        request.scope["headers"] = [*request.scope["headers"], (b"x-request-id", base.encode("latin-1"))]
+    return f"chatcmpl-{base}"
+
+
+def _reported_request_id(completion: dict, predicted: str) -> str:
+    """The engine request id vLLM reports as the completion's ``id``, which alignment uses.
+
+    It equals the prediction while vLLM keeps its request id scheme. If that ever
+    changes, alignment still finds the capture, but a request that fails before its
+    completion arrives releases nothing, so the first mismatch is logged.
+    """
+    reported = completion.get("id") or predicted
+    if reported != predicted:
+        logging.warning(
+            "[NeMoSpeechLM] vLLM reported chat request %s, not the predicted %s (logged once): its request id "
+            "scheme changed, so a request that fails before its completion arrives keeps its CTC capture until "
+            "the byte cap evicts it.",
+            reported,
+            predicted,
+            mode=LogMode.ONCE,
+        )
+    return reported
+
+
+async def _release(engine: Any, request_id: str) -> None:
+    """Release a capture that alignment will not, without masking the error that led here."""
+    await asyncio.gather(release_captures_async(engine.collective_rpc, [request_id]), return_exceptions=True)
+
+
+def _error(
+    error: Exception | str, err_type: str = "BadRequestError", status_code: HTTPStatus = HTTPStatus.BAD_REQUEST
+) -> Any:
+    """An OpenAI-style error response, in vLLM's format; for an exception, vLLM picks the status from its type."""
+    from vllm.entrypoints.serve.exception_handling.error_response import create_error_response
+
+    response = create_error_response(error, err_type, status_code)
+    return _json(response.model_dump(), response.error.code)
+
+
+def _json(content: Any, status_code: int = HTTPStatus.OK, headers: dict | None = None) -> Any:
+    from starlette.responses import JSONResponse
+
+    return JSONResponse(content=content, status_code=int(status_code), headers=headers)
