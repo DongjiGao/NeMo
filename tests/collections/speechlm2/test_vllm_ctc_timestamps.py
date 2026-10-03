@@ -696,7 +696,7 @@ def server(encoder):
         ct.WORKER_ALIGN_METHOD: ct._worker_align_requests,
         ct.WORKER_RELEASE_METHOD: ct._worker_release_requests,
     }
-    script = {"transcript": "hi there", "status": 200}
+    script = {"transcript": "hi there", "status": 200, "id_prefix": "chatcmpl-"}
     rpcs = []
 
     async def collective_rpc(method, args):
@@ -711,7 +711,8 @@ def server(encoder):
     @app.post("/v1/chat/completions")
     async def vllm_chat_route(request: Request):  # stands in for vLLM's own chat route
         body = await request.json()
-        request_id = f"chatcmpl-{request.headers.get('x-request-id') or body.get('request_id') or uuid.uuid4().hex}"
+        base = request.headers.get("x-request-id") or body.get("request_id") or uuid.uuid4().hex
+        request_id = f"{script['id_prefix']}{base}"
         if (body.get("mm_processor_kwargs") or {}).get("capture_ctc_timestamps"):
             # The capture the engine keeps for an opted-in request while it generates.
             _capture(1, 4, [f"hash-{request_id}"])
@@ -765,6 +766,16 @@ def test_the_client_request_id_names_the_engine_request(server):
     response = server.post(request_id="body-1")
     assert response.json()["id"] == "chatcmpl-body-1" and response.json()["ctc_timestamps"]["words"]
     assert ct._store == {}
+
+
+def test_alignment_uses_the_request_id_vllm_reports(server, caplog):
+    server.script["id_prefix"] = "chat-"  # a vLLM whose request id scheme changed
+
+    response = server.post()
+
+    assert response.json()["id"].startswith("chat-ctc-") and response.json()["ctc_timestamps"]["words"]
+    assert "not the predicted" in caplog.text
+    assert server.rpcs == [ct.WORKER_ALIGN_METHOD] and ct._store == {}
 
 
 def test_opted_in_requests_refuse_streaming_and_n_above_1(server):

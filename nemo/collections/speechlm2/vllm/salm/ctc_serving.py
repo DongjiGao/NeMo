@@ -42,6 +42,7 @@ from typing import Any
 
 from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import align_async, ctc_adapter_path, release_captures_async
 from nemo.utils import logging
+from nemo.utils.nemo_logging import LogMode
 
 _CHAT_PATH = "/v1/chat/completions"
 _OPT_IN = "capture_ctc_timestamps"
@@ -81,6 +82,7 @@ async def ctc_timestamp_middleware(request: Any, call_next: Any) -> Any:
             await _release(engine, request_id)
             return response
         completion = json.loads(b"".join([chunk async for chunk in response.body_iterator]))
+        request_id = _reported_request_id(completion, request_id)
         text = completion["choices"][0]["message"]["content"] or ""
         (result,) = await align_async(engine.collective_rpc, [(request_id, text)], require_enabled=False)
     except BaseException as error:
@@ -120,6 +122,26 @@ def _engine_request_id(request: Any, payload: dict) -> str:
         base = f"ctc-{uuid.uuid4().hex}"
         request.scope["headers"] = [*request.scope["headers"], (b"x-request-id", base.encode("latin-1"))]
     return f"chatcmpl-{base}"
+
+
+def _reported_request_id(completion: dict, predicted: str) -> str:
+    """The engine request id vLLM reports as the completion's ``id``, which alignment uses.
+
+    It equals the prediction while vLLM keeps its request id scheme. If that ever
+    changes, alignment still finds the capture, but a request that fails before its
+    completion arrives releases nothing, so the first mismatch is logged.
+    """
+    reported = completion.get("id") or predicted
+    if reported != predicted:
+        logging.warning(
+            "[NeMoSpeechLM] vLLM reported chat request %s, not the predicted %s (logged once): its request id "
+            "scheme changed, so a request that fails before its completion arrives keeps its CTC capture until "
+            "the byte cap evicts it.",
+            reported,
+            predicted,
+            mode=LogMode.ONCE,
+        )
+    return reported
 
 
 async def _release(engine: Any, request_id: str) -> None:
