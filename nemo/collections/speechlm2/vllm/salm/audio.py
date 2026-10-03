@@ -678,6 +678,11 @@ class NeMoSpeechLMMultiModalProcessor(
         mm_kwargs: Mapping[str, object],
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
+        """Per-request preprocessing, under vLLM's hook name (this model has no Hugging Face processor).
+
+        Expands each audio placeholder into its estimated encoder token count, tokenizes the
+        prompt, and packages the audio with its CTC timestamp opt-in flag.
+        """
         tokenizer = self.info.get_tokenizer()
         _ensure_special_tokens(tokenizer)
         mm_data = dict(mm_data)
