@@ -15,7 +15,8 @@
 """Keep CTC timestamp inputs per request inside vLLM and align finished transcripts.
 
 Only requests that opt in keep anything: they set ``"capture_ctc_timestamps": True`` in
-vLLM's ``mm_processor_kwargs``, which ``LLM.chat`` and ``LLM.generate`` take.
+vLLM's ``mm_processor_kwargs``, offline in ``LLM.chat`` or ``LLM.generate`` and served
+in the chat completion request body.
 
 The encoder returns ``CTCTimestampInputs`` (ASR states, Sortformer speaker
 probabilities, 10 ms diarization labels) from the same forward that feeds the LLM,
@@ -56,8 +57,8 @@ that both modes reach through ``collective_rpc``. The client functions :func:`al
 and :func:`release_captures` call it from a synchronous ``LLM``, which is what
 :func:`ctc_timestamps`, :func:`ctc_word_timestamps` and :func:`ctc_release` do;
 :func:`align_async` and :func:`release_captures_async` call it from a server's async
-engine client. Callers pass the external request id, which vLLM's scheduler knows
-with a random suffix appended.
+engine client, which is what ``ctc_serving`` does. Callers pass the external request
+id, which vLLM's scheduler knows with a random suffix appended.
 """
 
 from __future__ import annotations
@@ -424,7 +425,7 @@ def _trim_store() -> int:
 
     Captures normally go when their last owner is aligned or released, so this only
     catches captures nobody releases: outputs an offline caller drops, and opted-in
-    requests to a server, where nothing aligns them. Python
+    requests to a server started without the ``ctc_serving`` middleware. Python
     dicts preserve insertion order and alignment re-inserts what it keeps, so the first
     keys are the least recently used. The newest capture is kept even when it alone
     exceeds the budget.

@@ -680,6 +680,120 @@ def test_startup_profiling_inputs_opt_into_capture(monkeypatch):
     assert inputs.hf_processor_mm_kwargs == {"capture_ctc_timestamps": True}
 
 
+@pytest.fixture
+def server(encoder):
+    """The chat middleware in front of a stand-in for vLLM's chat route, over a stub engine and the real store."""
+    pytest.importorskip("vllm")
+    import uuid
+
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+    from fastapi.testclient import TestClient
+
+    from nemo.collections.speechlm2.vllm.salm.ctc_serving import ctc_timestamp_middleware
+
+    workers = {
+        ct.WORKER_ALIGN_METHOD: ct._worker_align_requests,
+        ct.WORKER_RELEASE_METHOD: ct._worker_release_requests,
+    }
+    script = {"transcript": "hi there", "status": 200}
+    rpcs = []
+
+    async def collective_rpc(method, args):
+        rpcs.append(method)
+        return [workers[method](None, *args)]
+
+    hf_config = SimpleNamespace(ctc_timestamps={"adapter_path": "/adapter.pt"})
+    engine = SimpleNamespace(model_config=SimpleNamespace(hf_config=hf_config), collective_rpc=collective_rpc)
+    app = FastAPI()
+    app.state.engine_client = engine
+
+    @app.post("/v1/chat/completions")
+    async def vllm_chat_route(request: Request):  # stands in for vLLM's own chat route
+        body = await request.json()
+        request_id = f"chatcmpl-{request.headers.get('x-request-id') or body.get('request_id') or uuid.uuid4().hex}"
+        if (body.get("mm_processor_kwargs") or {}).get("capture_ctc_timestamps"):
+            # The capture the engine keeps for an opted-in request while it generates.
+            _capture(1, 4, [f"hash-{request_id}"])
+            ct._record_request_hashes([(f"{request_id}-0123abcd", f"hash-{request_id}")])
+        message = {"role": "assistant", "content": script["transcript"]}
+        content = {"id": request_id, "object": "chat.completion", "choices": [{"index": 0, "message": message}]}
+        return JSONResponse(content, status_code=script["status"])
+
+    app.middleware("http")(ctc_timestamp_middleware)
+    client = TestClient(app)
+
+    def post(opt_in=True, path="/v1/chat/completions", headers=None, **fields):
+        body = {"model": "hr9a", "messages": [{"role": "user", "content": "Transcribe."}], **fields}
+        if opt_in:
+            body["mm_processor_kwargs"] = {"capture_ctc_timestamps": True}
+        rpcs.clear()
+        return client.post(path, json=body, headers=headers or {})
+
+    return SimpleNamespace(post=post, script=script, rpcs=rpcs, hf_config=hf_config)
+
+
+def test_an_opted_in_chat_completion_gets_ctc_timestamps_and_releases_its_capture(server):
+    response = server.post()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"].startswith("chatcmpl-ctc-") and body["choices"][0]["message"]["content"] == "hi there"
+    timestamps = body["ctc_timestamps"]
+    assert [(w["word"], w["start"], w["end"], w["speaker"]) for w in timestamps["words"]] == [
+        ("hi", 0.1, 0.18, "0"),
+        ("there", 0.2, 0.28, "0"),
+    ]
+    assert timestamps["diarization"] == [{"speaker": 1, "start": 0.05, "end": 0.93}]
+    assert server.rpcs == [ct.WORKER_ALIGN_METHOD] and ct._store == {}
+
+
+def test_chat_requests_without_the_opt_in_pass_through_untouched(server):
+    flag_off = {"capture_ctc_timestamps": False}
+    assert "ctc_timestamps" not in server.post(opt_in=False).json()
+    assert "ctc_timestamps" not in server.post(opt_in=False, mm_processor_kwargs=flag_off).json()
+    assert server.post(path="/v1/completions").status_code == 404 and server.rpcs == []
+    server.hf_config.ctc_timestamps = None
+    assert "ctc_timestamps" not in server.post().json()
+    assert server.rpcs == []
+
+
+def test_the_client_request_id_names_the_engine_request(server):
+    response = server.post(headers={"X-Request-Id": "client-1"})
+    assert response.json()["id"] == "chatcmpl-client-1" and response.json()["ctc_timestamps"]["words"]
+
+    response = server.post(request_id="body-1")
+    assert response.json()["id"] == "chatcmpl-body-1" and response.json()["ctc_timestamps"]["words"]
+    assert ct._store == {}
+
+
+def test_opted_in_requests_refuse_streaming_and_n_above_1(server):
+    for fields in ({"stream": True}, {"n": 2}):
+        response = server.post(**fields)
+
+        assert response.status_code == 400
+        assert "neither streaming nor n > 1" in response.json()["error"]["message"]
+    assert server.rpcs == []
+
+
+def test_a_failed_chat_completion_releases_its_capture(server):
+    server.script["status"] = 500
+
+    response = server.post()
+
+    assert response.status_code == 500 and "ctc_timestamps" not in response.json()
+    assert server.rpcs == [ct.WORKER_RELEASE_METHOD] and ct._store == {}
+
+
+def test_an_alignment_failure_releases_the_capture_and_answers_500(server):
+    server.script["transcript"] = "crash"
+
+    response = server.post()
+
+    assert response.status_code == 500 and response.json()["error"]["message"] == "kernel failure"
+    assert server.rpcs == [ct.WORKER_ALIGN_METHOD, ct.WORKER_RELEASE_METHOD] and ct._store == {}
+
+
 def test_transcripts_without_speaker_tags_are_reported(encoder, caplog):
     _capture(1, 4, ["hash-a"])
     ct._record_request_hashes([("req", "hash-a")])
