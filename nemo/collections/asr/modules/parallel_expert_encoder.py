@@ -998,60 +998,22 @@ class ParallelExpertEncoder(nn.Module):
         sot_transcripts: Sequence[str],
         audio_durations: Sequence[float],
     ) -> List[Dict[str, Any]]:
-        """Run the deferred CTC head and align generated ASR text."""
+        """Align generated ASR text with this encoder's CTC timestamp aligner.
+
+        The aligner owns the deferred CTC head, its windows and the alignment
+        (``MultiSpeakerSOTWordTimestampAligner.generate_from_inputs`` in
+        ``nemo.collections.speechlm2.parts.ctc_timestamp_utils``).
+        """
         from nemo.collections.speechlm2.parts.ctc_timestamp_utils import get_ctc_timestamp_aligner
 
         if not isinstance(timestamp_inputs, CTCTimestampInputs):
             raise TypeError("timestamp_inputs must be a CTCTimestampInputs instance.")
-        extractor = get_ctc_timestamp_aligner(
+        aligner = get_ctc_timestamp_aligner(
             self,
             self.ctc_timestamp_model_path,
             timestamp_inputs.asr_encoded.device,
         )
-        ctc_log_probs = self._decode_ctc_timestamp_inputs(extractor.ctc_decoder, timestamp_inputs)
-        speaker_probs = self._align_diar_frames(timestamp_inputs.sortformer_sigmoids, ctc_log_probs.shape[1])
-        return extractor.extract_from_outputs_batch(
-            sot_transcripts=sot_transcripts,
-            audio_durations=audio_durations,
-            ctc_log_probs=ctc_log_probs,
-            ctc_lengths=timestamp_inputs.asr_encoded_lengths.clamp(max=ctc_log_probs.shape[1]),
-            sortformer_sigmoids=speaker_probs,
-            sortformer_lengths=timestamp_inputs.sortformer_lengths.clamp(max=speaker_probs.shape[1]),
-            diarization_labels=timestamp_inputs.diarization_labels,
-            diarization_lengths=timestamp_inputs.diarization_lengths,
-            diarization_frame_seconds=timestamp_inputs.diarization_frame_seconds,
-        )
-
-    def _decode_ctc_timestamp_inputs(
-        self,
-        ctc_decoder: nn.Module,
-        timestamp_inputs: CTCTimestampInputs,
-    ) -> torch.Tensor:
-        """Run the deferred CTC head in bounded windows after text generation."""
-        states = timestamp_inputs.asr_encoded
-        lengths = timestamp_inputs.asr_encoded_lengths
-        parameter = next(ctc_decoder.parameters(), None)
-        decoder_dtype = parameter.dtype if parameter is not None else states.dtype
-
-        def decode(state_chunk: torch.Tensor, chunk_lengths: torch.Tensor) -> torch.Tensor:
-            return ctc_decoder(state_chunk.to(dtype=decoder_dtype), encoded_lengths=chunk_lengths)
-
-        core_length = int(getattr(self, "online_inference_length", 0))
-        if core_length <= 0 or states.shape[-1] <= core_length:
-            return decode(states, lengths)
-
-        left_context = int(getattr(self, "chunk_left_context", 0))
-        right_context = int(getattr(self, "chunk_right_context", 0))
-        chunks = []
-        for start in range(0, states.shape[-1], core_length):
-            end = min(start + core_length, states.shape[-1])
-            context_start = max(start - left_context, 0)
-            context_end = min(end + right_context, states.shape[-1])
-            context_lengths = (lengths - context_start).clamp(min=0, max=context_end - context_start)
-            context_logits = decode(states[:, :, context_start:context_end], context_lengths)
-            left_drop = start - context_start
-            chunks.append(context_logits[:, left_drop : left_drop + end - start])
-        return torch.cat(chunks, dim=1)
+        return aligner.generate_from_inputs(timestamp_inputs, sot_transcripts, audio_durations)
 
     def forward(
         self,
