@@ -33,7 +33,6 @@ from torch import nn
 
 from nemo.collections.asr.modules.conv_asr import ConvASRDecoder
 from nemo.collections.asr.modules.transformer_encoder import TransformerEncoder
-from nemo.collections.asr.parts.preprocessing.features import normalize_batch
 from nemo.collections.common.tokenizers.sentencepiece_tokenizer import SentencePieceTokenizer
 
 __all__ = [
@@ -224,17 +223,22 @@ class TransformerCTCDecoder(ConvASRDecoder):
 
 
 class MultiSpeakerSOTWordTimestampAligner:
-    """Align speaker streams with exact max-sum CTC DP and packed two-bit backpointers."""
+    """Align speaker streams with exact max-sum CTC DP and packed two-bit backpointers.
+
+    The aligner takes model outputs, not audio: ASR states for the CTC head
+    (:meth:`generate_from_inputs`) or CTC log probabilities (:meth:`extract_from_outputs_batch`).
+    To start from audio, run the encoder with ``return_ctc_timestamp_inputs=True`` and pass the
+    returned ``CTCTimestampInputs`` to :meth:`generate_from_inputs`.
+    """
 
     _SPEAKER_TAG_RE = re.compile(r"<spk:(\d+)>", flags=re.IGNORECASE)
     _EMISSION_BLOCK_FRAMES = 256
 
     def __init__(
         self,
-        encoder: Optional[nn.Module] = None,
+        *,
         ctc_decoder: Optional[TransformerCTCDecoder] = None,
         tokenizer: Optional[Any] = None,
-        *,
         blank_id: Optional[int] = None,
         input_frame_seconds: float = 0.01,
         ctc_frame_seconds: Optional[float] = None,
@@ -246,13 +250,11 @@ class MultiSpeakerSOTWordTimestampAligner:
         online_inference_length: int = 0,
         chunk_left_context: int = 0,
         chunk_right_context: int = 0,
-        subsampling_factor: Optional[int] = None,
+        subsampling_factor: int = 1,
     ) -> None:
         """Initialize multi-speaker SOT word timestamp alignment.
 
         Args:
-            encoder (Optional[nn.Module]): Parallel Expert Encoder or its wrapper, used only
-                by the audio-in path (:meth:`extract_from_audio_batch`).
             ctc_decoder (Optional[TransformerCTCDecoder]): CTC timestamp decoder.
             tokenizer (Optional[Any]): Tokenizer matching the CTC decoder vocabulary.
             blank_id (Optional[int]): Explicit CTC blank class index.
@@ -267,8 +269,8 @@ class MultiSpeakerSOTWordTimestampAligner:
                 head over stored states; 0 runs it over the whole sequence at once.
             chunk_left_context (int): Encoder frames of left context per deferred head window.
             chunk_right_context (int): Encoder frames of right context per deferred head window.
-            subsampling_factor (Optional[int]): Input frames per CTC frame, for the CTC frame
-                duration when no audio duration is given; ``None`` reads it from ``encoder``.
+            subsampling_factor (int): Input frames per CTC frame, for the CTC frame duration when
+                no audio duration is given.
         """
         if speaker_logprob_weight < 0:
             raise ValueError("speaker_logprob_weight must be non-negative.")
@@ -276,7 +278,6 @@ class MultiSpeakerSOTWordTimestampAligner:
             raise ValueError("speaker_activity_threshold must be between zero and one.")
         if maximum_token_len <= 0:
             raise ValueError("maximum_token_len must be positive.")
-        self.encoder = encoder
         self.ctc_decoder = ctc_decoder
         self.tokenizer = tokenizer
         self.blank_id = blank_id
@@ -290,7 +291,7 @@ class MultiSpeakerSOTWordTimestampAligner:
         self.online_inference_length = int(online_inference_length)
         self.chunk_left_context = int(chunk_left_context)
         self.chunk_right_context = int(chunk_right_context)
-        self.subsampling_factor = subsampling_factor
+        self.subsampling_factor = int(subsampling_factor)
 
     @classmethod
     def parse_sot_words(cls, transcript: str) -> List[Dict[str, Any]]:
@@ -313,116 +314,6 @@ class MultiSpeakerSOTWordTimestampAligner:
                     )
                 )
         return words
-
-    def extract_ctc_and_sortformer_batch(
-        self,
-        processed_signal: torch.Tensor,
-        processed_signal_length: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """Run the raw PEE ASR/diarization branches and the CTC adapter."""
-        pee = getattr(self.encoder, "encoder", self.encoder)
-        if pee is None or self.ctc_decoder is None:
-            raise ValueError("encoder and ctc_decoder are required for audio inference.")
-
-        modules = (pee, self.ctc_decoder)
-        previous_modes = [module.training for module in modules]
-        try:
-            for module in modules:
-                module.eval()
-            with torch.inference_mode():
-                speech_states, speech_lengths = pee._run_asr(processed_signal, processed_signal_length)
-                diar_signal = processed_signal
-                if pee.diar_normalize_type:
-                    diar_signal, _, _ = normalize_batch(
-                        diar_signal,
-                        processed_signal_length,
-                        normalize_type=pee.diar_normalize_type,
-                    )
-                diar_signal = pee._match_module_io(diar_signal, pee.diarization_model)
-                embeddings, embedding_lengths = pee.diarization_model.frontend_encoder(
-                    processed_signal=diar_signal,
-                    processed_signal_length=processed_signal_length.to(diar_signal.device),
-                    bypass_pre_encode=False,
-                )
-                native_predictions = pee.diarization_model.forward_infer(
-                    emb_seq=embeddings,
-                    emb_seq_length=embedding_lengths,
-                )
-                speaker_probs = pee._align_diarization_output_resolution(native_predictions, embedding_lengths)
-                ctc_log_probs = self.ctc_decoder(speech_states, encoded_lengths=speech_lengths)
-        finally:
-            for module, was_training in zip(modules, previous_modes):
-                module.train(was_training)
-
-        diar_model = pee.diarization_model
-        native_factor = 1 if diar_model.high_resolution else int(diar_model.encoder.subsampling_factor)
-        downsample_factor = int(diar_model.output_subsampling_factor) // native_factor
-        if downsample_factor <= 1:
-            speaker_lengths = embedding_lengths
-        else:
-            native_lengths = embedding_lengths * (int(diar_model.encoder.subsampling_factor) // native_factor)
-            speaker_lengths = torch.div(
-                native_lengths + downsample_factor - 1,
-                downsample_factor,
-                rounding_mode="floor",
-            )
-        return {
-            "ctc_log_probs": ctc_log_probs,
-            "ctc_lengths": speech_lengths.clamp(max=ctc_log_probs.shape[1]),
-            "sortformer_sigmoids": speaker_probs,
-            "sortformer_lengths": speaker_lengths.clamp(min=1, max=speaker_probs.shape[1]),
-        }
-
-    def extract_from_audio(
-        self,
-        input_signal: torch.Tensor,
-        input_signal_length: torch.Tensor,
-        preprocessor: nn.Module,
-        sot_transcript: str,
-        *,
-        audio_duration: Optional[float] = None,
-        time_offset: float = 0.0,
-    ) -> Dict[str, Any]:
-        """Thin one-record wrapper around :meth:`extract_from_audio_batch`."""
-        return self.extract_from_audio_batch(
-            input_signal,
-            input_signal_length,
-            preprocessor,
-            [sot_transcript],
-            audio_durations=None if audio_duration is None else [audio_duration],
-            time_offsets=[time_offset],
-        )[0]
-
-    def extract_from_audio_batch(
-        self,
-        input_signal: torch.Tensor,
-        input_signal_length: torch.Tensor,
-        preprocessor: nn.Module,
-        sot_transcripts: Sequence[str],
-        *,
-        audio_durations: Optional[Sequence[Optional[float]]] = None,
-        time_offsets: Optional[Sequence[float]] = None,
-    ) -> List[Dict[str, Any]]:
-        """Preprocess a waveform batch once, then align every record in parallel mode."""
-        batch_size = input_signal.shape[0]
-        if input_signal_length.shape != (batch_size,) or len(sot_transcripts) != batch_size:
-            raise ValueError("audio lengths and transcripts must match the waveform batch.")
-        with torch.inference_mode():
-            processed_signal, processed_signal_length = preprocessor(
-                input_signal=input_signal,
-                length=input_signal_length,
-            )
-        outputs = self.extract_ctc_and_sortformer_batch(processed_signal, processed_signal_length)
-        if audio_durations is None:
-            sample_rate = getattr(preprocessor, "_sample_rate", getattr(preprocessor, "sample_rate", None))
-            if sample_rate is not None:
-                audio_durations = [float(length) / float(sample_rate) for length in input_signal_length.cpu()]
-        return self.extract_from_outputs_batch(
-            sot_transcripts=sot_transcripts,
-            audio_durations=audio_durations,
-            time_offsets=time_offsets,
-            **outputs,
-        )
 
     @torch.no_grad()
     def ctc_log_probs_from_inputs(self, timestamp_inputs: Any) -> torch.Tensor:
@@ -627,7 +518,7 @@ class MultiSpeakerSOTWordTimestampAligner:
         if weight < 0:
             raise ValueError("speaker_logprob_weight must be non-negative.")
 
-        default_ctc_step = self.input_frame_seconds * float(self._input_frames_per_ctc_frame())
+        default_ctc_step = self.input_frame_seconds * float(self.subsampling_factor)
         records = []
         for index, transcript in enumerate(sot_transcripts):
             ctc_length = ctc_lengths_list[index]
@@ -1439,13 +1330,6 @@ class MultiSpeakerSOTWordTimestampAligner:
             raise ValueError(f"blank_id={blank_id} is outside the CTC vocabulary.")
         return blank_id
 
-    def _input_frames_per_ctc_frame(self) -> int:
-        """Return the configured subsampling factor, else the encoder's, else 1."""
-        if self.subsampling_factor is not None:
-            return self.subsampling_factor
-        pee = getattr(self.encoder, "encoder", self.encoder)
-        return getattr(pee, "subsampling_factor", 1)
-
     @staticmethod
     def _frame_seconds(
         length: int,
@@ -1662,8 +1546,8 @@ def get_ctc_timestamp_aligner(
 ) -> MultiSpeakerSOTWordTimestampAligner:
     """Load and cache an inference-only aligner without registering it in ``owner``'s module tree.
 
-    The aligner records the encoder's deferred-head windows and subsampling factor here, so
-    aligning stored inputs never reads the encoder again.
+    The aligner copies the encoder's deferred-head windows and subsampling factor here and keeps no
+    reference to the encoder.
     """
     if not isinstance(artifact_path, str) or not artifact_path:
         raise ValueError("ctc_timestamp_model_path must be a non-empty lightweight artifact path.")
@@ -1675,7 +1559,6 @@ def get_ctc_timestamp_aligner(
         artifact = load_ctc_timestamp_artifact(resolved_path, map_location=device, dtype=dtype)
         pee = getattr(owner, "encoder", owner)
         aligner = MultiSpeakerSOTWordTimestampAligner(
-            encoder=owner,
             ctc_decoder=artifact.decoder,
             tokenizer=artifact.tokenizer,
             online_inference_length=int(getattr(owner, "online_inference_length", 0)),

@@ -266,9 +266,9 @@ def test_ctc_timestamp_loader_records_the_encoder_windows_and_subsampling(monkey
 
     aligner = get_ctc_timestamp_aligner(encoder, str(adapter_path), torch.device("cpu"))
 
-    # Recorded once, so aligning stored inputs never reads the encoder again.
     assert (aligner.online_inference_length, aligner.chunk_left_context, aligner.chunk_right_context) == (500, 50, 25)
     assert aligner.subsampling_factor == 8
+    assert all(value is not encoder for value in vars(aligner).values())
 
 
 @pytest.mark.unit
