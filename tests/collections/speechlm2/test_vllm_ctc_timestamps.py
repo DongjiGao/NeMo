@@ -39,7 +39,14 @@ class _FakeAligner:
         self.calls.append((timestamp_inputs, list(sot_transcripts), list(audio_durations)))
         if any("crash" in text for text in sot_transcripts):
             raise RuntimeError("kernel failure")
-        return {"records": [{"text": text, "ctc_log_probs": torch.zeros(1, 2)} for text in sot_transcripts]}
+        return {
+            "config": {},
+            "max_ctc_frames": 4,
+            "num_speaker_columns": 2,
+            "diarization_frame_seconds": 0.01,
+            "diarization_max_speaker_count": 4,
+            "records": [{"text": text, "ctc_log_probs": torch.zeros(1, 2)} for text in sot_transcripts],
+        }
 
 
 def _align_fake_batch(prepared):
@@ -48,6 +55,8 @@ def _align_fake_batch(prepared):
     assert all(isinstance(record["ctc_log_probs"], torch.Tensor) for record in records)
     if any("unalignable" in record["text"] for record in records):
         raise ValueError("tokenizer disagreement")
+    if any("explode" in record["text"] for record in records):
+        raise RuntimeError("search failure")
     return [
         {
             "speaker_word_timestamps": {
@@ -322,6 +331,78 @@ def test_async_alignment_runs_off_the_event_loop_thread(aligner, monkeypatch):
 
     assert _words(result) == ["a", "b"]
     assert threads and threads[0] is not threading.main_thread()
+
+
+def _serve_concurrently(names):
+    """Align one request per name, all at once on one event loop, as a server's middleware does."""
+
+    async def rpc(method, args):
+        return [ct._worker_prepare_requests(None, *args)]
+
+    async def serve():
+        requests = (ct.align_async(rpc, [(f"req-{name}", name)]) for name in names)
+        # Bounded, so that a request left waiting fails the test instead of hanging it.
+        return await asyncio.wait_for(asyncio.gather(*requests, return_exceptions=True), timeout=30)
+
+    return asyncio.run(serve())
+
+
+def _record_searches(monkeypatch):
+    searches = []
+
+    def align_and_record(prepared):
+        searches.append([record["text"] for record in prepared["records"]])
+        return _align_fake_batch(prepared)
+
+    monkeypatch.setattr("nemo.collections.speechlm2.parts.ctc_timestamp_utils.align_prepared_batch", align_and_record)
+    return searches
+
+
+def test_concurrent_server_alignments_share_one_search(aligner, monkeypatch):
+    _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
+    ct._record_request_hashes([(f"req-{name}-0123abcd", f"hash-{name}") for name in "abc"])
+    searches = _record_searches(monkeypatch)
+
+    results = _serve_concurrently("abc")
+
+    assert [_words(result) for (result,) in results] == [["a"], ["b"], ["c"]]
+    assert searches == [["a", "b", "c"]]
+
+
+def test_server_searches_take_at_most_the_record_cap(aligner, monkeypatch):
+    _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
+    ct._record_request_hashes([(f"req-{name}-0123abcd", f"hash-{name}") for name in "abc"])
+    searches = _record_searches(monkeypatch)
+    monkeypatch.setattr(ct, "_SERVER_ALIGN_RECORDS", 2)
+
+    results = _serve_concurrently("abc")
+
+    assert [_words(result) for (result,) in results] == [["a"], ["b"], ["c"]]
+    assert searches == [["a", "b"], ["c"]]
+
+
+def test_an_error_in_a_shared_search_reaches_only_its_request(aligner):
+    _capture(2, 4, ["hash-fine", "hash-explode"])
+    ct._record_request_hashes([("req-fine-0123abcd", "hash-fine"), ("req-explode-0123abcd", "hash-explode")])
+
+    fine, exploded = _serve_concurrently(["fine", "explode"])
+
+    assert _words(fine[0]) == ["fine"]
+    assert isinstance(exploded, RuntimeError) and str(exploded) == "search failure"
+
+
+def test_an_unexpected_batcher_error_fails_the_waiting_requests_instead_of_hanging_them(aligner, monkeypatch):
+    _capture(2, 4, ["hash-a", "hash-b"])
+    ct._record_request_hashes([("req-a-0123abcd", "hash-a"), ("req-b-0123abcd", "hash-b")])
+
+    def broken(group):
+        raise KeyError("broken batch")
+
+    monkeypatch.setattr(ct, "_align_group", broken)
+
+    results = _serve_concurrently("ab")
+
+    assert all(isinstance(result, KeyError) for result in results)
 
 
 def test_a_prepared_reply_survives_vllms_rpc_serialization(aligner):

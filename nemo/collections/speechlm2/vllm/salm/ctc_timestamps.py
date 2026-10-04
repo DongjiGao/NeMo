@@ -70,6 +70,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import weakref
 from collections import deque
 from collections.abc import Sequence
 from typing import Any
@@ -102,6 +103,14 @@ _INTERNAL_ID_SUFFIX_LEN = 8
 # Requests decoded together in one deferred-head call, which materializes a
 # (batch, frames, vocabulary) log-prob tensor on the device.
 _ALIGN_BATCH = 16
+
+# Records a server merges into one alignment search (see _AlignmentBatcher). The
+# search's per-frame loop is shared, so more records cost little more, short ones
+# padded to the longest.
+_SERVER_ALIGN_RECORDS = 32
+
+# Fields every prepared batch in a merged search must share.
+_MERGEABLE_BATCH_KEYS = ("config", "num_speaker_columns", "diarization_frame_seconds", "diarization_max_speaker_count")
 
 # Weight of the Sortformer speaker-activity prior in CTC alignment, overridable per
 # checkpoint as ctc_timestamps.speaker_logprob_weight. The aligner's own default is
@@ -140,6 +149,8 @@ _external_ids: dict[str, str] = {}
 _uncompacted: deque[dict] = deque()
 # Reentrant because the alignment lookup resolves request ids while holding it.
 _lock = threading.RLock()
+# One alignment batcher per event loop; a server has one.
+_batchers: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 def register_aligner(aligner: Any) -> None:
@@ -641,9 +652,14 @@ def align_prepared_requests(reply: dict) -> list[dict]:
     Raises:
         Exception: Any aligner error other than ``ValueError``.
     """
+    return _results_from(reply, [_align_batch(batch["prepared"]) for batch in reply["batches"]])
+
+
+def _results_from(reply: dict, aligned: Sequence[list[dict | None]]) -> list[dict]:
+    """Public results per item of ``reply``, from each of its batches' aligner results."""
     results: list[dict] = [_empty_result() for _ in range(reply["count"])]
-    for batch in reply["batches"]:
-        for index, result in zip(batch["items"], _align_batch(batch["prepared"])):
+    for batch, batch_results in zip(reply["batches"], aligned):
+        for index, result in zip(batch["items"], batch_results):
             if result is not None:
                 results[index] = _public_result(result)
     return results
@@ -686,6 +702,109 @@ def _align_batch(prepared: dict) -> list[dict | None]:
             raise
         logging.warning("[NeMoSpeechLM] CTC alignment failed: %s", error)
         return [None]
+
+
+class _AlignmentBatcher:
+    """Aligns the prepared batches of concurrent requests together, one search at a time.
+
+    A server prepares each request on its own, but the alignment search pays its per-frame
+    loop once per batch, so a one-record search costs several times more per record than a
+    merged one. The first batch starts a search at once; the batches that arrive while it
+    runs on a worker thread queue up, and the next search takes all of them, up to
+    ``_SERVER_ALIGN_RECORDS`` records.
+    """
+
+    def __init__(self) -> None:
+        self._pending: list[tuple[dict, asyncio.Future]] = []
+        self._drain_task: asyncio.Task | None = None
+
+    async def align(self, prepared: dict) -> list[dict | None]:
+        """Align one prepared batch, merged with whatever else is waiting."""
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._pending.append((prepared, future))
+        if self._drain_task is None:
+            self._drain_task = loop.create_task(self._drain())
+        return await future
+
+    async def _drain(self) -> None:
+        group: list[tuple[dict, asyncio.Future]] = []
+        try:
+            while self._pending:
+                group = [self._pending.pop(0)]
+                records = len(group[0][0]["records"])
+                while self._pending and records + len(self._pending[0][0]["records"]) <= _SERVER_ALIGN_RECORDS:
+                    records += len(self._pending[0][0]["records"])
+                    group.append(self._pending.pop(0))
+                try:
+                    outcomes = await asyncio.to_thread(_align_group, [prepared for prepared, _ in group])
+                except Exception as error:  # noqa: BLE001
+                    outcomes = [error] * len(group)
+                for (_, future), outcome in zip(group, outcomes):
+                    if future.done():
+                        continue
+                    if isinstance(outcome, BaseException):
+                        future.set_exception(outcome)
+                    else:
+                        future.set_result(outcome)
+                group = []
+        finally:
+            self._drain_task = None
+            # A drain cancelled with its event loop must not leave requests waiting forever.
+            for _, future in group + self._pending:
+                if not future.done():
+                    future.cancel()
+            self._pending.clear()
+
+
+def _batcher() -> _AlignmentBatcher:
+    """The alignment batcher of the running event loop."""
+    loop = asyncio.get_running_loop()
+    batcher = _batchers.get(loop)
+    if batcher is None:
+        batcher = _batchers[loop] = _AlignmentBatcher()
+    return batcher
+
+
+def _align_group(group: list[dict]) -> list[list[dict | None] | BaseException]:
+    """Align queued prepared batches in one search; per batch after an error, so it reaches only its request."""
+    merged = _merge_prepared(group)
+    if merged is not None:
+        try:
+            results = _align_batch(merged)
+        except Exception:  # noqa: BLE001
+            pass
+        else:
+            outcomes, start = [], 0
+            for prepared in group:
+                outcomes.append(results[start : start + len(prepared["records"])])
+                start += len(prepared["records"])
+            return outcomes
+    outcomes = []
+    for prepared in group:
+        try:
+            outcomes.append(_align_batch(prepared))
+        except Exception as error:  # noqa: BLE001
+            outcomes.append(error)
+    return outcomes
+
+
+def _merge_prepared(group: list[dict]) -> dict | None:
+    """One prepared batch with the records of all of ``group``, or ``None`` when they cannot share a search.
+
+    Each stream's search is independent and frames past a record's length are never read,
+    so a merged search aligns every record exactly as its own batch would.
+    """
+    first = group[0]
+    if len(group) == 1:
+        return first
+    if any(prepared[key] != first[key] for prepared in group[1:] for key in _MERGEABLE_BATCH_KEYS):
+        return None
+    return {
+        **first,
+        "max_ctc_frames": max(prepared["max_ctc_frames"] for prepared in group),
+        "records": [record for prepared in group for record in prepared["records"]],
+    }
 
 
 def _pack(value: Any) -> Any:
@@ -907,13 +1026,17 @@ async def align_async(
 ) -> list[dict]:
     """:func:`align` for an async engine client, e.g. a server's ``EngineClient.collective_rpc``.
 
-    The alignment search runs in a worker thread, so the event loop keeps serving other
-    requests meanwhile.
+    The alignment search runs on a worker thread, so the event loop keeps serving other
+    requests, and is merged with the searches of the other requests aligned meanwhile
+    (``_AlignmentBatcher``), so a busy server pays its per-frame cost once per batch.
     """
+    batcher = _batcher()
     results: list[dict] = []
     for batch in _rpc_batches(items, chunk_size):
         replies = await rpc(WORKER_PREPARE_METHOD, args=(batch, release, require_enabled))
-        results.extend(await asyncio.to_thread(_align_reply, replies))
+        reply = _unpack(replies[0])
+        aligned = await asyncio.gather(*(batcher.align(entry["prepared"]) for entry in reply["batches"]))
+        results.extend(_results_from(reply, aligned))
     return results
 
 
