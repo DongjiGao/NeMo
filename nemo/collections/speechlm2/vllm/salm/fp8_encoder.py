@@ -30,11 +30,12 @@ checkpoint's ``config.json``::
     }
 
 Every ``nn.Linear`` of the ASR encoder whose name ends with one of ``patterns``
-holds an FP8 E4M3 ``weight`` and a float32 ``weight_scale`` with one entry per
-output channel. With static activation scales, each such layer also needs an
-``activation_amax`` entry, keyed by its name inside the ASR encoder; the input
-scale is ``amax * scale_margin / 448``. The diarizer of a speaker-aware encoder
-is never quantized: its output is fused additively into the ASR features.
+(matched on whole name components) holds an FP8 E4M3 ``weight`` and a float32
+``weight_scale`` with one entry per output channel. With static activation
+scales, each such layer also needs an ``activation_amax`` entry, keyed by its
+name inside the ASR encoder; the input scale is ``amax * scale_margin / 448``.
+The diarizer of a speaker-aware encoder is never quantized: its output is fused
+additively into the ASR features.
 
 ``build_fp8_encoder`` creates these layers when the model is constructed, as vLLM
 does for a quantized decoder, so the checkpoint loads into them directly.
@@ -149,6 +150,11 @@ def _asr_encoder(perception: nn.Module) -> nn.Module:
     return getattr(encoder, "asr_encoder", encoder)
 
 
+def _matches(name: str, patterns: tuple[str, ...]) -> bool:
+    """Whether ``name`` ends with one of ``patterns`` on whole name components, so ``net.0`` misses ``subnet.0``."""
+    return any(name == pattern or name.endswith("." + pattern) for pattern in patterns)
+
+
 def build_fp8_encoder(perception: nn.Module, quant_cfg: Optional[dict]) -> int:
     """Build empty ``FP8Linear`` layers in place of the ASR encoder's quantized Linears.
 
@@ -161,14 +167,21 @@ def build_fp8_encoder(perception: nn.Module, quant_cfg: Optional[dict]) -> int:
         quant_cfg: The checkpoint's ``encoder_quantization`` block, or None.
 
     Returns:
-        The number of Linears replaced; 0 when the checkpoint has no prequantized encoder.
+        The number of Linears replaced; 0 when the checkpoint has no prequantized encoder. A block
+        without ``weights_prequantized`` is ignored with a warning: the encoder then runs unquantized.
 
     Raises:
         ValueError: If the block requests an unsupported format or scaling mode, has no
             patterns, or lacks a static activation amax for a quantized layer.
         RuntimeError: If the number of replaced Linears differs from ``expect_replaced``.
     """
-    if not quant_cfg or not quant_cfg.get("weights_prequantized"):
+    if not quant_cfg:
+        return 0
+    if not quant_cfg.get("weights_prequantized"):
+        logging.warning(
+            "config.json has an encoder_quantization block without weights_prequantized; only prequantized "
+            "FP8 encoder weights are supported, so the audio encoder runs unquantized"
+        )
         return 0
     if quant_cfg.get("format") != SUPPORTED_FORMAT:
         raise ValueError(
@@ -190,7 +203,7 @@ def build_fp8_encoder(perception: nn.Module, quant_cfg: Optional[dict]) -> int:
     targets = [
         (name, module)
         for name, module in encoder.named_modules()
-        if isinstance(module, nn.Linear) and any(name.endswith(pattern) for pattern in patterns)
+        if isinstance(module, nn.Linear) and _matches(name, patterns)
     ]
     static = activation_scale == "static_per_tensor"
     amax = quant_cfg.get("activation_amax") or {}

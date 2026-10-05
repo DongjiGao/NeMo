@@ -114,6 +114,28 @@ class TestBuildFP8Encoder:
         assert build_fp8_encoder(perception, cfg) == 0
         assert not any(isinstance(m, FP8Linear) for m in perception.modules())
 
+    def test_block_without_prequantized_weights_warns(self, monkeypatch):
+        from nemo.collections.speechlm2.vllm.salm import fp8_encoder
+
+        warnings = []
+        monkeypatch.setattr(fp8_encoder.logging, "warning", lambda msg, *args, **kwargs: warnings.append(msg))
+        perception = _speaker_aware_perception()
+
+        assert build_fp8_encoder(perception, _recipe(weights_prequantized=False)) == 0
+        assert len(warnings) == 1 and "weights_prequantized" in warnings[0]
+        assert not any(isinstance(m, FP8Linear) for m in perception.modules())
+
+    def test_patterns_match_whole_name_components(self):
+        perception = nn.Module()
+        perception.encoder = nn.Module()
+        perception.encoder.net = nn.Sequential(nn.Linear(D_MODEL, D_MODEL))
+        perception.encoder.subnet = nn.Sequential(nn.Linear(D_MODEL, D_MODEL))
+        recipe = _recipe(patterns=["net.0"], activation_amax={"net.0": 1.0, "subnet.0": 1.0}, expect_replaced=1)
+
+        assert build_fp8_encoder(perception, recipe) == 1
+        assert isinstance(perception.encoder.net[0], FP8Linear)
+        assert isinstance(perception.encoder.subnet[0], nn.Linear)
+
     def test_plain_encoder_without_asr_branch(self):
         perception = nn.Module()
         perception.encoder = _Encoder()
