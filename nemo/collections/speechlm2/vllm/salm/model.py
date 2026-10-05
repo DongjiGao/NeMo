@@ -65,6 +65,7 @@ from nemo.collections.speechlm2.vllm.salm.audio import (
 )
 from nemo.collections.speechlm2.vllm.salm.backends import HybridBackend, make_backend
 from nemo.collections.speechlm2.vllm.salm.config import _AUDIO_PLACEHOLDER
+from nemo.collections.speechlm2.vllm.salm.fp8_encoder import prepare_fp8_encoder
 
 _AUDIO_INPUT_DTYPE = torch.float32
 _PERCEPTION_DTYPE = torch.bfloat16
@@ -289,6 +290,9 @@ class NeMoSpeechLMForConditionalGeneration(
 
     def _load_perception_weights(self, perception_weights: dict[str, torch.Tensor]) -> set[str]:
         self.perception = self.perception.to(_PERCEPTION_DTYPE)
+        # After the cast, which would turn FP8 buffers back into bfloat16, and before
+        # the load, which needs a destination for each FP8 weight_scale.
+        prepare_fp8_encoder(self.perception, getattr(getattr(self, "config", None), "encoder_quantization", None))
         incompatible = self.perception.load_state_dict(perception_weights, strict=False)
 
         from nemo.collections.speechlm2.modules.perception import IndependentDualEncoder

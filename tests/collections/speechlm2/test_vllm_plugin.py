@@ -668,6 +668,29 @@ class TestHybridBackendWeightMapping:
         assert mapped_name == canonical_name
         assert mapped_tensor is tensor
 
+    @pytest.mark.parametrize(
+        ("source_name", "hf_name"),
+        [
+            ("llm.model.embed_tokens.weight", "backbone.embed_tokens.weight"),
+            # ModelOpt exports already use NemotronH's own embedding name.
+            ("backbone.embeddings.weight", "backbone.embeddings.weight"),
+            ("llm.lm_head.weight", "lm_head.weight"),
+        ],
+    )
+    def test_pads_vocabulary_tensors_to_served_vocab(self, source_name, hf_name):
+        import torch
+
+        from nemo.collections.speechlm2.vllm.salm.backends import HybridBackend
+
+        backend = HybridBackend(SimpleNamespace(text_config=SimpleNamespace(vocab_size=6)))
+        tensor = torch.ones(4, 3)
+        [(mapped_name, mapped_tensor)] = backend.nemo_to_hf_llm_weights([(source_name, tensor)])
+
+        assert mapped_name == hf_name
+        assert mapped_tensor.shape == (6, 3)
+        assert torch.equal(mapped_tensor[:4], tensor)
+        assert not mapped_tensor[4:].any()
+
     @staticmethod
     def _lora_weights():
         import torch
