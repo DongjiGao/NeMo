@@ -19,7 +19,7 @@ import torch
 from torch import nn
 
 try:
-    from nemo.collections.speechlm2.vllm.salm.fp8_encoder import FP8_DTYPE, FP8_MAX, FP8Linear, prepare_fp8_encoder
+    from nemo.collections.speechlm2.vllm.salm.fp8_encoder import FP8_DTYPE, FP8_MAX, FP8Linear, build_fp8_encoder
 
     _HAS_PLUGIN = True
 except (ImportError, RuntimeError):
@@ -51,13 +51,18 @@ class _Encoder(nn.Module):
 
 
 def _speaker_aware_perception() -> nn.Module:
-    """A perception module whose encoder holds an ASR branch and a diarizer with identical Linear names."""
+    """A freshly constructed (float32) perception module whose encoder holds an ASR branch and a diarizer
+    with identical Linear names."""
     perception = nn.Module()
     perception.encoder = nn.Module()
     perception.encoder.asr_encoder = _Encoder()
     perception.encoder.diarization_model = nn.Module()
     perception.encoder.diarization_model.encoder = _Encoder()
-    return perception.to(torch.bfloat16)
+    return perception
+
+
+def _fp8_bits(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.view(torch.uint8)
 
 
 def _recipe(**overrides) -> dict:
@@ -76,10 +81,10 @@ def _recipe(**overrides) -> dict:
 
 
 @pytest.mark.skipif(not _HAS_PLUGIN, reason="SpeechLM vLLM plugin not available")
-class TestPrepareFP8Encoder:
+class TestBuildFP8Encoder:
     def test_replaces_only_asr_encoder_linears(self):
         perception = _speaker_aware_perception()
-        replaced = prepare_fp8_encoder(perception, _recipe())
+        replaced = build_fp8_encoder(perception, _recipe())
 
         assert replaced == N_LAYERS * len(PATTERNS)
         asr = perception.encoder.asr_encoder
@@ -91,14 +96,14 @@ class TestPrepareFP8Encoder:
 
     def test_static_input_scale_uses_amax_and_margin(self):
         perception = _speaker_aware_perception()
-        prepare_fp8_encoder(perception, _recipe())
+        build_fp8_encoder(perception, _recipe())
 
         layer1_qkv = perception.encoder.asr_encoder.layers[1].attn.w_qkv
         assert layer1_qkv.input_scale.item() == pytest.approx(3.0 * 1.5 / FP8_MAX)
 
     def test_dynamic_activations_need_no_amax(self):
         perception = _speaker_aware_perception()
-        prepare_fp8_encoder(perception, _recipe(activation_scale="dynamic_per_token", activation_amax=None))
+        build_fp8_encoder(perception, _recipe(activation_scale="dynamic_per_token", activation_amax=None))
 
         assert perception.encoder.asr_encoder.layers[0].attn.w_qkv.input_scale is None
 
@@ -106,14 +111,14 @@ class TestPrepareFP8Encoder:
     def test_noop_without_prequantized_weights(self, cfg):
         perception = _speaker_aware_perception()
 
-        assert prepare_fp8_encoder(perception, cfg) == 0
+        assert build_fp8_encoder(perception, cfg) == 0
         assert not any(isinstance(m, FP8Linear) for m in perception.modules())
 
     def test_plain_encoder_without_asr_branch(self):
         perception = nn.Module()
         perception.encoder = _Encoder()
 
-        assert prepare_fp8_encoder(perception, _recipe()) == N_LAYERS * len(PATTERNS)
+        assert build_fp8_encoder(perception, _recipe()) == N_LAYERS * len(PATTERNS)
 
     @pytest.mark.parametrize(
         ("overrides", "error", "match"),
@@ -130,12 +135,33 @@ class TestPrepareFP8Encoder:
         perception = _speaker_aware_perception()
 
         with pytest.raises(error, match=match):
-            prepare_fp8_encoder(perception, _recipe(**overrides))
+            build_fp8_encoder(perception, _recipe(**overrides))
         assert not any(isinstance(m, FP8Linear) for m in perception.modules())
+
+    def test_bfloat16_cast_keeps_fp8_weights_and_float32_scales(self):
+        perception = _speaker_aware_perception()
+        build_fp8_encoder(perception, _recipe())
+        layer = perception.encoder.asr_encoder.layers[0].attn.w_qkv
+        weight = torch.randn(layer.weight.shape).to(FP8_DTYPE)
+        weight_scale = torch.rand(layer.out_features) * 1e-3 + 1e-4  # not representable in bfloat16
+        layer.load_state_dict(
+            {"weight": weight, "weight_scale": weight_scale, "bias": torch.zeros(layer.out_features)}
+        )
+        input_scale = layer.input_scale.clone()
+
+        perception.to(torch.bfloat16)
+
+        assert layer.weight.dtype == FP8_DTYPE
+        assert torch.equal(_fp8_bits(layer.weight), _fp8_bits(weight))
+        assert layer.weight_scale.dtype == torch.float32
+        assert torch.equal(layer.weight_scale, weight_scale)
+        assert torch.equal(layer.input_scale, input_scale)
+        assert layer.bias.dtype == torch.bfloat16
 
     def test_checkpoint_state_dict_fills_fp8_modules(self):
         perception = _speaker_aware_perception()
-        prepare_fp8_encoder(perception, _recipe())
+        build_fp8_encoder(perception, _recipe())
+        perception.to(torch.bfloat16)  # the plugin casts perception right before loading
 
         state = {}
         for name, tensor in perception.state_dict().items():
@@ -148,8 +174,50 @@ class TestPrepareFP8Encoder:
         assert not result.missing_keys and not result.unexpected_keys
         w_qkv = perception.encoder.asr_encoder.layers[0].attn.w_qkv
         assert w_qkv.weight.dtype == FP8_DTYPE
+        assert torch.equal(_fp8_bits(w_qkv.weight), _fp8_bits(state["encoder.asr_encoder.layers.0.attn.w_qkv.weight"]))
         assert w_qkv.weight_scale.dtype == torch.float32
         assert torch.equal(w_qkv.weight_scale, state["encoder.asr_encoder.layers.0.attn.w_qkv.weight_scale"])
+
+    def test_plugin_perception_loader_loads_fp8_checkpoint(self):
+        pytest.importorskip("vllm")
+        from nemo.collections.speechlm2.vllm.salm.model import NeMoSpeechLMForConditionalGeneration
+
+        perception = _speaker_aware_perception()
+        build_fp8_encoder(perception, _recipe())
+        state = {
+            name: (
+                torch.randn(t.shape).to(FP8_DTYPE)
+                if t.dtype == FP8_DTYPE
+                else torch.randn(t.shape).to(torch.bfloat16 if t.is_floating_point() else t.dtype)
+            )
+            for name, t in perception.state_dict().items()
+        }
+        model = object.__new__(NeMoSpeechLMForConditionalGeneration)
+        nn.Module.__init__(model)
+        model.perception = perception
+        model._uses_pe_encoder = True  # turns on the exact-architecture check
+
+        loaded = model._load_perception_weights(state)
+
+        assert loaded == {f"perception.{name}" for name in state}
+        w_qkv = model.perception.encoder.asr_encoder.layers[1].attn.w_qkv
+        assert w_qkv.weight.dtype == FP8_DTYPE
+        assert torch.equal(_fp8_bits(w_qkv.weight), _fp8_bits(state["encoder.asr_encoder.layers.1.attn.w_qkv.weight"]))
+        assert model.perception.encoder.diarization_model.encoder.layers[0].attn.w_qkv.weight.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not _HAS_PLUGIN or not torch.cuda.is_available(), reason="needs CUDA")
+def test_device_move_keeps_fp8_dtypes():
+    perception = _speaker_aware_perception()
+    build_fp8_encoder(perception, _recipe())
+
+    perception.to("cuda", torch.bfloat16)
+
+    layer = perception.encoder.asr_encoder.layers[0].attn.w_qkv
+    assert layer.weight.device.type == "cuda" and layer.weight.dtype == FP8_DTYPE
+    assert layer.weight_scale.device.type == "cuda" and layer.weight_scale.dtype == torch.float32
+    assert layer.input_scale.device.type == "cuda" and layer.input_scale.dtype == torch.float32
+    assert layer.bias.device.type == "cuda" and layer.bias.dtype == torch.bfloat16
 
 
 def _fp8_gemm_available() -> bool:

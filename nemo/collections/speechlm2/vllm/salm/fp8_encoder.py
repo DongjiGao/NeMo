@@ -35,8 +35,12 @@ output channel. With static activation scales, each such layer also needs an
 ``activation_amax`` entry, keyed by its name inside the ASR encoder; the input
 scale is ``amax * scale_margin / 448``. The diarizer of a speaker-aware encoder
 is never quantized: its output is fused additively into the ASR features.
+
+``build_fp8_encoder`` creates these layers when the model is constructed, as vLLM
+does for a quantized decoder, so the checkpoint loads into them directly.
 """
 
+from collections.abc import Callable
 from typing import Optional
 
 import torch
@@ -57,7 +61,8 @@ class FP8Linear(nn.Module):
     ``weight_scale`` are persistent buffers named like the checkpoint tensors.
     Weights are scaled per output channel. Activations are quantized with a
     static per-tensor scale when ``input_scale`` is given, otherwise dynamically
-    per token.
+    per token. Dtype casts of an enclosing module convert only the bias; the
+    FP8 weight and the float32 scales keep their dtypes and follow device moves.
 
     Args:
         in_features: Input width. CUTLASS needs a multiple of 16.
@@ -94,6 +99,24 @@ class FP8Linear(nn.Module):
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features, dtype=bias_dtype, device=device), requires_grad=False)
 
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "FP8Linear":
+        """Apply ``fn`` to the bias as usual but only its device change to the buffers.
+
+        The perception module is cast to bfloat16 as a whole; applied to the buffers,
+        that cast would turn the FP8 weight into bfloat16 values and round the scales.
+        """
+        buffers = dict(self._buffers)
+        self._buffers.clear()
+        try:
+            super()._apply(fn, recurse)
+        finally:
+            for name, buf in buffers.items():
+                if buf is not None:
+                    device = fn(torch.empty(0, dtype=buf.dtype, device=buf.device)).device
+                    buf = buf.to(device=device)
+                self._buffers[name] = buf
+        return self
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Quantize ``x`` to FP8 and multiply by the FP8 weight, returning ``x.dtype``."""
         import vllm._custom_ops as ops
@@ -126,12 +149,12 @@ def _asr_encoder(perception: nn.Module) -> nn.Module:
     return getattr(encoder, "asr_encoder", encoder)
 
 
-def prepare_fp8_encoder(perception: nn.Module, quant_cfg: Optional[dict]) -> int:
-    """Swap the ASR encoder's quantized Linears for empty ``FP8Linear`` modules before the weights load.
+def build_fp8_encoder(perception: nn.Module, quant_cfg: Optional[dict]) -> int:
+    """Build empty ``FP8Linear`` layers in place of the ASR encoder's quantized Linears.
 
-    Call this after the perception module is cast to its serving dtype and before
-    ``load_state_dict``: the cast would turn existing FP8 buffers back into
-    bfloat16, and the load needs ``weight_scale`` to have a destination.
+    Call this when the model is constructed, before any weights load: the
+    checkpoint's FP8 ``weight`` and ``weight_scale`` then load into these layers
+    directly, and later dtype casts of the perception module leave them intact.
 
     Args:
         perception: The SpeechLM perception module.
