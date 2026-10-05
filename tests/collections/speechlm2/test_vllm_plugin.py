@@ -2364,6 +2364,29 @@ class TestMTPPlugin:
                 [("backbone.layers.0.mixer.in_proj.weight", tensor), ("lm_head.weight", tensor)],
             )
 
+    def test_mtp_load_weights_accepts_checkpoint_with_draft_head(self, monkeypatch):
+        """A checkpoint carrying llm.mtp.* passes the guard and hands the head tensors to vLLM's loader."""
+        import torch
+        from vllm.model_executor.models.nemotron_h_mtp import NemotronHMTP
+
+        from nemo.collections.speechlm2.vllm.salm.mtp import NeMoSpeechLMMTP
+
+        model = object.__new__(NeMoSpeechLMMTP)
+        object.__setattr__(
+            model,
+            "config",
+            SimpleNamespace(mtp_hybrid_override_pattern="*E", vocab_size=3),
+        )
+        monkeypatch.setattr(NemotronHMTP, "load_weights", lambda self, weights: {name for name, _ in weights})
+        tensor = torch.ones(1, 2)
+
+        loaded = NeMoSpeechLMMTP.load_weights(
+            model,
+            [("backbone.layers.0.mixer.in_proj.weight", tensor), ("llm.mtp.layers.0.eh_proj.weight", tensor)],
+        )
+
+        assert loaded == {"mtp.layers.0.eh_proj.weight"}
+
     def test_mtp_weight_remap_splits_packed_experts(self):
         """Packed Automodel MTP experts must become vLLM per-expert weights."""
         import torch
