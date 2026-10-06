@@ -48,14 +48,15 @@ FP8_MAX = 448.0
 _PERCEPTION_PREFIX = "perception."
 
 
-class FP8Linear(nn.Module):
+class FP8Linear(nn.Linear):
     """Linear layer with FP8 E4M3 weights and static per-tensor scales, run with vLLM's CUTLASS FP8 GEMM.
 
     The module is built empty and filled by ``load_state_dict``: ``weight``,
     ``weight_scale`` and ``input_scale`` are persistent buffers named and shaped like
     ModelOpt's FP8 checkpoint tensors. Dtype casts of an enclosing module convert only
     the bias; the FP8 weight and the float32 scales keep their dtypes and follow
-    device moves.
+    device moves. It subclasses ``nn.Linear`` because encoders choose how to call an
+    input projection with ``isinstance(module, nn.Linear)``.
 
     Args:
         in_features: Input width. CUTLASS needs a multiple of 16.
@@ -74,7 +75,8 @@ class FP8Linear(nn.Module):
         bias_dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
     ) -> None:
-        super().__init__()
+        # nn.Linear.__init__ would allocate full-precision parameters that the FP8 buffers replace.
+        nn.Module.__init__(self)
         if in_features % 16 != 0:
             raise ValueError(f"in_features={in_features} must be a multiple of 16 for the CUTLASS FP8 GEMM")
         self.in_features = in_features
@@ -109,7 +111,8 @@ class FP8Linear(nn.Module):
         import vllm._custom_ops as ops
 
         out_shape = (*x.shape[:-1], self.out_features)
-        xq, x_scale = ops.scaled_fp8_quant(x.reshape(-1, self.in_features), self.input_scale)
+        # The quantization kernel needs a contiguous last dimension; a transposed input reshapes to a strided view.
+        xq, x_scale = ops.scaled_fp8_quant(x.reshape(-1, self.in_features).contiguous(), self.input_scale)
         # CUTLASS wants a column-major B, which the transpose gives as a view.
         out = ops.cutlass_scaled_mm(xq, self.weight.t(), x_scale, self.weight_scale, x.dtype, self.bias)
         return out.reshape(out_shape)
@@ -145,7 +148,9 @@ def build_fp8_encoder(perception: nn.Module, quant_config: Optional[Any]) -> int
     targets = [
         (name, module)
         for name, module in perception.named_modules()
-        if isinstance(module, nn.Linear) and not quant_config.is_layer_excluded(_PERCEPTION_PREFIX + name)
+        if isinstance(module, nn.Linear)
+        and not isinstance(module, FP8Linear)
+        and not quant_config.is_layer_excluded(_PERCEPTION_PREFIX + name)
     ]
     if not targets:
         return 0

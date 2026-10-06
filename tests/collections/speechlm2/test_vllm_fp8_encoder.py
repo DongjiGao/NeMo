@@ -168,6 +168,40 @@ class TestBuildFP8Encoder:
             build_fp8_encoder(perception, _QuantConfig(DECODER_IGNORE + PERCEPTION_IGNORE))
         assert not any(isinstance(m, FP8Linear) for m in perception.modules())
 
+    def test_fp8_layers_count_as_linear_and_are_not_rebuilt(self):
+        perception = _quantized_perception()
+        w_qkv = perception.encoder.asr_encoder.layers[0].attn.w_qkv
+
+        assert isinstance(w_qkv, nn.Linear)
+        assert build_fp8_encoder(perception, _QuantConfig(DECODER_IGNORE + PERCEPTION_IGNORE)) == 0
+        assert perception.encoder.asr_encoder.layers[0].attn.w_qkv is w_qkv
+
+    @pytest.mark.parametrize("encoder_name", ["TransformerEncoder", "ConformerEncoder"])
+    def test_quantized_input_projection_is_called_like_a_linear(self, encoder_name, monkeypatch):
+        from nemo.collections.asr.modules.conformer_encoder import ConformerEncoder
+        from nemo.collections.asr.modules.transformer_encoder import TransformerEncoder
+
+        encoder_cls, kwargs = {
+            "TransformerEncoder": (
+                TransformerEncoder,
+                {"self_attention_model": "no_pos", "sync_max_audio_length": False},
+            ),
+            "ConformerEncoder": (ConformerEncoder, {}),
+        }[encoder_name]
+        encoder = encoder_cls(
+            feat_in=32, d_model=64, n_heads=4, n_layers=1, subsampling=None, subsampling_factor=1, **kwargs
+        ).eval()
+        perception = nn.Module()
+        perception.encoder = encoder
+        build_fp8_encoder(perception, _QuantConfig(DECODER_IGNORE + ["perception.proj"]))
+        monkeypatch.setattr(FP8Linear, "forward", lambda self, x: x.new_zeros(*x.shape[:-1], self.out_features))
+
+        with torch.no_grad():
+            encoded, length = encoder(audio_signal=torch.randn(1, 32, 3), length=torch.tensor([3]))[:2]
+
+        assert isinstance(encoder.pre_encode, FP8Linear)
+        assert encoded.shape == (1, 64, 3) and length.tolist() == [3]
+
     def test_vllm_modelopt_config_selects_the_same_layers(self):
         pytest.importorskip("vllm")
         from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
@@ -316,3 +350,87 @@ def test_fp8_linear_matches_dequantized_reference():
     reference = x_dequant @ (weight_fp8.float() * weight_scale).t() + bias.float()
     assert out.shape == (5, 7, 64)
     torch.testing.assert_close(out.float(), reference, rtol=0.02, atol=0.1)
+
+
+@pytest.mark.skipif(not _fp8_gemm_available(), reason="needs an FP8-capable GPU and vLLM's CUTLASS kernels")
+def test_fp8_linear_accepts_a_strided_input():
+    layer = _quantized_perception().encoder.asr_encoder.layers[0].attn.w_qkv
+    layer.load_state_dict(_checkpoint(layer))
+    layer.to("cuda", torch.bfloat16)
+    x = torch.randn(1, D_MODEL, 7, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+
+    assert not x.reshape(-1, D_MODEL).is_contiguous()
+    torch.testing.assert_close(layer(x), layer(x.contiguous()), rtol=0, atol=0)
+
+
+def _transformer_encoder(**kwargs) -> nn.Module:
+    """A small real TransformerEncoder whose Linear widths suit the CUTLASS FP8 GEMM."""
+    from nemo.collections.asr.modules.transformer_encoder import TransformerEncoder
+
+    return TransformerEncoder(
+        d_model=D_MODEL,
+        n_heads=2,
+        n_layers=N_LAYERS,
+        ff_expansion=1.0,
+        self_attention_model="rope",
+        drop_rate=0.0,
+        dropout_pre_encoder=0.0,
+        sync_max_audio_length=False,
+        **kwargs,
+    ).eval()
+
+
+def _load_random_fp8(perception: nn.Module) -> None:
+    perception.load_state_dict(_checkpoint(perception))
+    perception.to("cuda", torch.bfloat16)
+
+
+@pytest.mark.skipif(not _fp8_gemm_available(), reason="needs an FP8-capable GPU and vLLM's CUTLASS kernels")
+def test_sequence_packed_encoder_runs_quantized_qkv_projections():
+    torch.manual_seed(0)
+    perception = nn.Module()
+    perception.encoder = _transformer_encoder(feat_in=8, subsampling_factor=2)
+    ignore = DECODER_IGNORE + ["perception.encoder.pre_encode*"]
+    assert build_fp8_encoder(perception, _QuantConfig(ignore)) == N_QUANTIZED
+    _load_random_fp8(perception)
+    x = torch.randn(2, 6, D_MODEL, device="cuda", dtype=torch.bfloat16)
+    lengths = torch.tensor([6, 3], device="cuda")
+
+    with torch.no_grad():
+        default = perception.encoder.forward_sequence_packed(x, lengths, bypass_pre_encode=True)
+        fused = perception.encoder.forward_sequence_packed(x, lengths, bypass_pre_encode=True, fused_qkv=True)
+
+    assert default.data.shape == (9, D_MODEL)
+    torch.testing.assert_close(default.data, fused.data, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not _fp8_gemm_available(), reason="needs an FP8-capable GPU and vLLM's CUTLASS kernels")
+def test_independent_dual_encoder_with_a_quantized_asr_branch():
+    from nemo.collections.asr.parts.packed_sequence import pack_encoder_output
+    from nemo.collections.speechlm2.modules.perception import IndependentDualEncoder
+
+    torch.manual_seed(0)
+    branches = {
+        name: _transformer_encoder(feat_in=4, subsampling="feature_stacking", subsampling_factor=2)
+        for name in ("asr", "auxiliary")
+    }
+    perception = nn.Module()
+    perception.encoder = IndependentDualEncoder(branches["asr"], branches["auxiliary"], frame_shift_seconds=0.01)
+    ignore = DECODER_IGNORE + [
+        "perception.encoder.auxiliary_encoder*",
+        "perception.encoder.asr_encoder.pre_encode*",
+    ]
+    assert build_fp8_encoder(perception, _QuantConfig(ignore)) == N_QUANTIZED
+    _load_random_fp8(perception)
+    features = torch.randn(2, 4, 17, device="cuda", dtype=torch.bfloat16)
+    lengths = torch.tensor([17, 10], device="cuda")
+
+    with torch.no_grad():
+        encoded, encoded_lengths = perception.encoder(features, lengths)
+        packed = pack_encoder_output(features.transpose(1, 2), lengths)
+        asr = branches["asr"].forward_sequence_packed(packed, packed.lengths, fused_qkv=True)
+
+    assert encoded.shape == (2, 2 * D_MODEL, 9) and encoded_lengths.tolist() == [9, 5]
+    assert isinstance(branches["asr"].layers[0].attn.w_qkv, FP8Linear)
+    assert not isinstance(branches["auxiliary"].layers[0].attn.w_qkv, FP8Linear)
+    torch.testing.assert_close(encoded[0, :D_MODEL, :9].transpose(0, 1), asr.data[:9], rtol=0, atol=0)
