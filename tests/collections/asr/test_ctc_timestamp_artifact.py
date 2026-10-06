@@ -6,9 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from nemo.collections.common.tokenizers.sentencepiece_tokenizer import (
-    SentencePieceTokenizer,
-)
+from nemo.collections.common.tokenizers.sentencepiece_tokenizer import SentencePieceTokenizer
 from nemo.collections.speechlm2.parts.ctc_timestamp_utils import (
     CTC_TIMESTAMP_ARTIFACT_FORMAT,
     TransformerCTCDecoder,
