@@ -65,7 +65,7 @@ from nemo.collections.speechlm2.vllm.salm.audio import (
 )
 from nemo.collections.speechlm2.vllm.salm.backends import HybridBackend, make_backend
 from nemo.collections.speechlm2.vllm.salm.config import _AUDIO_PLACEHOLDER
-from nemo.collections.speechlm2.vllm.salm.fp8_encoder import build_fp8_encoder
+from nemo.collections.speechlm2.vllm.salm.fp8_encoder import build_fp8_encoder, check_fp8_encoder_weights
 
 _AUDIO_INPUT_DTYPE = torch.float32
 _PERCEPTION_DTYPE = torch.bfloat16
@@ -150,7 +150,7 @@ class NeMoSpeechLMForConditionalGeneration(
                 )
                 self._uses_pe_encoder = _is_parallel_expert_encoder(getattr(self.perception, "encoder", None))
             # Built here, as vLLM builds a quantized decoder, so FP8 weights load directly.
-            build_fp8_encoder(self.perception, getattr(config, "encoder_quantization", None))
+            build_fp8_encoder(self.perception, vllm_config.quant_config)
 
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
 
@@ -291,6 +291,7 @@ class NeMoSpeechLMForConditionalGeneration(
     # ── weight loading ──
 
     def _load_perception_weights(self, perception_weights: dict[str, torch.Tensor]) -> set[str]:
+        check_fp8_encoder_weights(self.perception, perception_weights)
         self.perception = self.perception.to(_PERCEPTION_DTYPE)
         incompatible = self.perception.load_state_dict(perception_weights, strict=False)
 

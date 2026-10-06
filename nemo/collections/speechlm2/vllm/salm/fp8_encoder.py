@@ -12,37 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FP8 audio encoder for SpeechLM checkpoints whose encoder weights are stored in FP8.
+"""FP8 audio encoder for SpeechLM checkpoints quantized with ModelOpt FP8.
 
-The audio encoder runs as plain PyTorch inside the plugin, outside vLLM's
-quantization machinery, so an FP8 encoder is described by its own block in the
-checkpoint's ``config.json``::
+A checkpoint describes its audio encoder's quantization the way it describes its
+decoder's, in the ModelOpt ``quantization_config`` of ``config.json``
+(``quant_algo: FP8``): every Linear of the perception module that no ``ignore``
+entry matches is quantized. Such a layer stores an FP8 E4M3 ``weight``, a float32
+scalar ``weight_scale`` and a float32 scalar ``input_scale``, the static per-tensor
+activation scale, both in the divisor convention ``x_fp8 = x / scale``. A
+speaker-aware checkpoint keeps its diarizer, the ASR encoder's input projection and
+the connector unquantized by listing them::
 
-    "encoder_quantization": {
-        "format": "fp8_e4m3",
-        "weights_prequantized": true,
-        "weight_scale": "per_output_channel",
-        "activation_scale": "static_per_tensor",   # or "dynamic_per_token"
-        "patterns": ["attn.w_qkv", "attn.out_proj", "ffn.net.0", "ffn.net.3"],
-        "activation_amax": {"layers.0.attn.w_qkv": 11.5, ...},
-        "scale_margin": 1.5,
-        "expect_replaced": 128
-    }
+    "ignore": [..., "perception.encoder.diarization_model*",
+               "perception.encoder.asr_encoder.pre_encode*", "perception.proj"]
 
-Every ``nn.Linear`` of the ASR encoder whose name ends with one of ``patterns``
-(matched on whole name components) holds an FP8 E4M3 ``weight`` and a float32
-``weight_scale`` with one entry per output channel. With static activation
-scales, each such layer also needs an ``activation_amax`` entry, keyed by its
-name inside the ASR encoder; the input scale is ``amax * scale_margin / 448``.
-The diarizer of a speaker-aware encoder is never quantized: its output is fused
-additively into the ASR features.
+The audio encoder runs as plain PyTorch inside the plugin rather than through vLLM's
+quantized layers, so ``build_fp8_encoder`` applies vLLM's exclusion rule to the
+perception Linears itself and builds ``FP8Linear`` layers for the quantized ones
+when the model is constructed; the checkpoint then loads into them directly.
 
-``build_fp8_encoder`` creates these layers when the model is constructed, as vLLM
-does for a quantized decoder, so the checkpoint loads into them directly.
+A ``quantization_config`` without any ``perception`` entry predates encoder
+quantization (its decoder was quantized on its own), so its encoder stays unquantized.
 """
 
-from collections.abc import Callable
-from typing import Optional
+from collections.abc import Callable, Mapping
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -51,26 +45,22 @@ from nemo.utils import logging
 
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = 448.0
-SUPPORTED_FORMAT = "fp8_e4m3"
-_ACTIVATION_SCALES = ("static_per_tensor", "dynamic_per_token")
+_PERCEPTION_PREFIX = "perception."
 
 
 class FP8Linear(nn.Module):
-    """Linear layer with FP8 E4M3 weights from the checkpoint, run with vLLM's CUTLASS FP8 GEMM.
+    """Linear layer with FP8 E4M3 weights and static per-tensor scales, run with vLLM's CUTLASS FP8 GEMM.
 
-    The module is built empty and filled by ``load_state_dict``: ``weight`` and
-    ``weight_scale`` are persistent buffers named like the checkpoint tensors.
-    Weights are scaled per output channel. Activations are quantized with a
-    static per-tensor scale when ``input_scale`` is given, otherwise dynamically
-    per token. Dtype casts of an enclosing module convert only the bias; the
-    FP8 weight and the float32 scales keep their dtypes and follow device moves.
+    The module is built empty and filled by ``load_state_dict``: ``weight``,
+    ``weight_scale`` and ``input_scale`` are persistent buffers named and shaped like
+    ModelOpt's FP8 checkpoint tensors. Dtype casts of an enclosing module convert only
+    the bias; the FP8 weight and the float32 scales keep their dtypes and follow
+    device moves.
 
     Args:
         in_features: Input width. CUTLASS needs a multiple of 16.
         out_features: Output width.
         bias: Whether the layer has a bias.
-        input_scale: Static activation scale (divisor convention, ``xq = x / scale``),
-            or None for dynamic per-token scaling.
         bias_dtype: Dtype of the bias parameter.
         device: Device for the empty buffers.
     """
@@ -81,7 +71,6 @@ class FP8Linear(nn.Module):
         out_features: int,
         *,
         bias: bool,
-        input_scale: Optional[torch.Tensor] = None,
         bias_dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
     ) -> None:
@@ -91,11 +80,8 @@ class FP8Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.register_buffer("weight", torch.empty(out_features, in_features, dtype=FP8_DTYPE, device=device))
-        self.register_buffer("weight_scale", torch.empty(out_features, dtype=torch.float32, device=device))
-        if input_scale is not None:
-            self.register_buffer("input_scale", input_scale.float().reshape(1).to(device), persistent=False)
-        else:
-            self.input_scale = None
+        self.register_buffer("weight_scale", torch.empty((), dtype=torch.float32, device=device))
+        self.register_buffer("input_scale", torch.empty((), dtype=torch.float32, device=device))
         self.bias = None
         if bias:
             self.bias = nn.Parameter(torch.empty(out_features, dtype=bias_dtype, device=device), requires_grad=False)
@@ -119,130 +105,118 @@ class FP8Linear(nn.Module):
         return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Quantize ``x`` to FP8 and multiply by the FP8 weight, returning ``x.dtype``."""
+        """Quantize ``x`` to FP8 with the static input scale and multiply by the FP8 weight, returning ``x.dtype``."""
         import vllm._custom_ops as ops
 
         out_shape = (*x.shape[:-1], self.out_features)
-        x2d = x.reshape(-1, self.in_features)
-        if self.input_scale is not None:
-            xq, x_scale = ops.scaled_fp8_quant(x2d, self.input_scale)
-        else:
-            xq, x_scale = ops.scaled_fp8_quant(x2d, None, use_per_token_if_dynamic=True)
-        # CUTLASS wants a column-major B and an [out, 1] weight scale; both are views.
-        out = ops.cutlass_scaled_mm(xq, self.weight.t(), x_scale, self.weight_scale.unsqueeze(-1), x.dtype, self.bias)
+        xq, x_scale = ops.scaled_fp8_quant(x.reshape(-1, self.in_features), self.input_scale)
+        # CUTLASS wants a column-major B, which the transpose gives as a view.
+        out = ops.cutlass_scaled_mm(xq, self.weight.t(), x_scale, self.weight_scale, x.dtype, self.bias)
         return out.reshape(out_shape)
 
     def extra_repr(self) -> str:
-        """Summarize the layer shape and activation scaling mode."""
-        mode = "static_per_tensor" if self.input_scale is not None else "dynamic_per_token"
-        return f"in_features={self.in_features}, out_features={self.out_features}, fp8_e4m3, activations={mode}"
+        """Summarize the layer shape and quantization."""
+        return f"in_features={self.in_features}, out_features={self.out_features}, fp8_e4m3, static per-tensor scales"
 
 
-def _asr_encoder(perception: nn.Module) -> nn.Module:
-    """Return the encoder that holds the quantized Linears.
-
-    A speaker-aware encoder keeps its ASR branch in ``asr_encoder`` next to the
-    diarizer, so selecting that subtree leaves the diarizer out by construction.
-    """
-    encoder = getattr(perception, "encoder", None)
-    if encoder is None:
-        raise ValueError("perception module has no 'encoder' to quantize")
-    return getattr(encoder, "asr_encoder", encoder)
-
-
-def _matches(name: str, patterns: tuple[str, ...]) -> bool:
-    """Whether ``name`` ends with one of ``patterns`` on whole name components, so ``net.0`` misses ``subnet.0``."""
-    return any(name == pattern or name.endswith("." + pattern) for pattern in patterns)
-
-
-def build_fp8_encoder(perception: nn.Module, quant_cfg: Optional[dict]) -> int:
-    """Build empty ``FP8Linear`` layers in place of the ASR encoder's quantized Linears.
+def build_fp8_encoder(perception: nn.Module, quant_config: Optional[Any]) -> int:
+    """Build empty ``FP8Linear`` layers in place of the perception Linears that ``quant_config`` quantizes.
 
     Call this when the model is constructed, before any weights load: the
-    checkpoint's FP8 ``weight`` and ``weight_scale`` then load into these layers
-    directly, and later dtype casts of the perception module leave them intact.
+    checkpoint's FP8 tensors then load into these layers directly, and later dtype
+    casts of the perception module leave them intact.
 
     Args:
-        perception: The SpeechLM perception module.
-        quant_cfg: The checkpoint's ``encoder_quantization`` block, or None.
+        perception: The SpeechLM perception module, whose names start with ``perception.`` in the checkpoint.
+        quant_config: vLLM's quantization config for the checkpoint, or None.
 
     Returns:
-        The number of Linears replaced; 0 when the checkpoint has no prequantized encoder. A block
-        without ``weights_prequantized`` is ignored with a warning: the encoder then runs unquantized.
+        The number of Linears replaced; 0 when ``quant_config`` does not quantize the encoder.
 
     Raises:
-        ValueError: If the block requests an unsupported format or scaling mode, has no
-            patterns, or lacks a static activation amax for a quantized layer.
-        RuntimeError: If the number of replaced Linears differs from ``expect_replaced``.
+        NotImplementedError: If the encoder is quantized with anything but ModelOpt FP8.
+        ValueError: If a quantized Linear's input width does not suit the CUTLASS FP8 GEMM.
     """
-    if not quant_cfg:
+    exclude_modules = getattr(quant_config, "exclude_modules", None) or ()
+    if not hasattr(quant_config, "is_layer_excluded") or not any(
+        str(entry).startswith("perception") for entry in exclude_modules
+    ):
         return 0
-    if not quant_cfg.get("weights_prequantized"):
-        logging.warning(
-            "config.json has an encoder_quantization block without weights_prequantized; only prequantized "
-            "FP8 encoder weights are supported, so the audio encoder runs unquantized"
-        )
-        return 0
-    if quant_cfg.get("format") != SUPPORTED_FORMAT:
-        raise ValueError(
-            f"encoder_quantization.format={quant_cfg.get('format')!r} is not supported; expected {SUPPORTED_FORMAT!r}"
-        )
-    weight_scale = quant_cfg.get("weight_scale", "per_output_channel")
-    if weight_scale != "per_output_channel":
-        raise ValueError(f"encoder_quantization.weight_scale={weight_scale!r} is not supported")
-    activation_scale = quant_cfg.get("activation_scale", "static_per_tensor")
-    if activation_scale not in _ACTIVATION_SCALES:
-        raise ValueError(
-            f"encoder_quantization.activation_scale={activation_scale!r} is not one of {_ACTIVATION_SCALES}"
-        )
-    patterns = tuple(quant_cfg.get("patterns") or ())
-    if not patterns:
-        raise ValueError("encoder_quantization.patterns is required to locate the FP8 Linears")
-
-    encoder = _asr_encoder(perception)
     targets = [
         (name, module)
-        for name, module in encoder.named_modules()
-        if isinstance(module, nn.Linear) and _matches(name, patterns)
+        for name, module in perception.named_modules()
+        if isinstance(module, nn.Linear) and not quant_config.is_layer_excluded(_PERCEPTION_PREFIX + name)
     ]
-    static = activation_scale == "static_per_tensor"
-    amax = quant_cfg.get("activation_amax") or {}
-    if static:
-        missing = [name for name, _ in targets if name not in amax]
-        if missing:
-            raise ValueError(
-                f"encoder_quantization uses static activation scales but has no activation_amax for {len(missing)} "
-                f"quantized Linear(s), e.g. {missing[:3]}"
-            )
-    expected = quant_cfg.get("expect_replaced")
-    if expected is not None and int(expected) != len(targets):
-        raise RuntimeError(
-            f"encoder_quantization.expect_replaced={expected} but {len(targets)} Linears match the patterns; "
-            "refusing to load a checkpoint whose quantized layers do not line up with the encoder"
+    if not targets:
+        return 0
+    scheme = (quant_config.get_name(), getattr(quant_config, "quant_method", None))
+    if scheme != ("modelopt", "FP8"):
+        raise NotImplementedError(
+            f"quantization_config quantizes {len(targets)} audio encoder Linear(s), e.g. "
+            f"{_PERCEPTION_PREFIX + targets[0][0]!r}, as {scheme[0]} {scheme[1]}; the audio encoder supports only "
+            "ModelOpt FP8 with static per-tensor scales"
         )
-    margin = float(quant_cfg.get("scale_margin", 1.0))
 
-    for name, module in targets:
-        input_scale = None
-        if static:
-            input_scale = torch.tensor(max(float(amax[name]) * margin / FP8_MAX, 1e-12))
-        parent_name, _, child_name = name.rpartition(".")
-        parent = encoder.get_submodule(parent_name) if parent_name else encoder
-        setattr(
-            parent,
-            child_name,
+    replacements = [
+        (
+            name,
             FP8Linear(
                 module.in_features,
                 module.out_features,
                 bias=module.bias is not None,
-                input_scale=input_scale,
                 bias_dtype=module.bias.dtype if module.bias is not None else torch.bfloat16,
                 device=module.weight.device,
             ),
         )
+        for name, module in targets
+    ]
+    for name, layer in replacements:
+        parent_name, _, child_name = name.rpartition(".")
+        parent = perception.get_submodule(parent_name) if parent_name else perception
+        setattr(parent, child_name, layer)
 
-    logging.info(
-        f"Prequantized encoder: {len(targets)} FP8 Linears prepared for load, "
-        f"{len(targets) if static else 0} static act scales"
+    logging.info(f"FP8 audio encoder: {len(replacements)} Linears built from quantization_config")
+    return len(replacements)
+
+
+def check_fp8_encoder_weights(perception: nn.Module, weights: Mapping[str, torch.Tensor]) -> None:
+    """Fail if the checkpoint's FP8 encoder tensors do not match the layers ``build_fp8_encoder`` built.
+
+    ``load_state_dict`` converts dtypes silently, so FP8 data copied into a bfloat16
+    Linear, or bfloat16 data into an ``FP8Linear``, would load without an error.
+
+    Args:
+        perception: The perception module after ``build_fp8_encoder``.
+        weights: The checkpoint's perception tensors, named relative to the perception module.
+
+    Raises:
+        ValueError: If an ``FP8Linear`` lacks an FP8 weight or a per-tensor scale, or the
+            checkpoint stores an FP8 weight for a layer that is not quantized.
+    """
+    fp8_layers = {name for name, module in perception.named_modules() if isinstance(module, FP8Linear)}
+    problems = []
+    for name in sorted(fp8_layers):
+        weight = weights.get(f"{name}.weight")
+        if weight is None or weight.dtype != FP8_DTYPE:
+            problems.append(f"{name}.weight is {'missing' if weight is None else weight.dtype}, not {FP8_DTYPE}")
+        for scale_name in ("weight_scale", "input_scale"):
+            scale = weights.get(f"{name}.{scale_name}")
+            if scale is None or scale.numel() != 1:
+                problems.append(
+                    f"{name}.{scale_name} is {'missing' if scale is None else tuple(scale.shape)}, not one scale"
+                )
+    unquantized = sorted(
+        key
+        for key, tensor in weights.items()
+        if tensor.dtype == FP8_DTYPE and key.rpartition(".")[0] not in fp8_layers
     )
-    return len(targets)
+    problems.extend(f"{key} is FP8 but quantization_config leaves its layer unquantized" for key in unquantized)
+    if problems:
+        shown = "; ".join(problems[:5]) + (f"; and {len(problems) - 5} more" if len(problems) > 5 else "")
+        hint = (
+            " (config.json's quantization_config must describe the encoder's FP8 layers; an "
+            "encoder_quantization block is not read)"
+            if unquantized
+            else ""
+        )
+        raise ValueError(f"FP8 audio encoder weights do not match quantization_config: {shown}{hint}")
