@@ -109,9 +109,6 @@ _ALIGN_BATCH = 16
 # padded to the longest.
 _SERVER_ALIGN_RECORDS = 32
 
-# Fields every prepared batch in a merged search must share.
-_MERGEABLE_BATCH_KEYS = ("config", "num_speaker_columns", "diarization_frame_seconds", "diarization_max_speaker_count")
-
 # Weight of the Sortformer speaker-activity prior in CTC alignment, overridable per
 # checkpoint as ctc_timestamps.speaker_logprob_weight. The aligner's own default is
 # 0.0, which lets words in overlapped speech drift out of their speaker's turns.
@@ -153,7 +150,7 @@ _lock = threading.RLock()
 _batchers: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
-def register_aligner(aligner: Any) -> None:
+def register_aligner(aligner: Any, special_tokens: Sequence[str] = ()) -> None:
     """Publish the checkpoint's CTC timestamp aligner, which also turns input capture on.
 
     The runner hook and the worker methods reached through ``collective_rpc`` never
@@ -162,8 +159,11 @@ def register_aligner(aligner: Any) -> None:
 
     Args:
         aligner (Any): The ``MultiSpeakerSOTWordTimestampAligner`` holding the deferred CTC head.
+        special_tokens (Sequence[str]): The LLM tokenizer's special tokens, which preparing removes
+            from each transcript, except ``<spk:N>`` speaker tags.
     """
     _registry["aligner"] = aligner
+    _registry["special_tokens"] = tuple(special_tokens)
 
 
 def active_aligner() -> Any:
@@ -225,6 +225,22 @@ def ctc_adapter_path(ctc_config: Any) -> str | None:
     if isinstance(ctc_config, dict):
         return ctc_config.get("adapter_path")
     return getattr(ctc_config, "adapter_path", None)
+
+
+def tokenizer_special_tokens(model_config: Any) -> tuple[str, ...]:
+    """Return the special tokens of the model's tokenizer, which decoding can leave in a transcript.
+
+    Args:
+        model_config (Any): vLLM's ``ModelConfig``. ``None``, or a config with
+            ``skip_tokenizer_init``, has no tokenizer and so no special tokens.
+    """
+    if model_config is None or getattr(model_config, "skip_tokenizer_init", False):
+        return ()
+    try:
+        from vllm.tokenizers import cached_tokenizer_from_config
+    except ImportError:  # vLLM releases before vllm.tokenizers
+        from vllm.transformers_utils.tokenizer import cached_tokenizer_from_config
+    return tuple(getattr(cached_tokenizer_from_config(model_config), "all_special_tokens", ()))
 
 
 def take_step_hashes(count: int) -> list[str] | None:
@@ -549,7 +565,8 @@ def prepare_finished_requests(finished: Sequence[tuple[str, str]], *, release: b
     The half of :func:`align_finished_requests` that needs the captured inputs, the CTC head
     and the tokenizer, so it runs where the inputs live. Each prepared batch holds, per
     request, only the log-prob columns its transcript's tokens use; once prepared, the
-    captures are no longer needed.
+    captures are no longer needed. Each transcript first loses the special tokens the
+    decoder kept, except ``<spk:N>`` speaker tags (``clean_sot_transcript``).
 
     Args:
         finished (Sequence[tuple[str, str]]): As in :func:`align_finished_requests`.
@@ -563,14 +580,18 @@ def prepare_finished_requests(finished: Sequence[tuple[str, str]], *, release: b
     Raises:
         Exception: Any error other than ``ValueError`` while preparing.
     """
+    from nemo.collections.speechlm2.parts.ctc_timestamp_utils import MultiSpeakerSOTWordTimestampAligner
+
     reply = {"count": len(finished), "batches": []}
     aligner = active_aligner()
     if aligner is None:
         return reply
+    special_tokens = _registry.get("special_tokens", ())
     pending, no_audio, multi_audio, evicted = [], [], [], []
     with _lock:
         for index, (request_id, text) in enumerate(finished):
-            if not text.strip():
+            text = MultiSpeakerSOTWordTimestampAligner.clean_sot_transcript(text, special_tokens)
+            if not text:
                 continue
             hashes = mm_hashes_for_request(request_id)
             if not hashes:
@@ -768,7 +789,9 @@ def _batcher() -> _AlignmentBatcher:
 
 def _align_group(group: list[dict]) -> list[list[dict | None] | BaseException]:
     """Align queued prepared batches in one search; per batch after an error, so it reaches only its request."""
-    merged = _merge_prepared(group)
+    from nemo.collections.speechlm2.parts.ctc_timestamp_utils import merge_prepared_batches
+
+    merged = merge_prepared_batches(group)
     if merged is not None:
         try:
             results = _align_batch(merged)
@@ -787,24 +810,6 @@ def _align_group(group: list[dict]) -> list[list[dict | None] | BaseException]:
         except Exception as error:  # noqa: BLE001
             outcomes.append(error)
     return outcomes
-
-
-def _merge_prepared(group: list[dict]) -> dict | None:
-    """One prepared batch with the records of all of ``group``, or ``None`` when they cannot share a search.
-
-    Each stream's search is independent and frames past a record's length are never read,
-    so a merged search aligns every record exactly as its own batch would.
-    """
-    first = group[0]
-    if len(group) == 1:
-        return first
-    if any(prepared[key] != first[key] for prepared in group[1:] for key in _MERGEABLE_BATCH_KEYS):
-        return None
-    return {
-        **first,
-        "max_ctc_frames": max(prepared["max_ctc_frames"] for prepared in group),
-        "records": [record for prepared in group for record in prepared["records"]],
-    }
 
 
 def _pack(value: Any) -> Any:

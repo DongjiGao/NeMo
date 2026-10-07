@@ -75,6 +75,7 @@ from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
     require_v1_model_runner,
     store_alignment_states,
     take_step_hashes,
+    tokenizer_special_tokens,
 )
 from nemo.utils import logging
 
@@ -223,7 +224,7 @@ class NeMoSpeechLMForConditionalGeneration(
         aligner = get_ctc_timestamp_aligner(encoder, adapter_path, device)
         aligner.speaker_logprob_weight = speaker_prior_weight
 
-        register_aligner(aligner)
+        register_aligner(aligner, tokenizer_special_tokens(vllm_config.model_config))
         install_encoder_cache_binding()
         logging.info("[NeMoSpeechLM] CTC timestamps enabled from checkpoint config: %s", adapter_path)
 

@@ -41,7 +41,6 @@ class _FakeAligner:
             raise RuntimeError("kernel failure")
         return {
             "config": {},
-            "max_ctc_frames": 4,
             "num_speaker_columns": 2,
             "diarization_frame_seconds": 0.01,
             "diarization_max_speaker_count": 4,
@@ -509,6 +508,16 @@ def test_speaker_prior_weight_defaults_and_rejects_negative_values():
     assert ct.read_speaker_prior_weight(SimpleNamespace(speaker_logprob_weight=0)) == 0.0
     with pytest.raises(ValueError, match="non-negative"):
         ct.read_speaker_prior_weight({"speaker_logprob_weight": -0.1})
+
+
+def test_special_tokens_come_from_the_model_tokenizer(monkeypatch):
+    vllm_tokenizers = pytest.importorskip("vllm.tokenizers")
+    tokenizer = SimpleNamespace(all_special_tokens=["<s>", "<spk:0>"])
+    monkeypatch.setattr(vllm_tokenizers, "cached_tokenizer_from_config", lambda model_config: tokenizer)
+
+    assert ct.tokenizer_special_tokens(SimpleNamespace(skip_tokenizer_init=False)) == ("<s>", "<spk:0>")
+    assert ct.tokenizer_special_tokens(SimpleNamespace(skip_tokenizer_init=True)) == ()
+    assert ct.tokenizer_special_tokens(None) == ()
 
 
 def test_model_runner_v2_is_refused():
@@ -984,6 +993,16 @@ def test_transcripts_without_speaker_tags_are_reported(aligner, caplog):
     _align_one("req", "hello world", release=True)
 
     assert "no <spk:N> speaker tags" in caplog.text
+
+
+def test_prepared_transcripts_lose_special_tokens_but_keep_speaker_tags(aligner):
+    ct.register_aligner(aligner, ["<|im_end|>", "<spk:0>"])
+    _capture(1, 4, ["hash-a"])
+    ct._record_request_hashes([("req", "hash-a")])
+
+    _align_one("req", "<spk:0> hi <|im_end|>", release=True)
+
+    assert aligner.calls[-1][1] == ["<spk:0> hi"]
 
 
 def test_requests_without_recorded_audio_are_not_reported_as_evicted(aligner, caplog):
