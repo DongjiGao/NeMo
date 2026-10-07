@@ -251,7 +251,7 @@ def test_ctc_timestamp_loader_disables_distributed_length_sync(monkeypatch, tmp_
 
 
 @pytest.mark.unit
-def test_ctc_timestamp_loader_records_the_encoder_windows_and_subsampling(monkeypatch, tmp_path):
+def test_ctc_timestamp_loader_copies_the_encoder_windows_and_subsampling_on_every_call(monkeypatch, tmp_path):
     adapter_path = tmp_path / "adapter.pt"
     adapter_path.touch()
     adapter = CTCTimestampArtifact(decoder=nn.Linear(4, 4), tokenizer=object(), decoder_config={})
@@ -269,6 +269,11 @@ def test_ctc_timestamp_loader_records_the_encoder_windows_and_subsampling(monkey
     assert (aligner.online_inference_length, aligner.chunk_left_context, aligner.chunk_right_context) == (500, 50, 25)
     assert aligner.subsampling_factor == 8
     assert all(value is not encoder for value in vars(aligner).values())
+
+    encoder.online_inference_length, encoder.chunk_left_context, encoder.chunk_right_context = 250, 40, 10
+
+    assert get_ctc_timestamp_aligner(encoder, str(adapter_path), torch.device("cpu")) is aligner
+    assert (aligner.online_inference_length, aligner.chunk_left_context, aligner.chunk_right_context) == (250, 40, 10)
 
 
 @pytest.mark.unit

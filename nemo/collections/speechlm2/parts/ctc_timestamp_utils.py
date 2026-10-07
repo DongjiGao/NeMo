@@ -321,7 +321,8 @@ class MultiSpeakerSOTWordTimestampAligner:
 
         Windows follow the encoder's online inference: ``online_inference_length`` core
         frames, each decoded with ``chunk_left_context`` and ``chunk_right_context`` frames of
-        context, as recorded when the aligner was built (:func:`get_ctc_timestamp_aligner`).
+        context. :func:`get_ctc_timestamp_aligner` copies these settings from the encoder on
+        every call.
 
         Args:
             timestamp_inputs (Any): ``CTCTimestampInputs`` whose ``asr_encoded`` is shaped ``(B, D, T)``.
@@ -1546,8 +1547,8 @@ def get_ctc_timestamp_aligner(
 ) -> MultiSpeakerSOTWordTimestampAligner:
     """Load and cache an inference-only aligner without registering it in ``owner``'s module tree.
 
-    The aligner copies the encoder's deferred-head windows and subsampling factor here and keeps no
-    reference to the encoder.
+    Every call copies the encoder's deferred-head windows and subsampling factor onto the cached
+    aligner, so a change to them reaches it. The aligner keeps no reference to the encoder.
     """
     if not isinstance(artifact_path, str) or not artifact_path:
         raise ValueError("ctc_timestamp_model_path must be a non-empty lightweight artifact path.")
@@ -1557,18 +1558,15 @@ def get_ctc_timestamp_aligner(
         parameter = next(owner.parameters(), None)
         dtype = parameter.dtype if parameter is not None and device.type != "cpu" else torch.float32
         artifact = load_ctc_timestamp_artifact(resolved_path, map_location=device, dtype=dtype)
-        pee = getattr(owner, "encoder", owner)
-        aligner = MultiSpeakerSOTWordTimestampAligner(
-            ctc_decoder=artifact.decoder,
-            tokenizer=artifact.tokenizer,
-            online_inference_length=int(getattr(owner, "online_inference_length", 0)),
-            chunk_left_context=int(getattr(owner, "chunk_left_context", 0)),
-            chunk_right_context=int(getattr(owner, "chunk_right_context", 0)),
-            subsampling_factor=getattr(pee, "subsampling_factor", 1),
-        )
+        aligner = MultiSpeakerSOTWordTimestampAligner(ctc_decoder=artifact.decoder, tokenizer=artifact.tokenizer)
         owner.__dict__["_ctc_timestamp_extractor_cache"] = (resolved_path, aligner)
         cached = (resolved_path, aligner)
     aligner = cached[1]
+    pee = getattr(owner, "encoder", owner)
+    aligner.online_inference_length = int(getattr(owner, "online_inference_length", 0))
+    aligner.chunk_left_context = int(getattr(owner, "chunk_left_context", 0))
+    aligner.chunk_right_context = int(getattr(owner, "chunk_right_context", 0))
+    aligner.subsampling_factor = int(getattr(pee, "subsampling_factor", 1))
     parameter = next(owner.parameters(), None)
     dtype = parameter.dtype if parameter is not None and device.type != "cpu" else torch.float32
     aligner.ctc_decoder.to(device=device, dtype=dtype).eval()
