@@ -17,6 +17,7 @@
 import asyncio
 import sys
 import threading
+import weakref
 from collections import deque
 from types import SimpleNamespace
 
@@ -105,6 +106,7 @@ def _align_one(request_id, text, *, release):
 def aligner(monkeypatch):
     monkeypatch.setattr(ct, "_store", {})
     monkeypatch.setattr(ct, "_request_hashes", {})
+    monkeypatch.setattr(ct, "_request_items", {})
     monkeypatch.setattr(ct, "_hash_owners", {})
     monkeypatch.setattr(ct, "_engine_cached", set())
     monkeypatch.setattr(ct, "_external_ids", {})
@@ -163,7 +165,7 @@ def test_a_shared_capture_is_deleted_once_its_last_owner_is_aligned(aligner, cap
     ct._record_request_hashes([("req-1", "hash-a"), ("req-2", "hash-a")])
 
     assert _words(_align_one("req-1", "a", release=True)) == ["a"]
-    assert "hash-a" in ct._store and _align_one("req-1", "a", release=True) == ct._empty_result()
+    assert "hash-a" in ct._store and _align_one("req-1", "a", release=True) == ct._empty_result("no_capture")
     assert "already aligned or released" in caplog.text
 
     assert _words(_align_one("req-2", "b", release=True)) == ["b"]
@@ -194,6 +196,7 @@ def test_one_unalignable_transcript_does_not_cost_the_batch(aligner):
     results = ct.align_finished_requests([("req-a", "x"), ("req-b", "unalignable"), ("req-c", "y z")], release=True)
 
     assert [_words(result) for result in results] == [["x"], [], ["y", "z"]]
+    assert [result["error"] for result in results] == [None, "alignment_failed", None]
 
 
 def test_diarization_segments_and_speaker_mapping_pass_through(aligner):
@@ -445,9 +448,23 @@ def test_request_with_several_audio_items_gets_no_timestamps(aligner):
 
     results = ct.align_finished_requests([("two-clips", "one two"), ("one-clip", "three")], release=True)
 
-    assert results[0] == ct._empty_result()
+    assert results[0] == ct._empty_result("multiple_audio")
     assert _words(results[1]) == ["three"]
     assert [texts for _, texts, _ in aligner.calls] == [["three"]]
+
+
+def test_a_request_with_the_same_clip_twice_gets_no_timestamps(aligner):
+    _capture(1, 4, ["hash-a"])
+    clip = SimpleNamespace(identifier="hash-a")
+    twice = SimpleNamespace(req_id="twice", mm_features=[clip, clip])
+    once = SimpleNamespace(req_id="once", mm_features=[clip])
+    ct._record_new_requests(SimpleNamespace(scheduled_new_reqs=[twice, once]))
+
+    results = ct.align_finished_requests([("twice", "one two"), ("once", "three")], release=True)
+
+    assert results[0] == ct._empty_result("multiple_audio")
+    assert _words(results[1]) == ["three"]
+    assert ct._request_items == {}
 
 
 def test_a_step_whose_rows_do_not_match_its_hashes_keeps_no_captures(aligner, caplog):
@@ -527,7 +544,7 @@ def test_model_runner_v2_is_refused():
         ct.require_v1_model_runner(SimpleNamespace(use_v2_model_runner=True))
 
 
-def test_byte_budget_evicts_least_recently_used_but_keeps_the_newest(aligner, monkeypatch, caplog):
+def test_byte_budget_evicts_unowned_captures_oldest_first_but_keeps_the_newest(aligner, monkeypatch, caplog):
     monkeypatch.setattr(ct.logging, "once_logged", set())
     _capture(3, 4, ["hash-a", "hash-b", "hash-c"])
     ct._compact_ready()
@@ -544,6 +561,47 @@ def test_byte_budget_evicts_least_recently_used_but_keeps_the_newest(aligner, mo
     assert caplog.text.count("Evicting CTC timestamp captures") == 1
 
 
+def test_owned_captures_are_kept_and_new_ones_refused_when_they_fill_the_budget(aligner, monkeypatch, caplog):
+    monkeypatch.setattr(ct.logging, "once_logged", set())
+    _capture(1, 4, ["hash-a"])
+    ct._record_request_hashes([("req-a", "hash-a")])
+    ct._compact_ready()
+    monkeypatch.setenv("NEMO_CTC_TIMESTAMP_RETAIN_GB", str(1.5 * ct._store["hash-a"]["nbytes"] / 1e9))
+
+    # The next step encodes req-b's audio while req-a still waits for alignment.
+    _capture(1, 4, ["hash-b"])
+    ct._record_request_hashes([("req-b", "hash-b")])
+    ct._trim_store(["hash-b"])
+
+    assert list(ct._store) == ["hash-a"] and "new captures are refused" in caplog.text
+    results = ct.align_finished_requests([("req-a", "kept"), ("req-b", "refused")], release=True)
+    assert _words(results[0]) == ["kept"] and results[0]["error"] is None
+    assert results[1] == ct._empty_result("capture_unavailable")
+
+
+def test_captures_no_request_owns_are_evicted_before_new_ones_are_refused(aligner, monkeypatch):
+    _capture(2, 4, ["hash-old", "hash-a"])
+    ct._follow_engine_cache(encoded=["hash-old"])
+    ct._record_request_hashes([("req-old", "hash-old"), ("req-a", "hash-a")])
+    _align_one("req-old", "done", release=True)
+    monkeypatch.setenv("NEMO_CTC_TIMESTAMP_RETAIN_GB", str(2.5 * ct._store["hash-a"]["nbytes"] / 1e9))
+
+    _capture(1, 4, ["hash-b"])
+    ct._record_request_hashes([("req-b", "hash-b")])
+    ct._trim_store(["hash-b"])
+
+    # vLLM still caches hash-old's audio, but no request needs its capture.
+    assert list(ct._store) == ["hash-a", "hash-b"]
+
+
+def test_an_empty_transcript_has_no_words_and_no_error(aligner):
+    _capture(1, 4, ["hash-a"])
+    ct._record_request_hashes([("req", "hash-a")])
+
+    assert _align_one("req", " ", release=True) == ct._empty_result()
+    assert aligner.calls == []
+
+
 def test_reencoded_audio_replaces_its_entry_as_the_most_recent(aligner):
     _capture(1, 4, ["hash-a"])
     first = ct._store["hash-a"]
@@ -552,6 +610,25 @@ def test_reencoded_audio_replaces_its_entry_as_the_most_recent(aligner):
 
     assert list(ct._store) == ["hash-b", "hash-a"]
     assert first["dropped"] and ct._store["hash-a"]["asr_encoded"].shape[-1] == 3
+
+
+def test_a_failed_batch_is_freed_before_its_requests_are_retried_one_by_one(aligner, monkeypatch):
+    failed_inputs = []
+
+    def prepare(timestamp_inputs, sot_transcripts, audio_durations):
+        if len(sot_transcripts) > 1:
+            failed_inputs.append(weakref.ref(timestamp_inputs.asr_encoded))
+            raise RuntimeError("CUDA out of memory")
+        assert all(ref() is None for ref in failed_inputs)
+        return _FakeAligner.prepare_from_inputs(aligner, timestamp_inputs, sot_transcripts, audio_durations)
+
+    monkeypatch.setattr(aligner, "prepare_from_inputs", prepare)
+    _capture(2, 4, ["hash-a", "hash-b"])
+    ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b")])
+
+    results = ct.align_finished_requests([("req-a", "x"), ("req-b", "y")], release=True)
+
+    assert [_words(result) for result in results] == [["x"], ["y"]] and len(failed_inputs) == 1
 
 
 def test_unexpected_alignment_errors_are_raised_not_hidden(aligner):
@@ -667,7 +744,8 @@ def test_offline_alignment_refuses_a_model_without_timestamps(monkeypatch):
 
     with pytest.raises(RuntimeError, match="not enabled"):
         ct._worker_prepare_requests(None, [("req", "<spk:0> hi")])
-    assert ct._worker_prepare_requests(None, [("req", "<spk:0> hi")], True, False) == {"count": 1, "batches": []}
+    reply = ct._worker_prepare_requests(None, [("req", "<spk:0> hi")], True, False)
+    assert ct._align_reply([reply]) == [ct._empty_result("not_enabled")]
 
 
 def test_adapter_on_an_encoder_without_timestamp_support_is_refused():
@@ -903,6 +981,7 @@ def test_an_opted_in_chat_completion_gets_ctc_timestamps_and_releases_its_captur
         ("there", 0.2, 0.28, "0"),
     ]
     assert timestamps["diarization"] == [{"speaker": 1, "start": 0.05, "end": 0.93}]
+    assert timestamps["error"] is None
     assert server.rpcs == [ct.WORKER_PREPARE_METHOD] and ct._store == {}
 
 
@@ -1006,5 +1085,7 @@ def test_prepared_transcripts_lose_special_tokens_but_keep_speaker_tags(aligner)
 
 
 def test_requests_without_recorded_audio_are_not_reported_as_evicted(aligner, caplog):
-    assert ct.align_finished_requests([("text-only", "<spk:0> hello")], release=True) == [ct._empty_result()]
+    assert ct.align_finished_requests([("text-only", "<spk:0> hello")], release=True) == [
+        ct._empty_result("no_capture")
+    ]
     assert "No capture is recorded" in caplog.text and "evicted" not in caplog.text

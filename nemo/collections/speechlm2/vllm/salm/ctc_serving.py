@@ -23,7 +23,8 @@ audio's alignment inputs while it generates. Start the server with::
 and :func:`ctc_timestamp_middleware` aligns the finished transcript of such a request
 through :func:`align_async`, the same worker method offline callers reach, and adds
 the result to the response as a top-level ``ctc_timestamps`` field in the offline
-format: ``words``, ``diarization`` and ``speaker_tag_to_diarization_speaker``. vLLM's
+format: ``words``, ``diarization``, ``speaker_tag_to_diarization_speaker`` and
+``error``, which names why a result has no timestamps. vLLM's
 chat route serves the request itself, API-key check included; every other request
 passes through untouched.
 
@@ -138,8 +139,8 @@ def _reported_request_id(completion: dict, predicted: str) -> str:
     if reported != predicted:
         logging.warning(
             "[NeMoSpeechLM] vLLM reported chat request %s, not the predicted %s (logged once): its request id "
-            "scheme changed, so a request that fails before its completion arrives keeps its CTC capture until "
-            "the byte cap evicts it.",
+            "scheme changed, so a request that fails before its completion arrives keeps its CTC capture, which "
+            "counts against NEMO_CTC_TIMESTAMP_RETAIN_GB.",
             reported,
             predicted,
             mode=LogMode.ONCE,

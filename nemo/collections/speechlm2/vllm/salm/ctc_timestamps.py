@@ -48,9 +48,11 @@ does not know about. So each capture records the requests that own it (repeated 
 shares one through the encoder cache). A capture is deleted once the last of them is
 aligned with ``release=True`` or released through :func:`ctc_release`, and vLLM has
 evicted its audio from the encoder cache: until then a new request with that audio is
-served from the cache and captures nothing, so it needs the old capture. Captures
-nobody releases are bounded only by ``NEMO_CTC_TIMESTAMP_RETAIN_GB`` of host memory
-(default 8), least recently used first.
+served from the cache and captures nothing, so it needs the old capture. Stored captures
+are bounded by ``NEMO_CTC_TIMESTAMP_RETAIN_GB`` of host memory (default 8): captures no
+request owns are evicted first, least recently used first, and when owned captures alone
+fill the budget, new captures are refused, so no request loses a capture it already has.
+A result without timestamps names the reason in its ``error``.
 
 Alignment is split where its work changes kind. The engine process, where the inputs
 live, runs the CTC head on the device and keeps only the log-prob columns each
@@ -71,7 +73,7 @@ import asyncio
 import os
 import threading
 import weakref
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Sequence
 from typing import Any
 
@@ -80,8 +82,8 @@ import torch
 from nemo.utils import logging
 from nemo.utils.nemo_logging import LogMode
 
-# Guards against captures nobody aligns or releases; an hour of audio keeps on the
-# order of 0.1-0.2 GB of encoder states.
+# Bounds the host memory captures take; an hour of audio keeps on the order of
+# 0.1-0.2 GB of encoder states.
 _RETENTION_GB_ENV = "NEMO_CTC_TIMESTAMP_RETAIN_GB"
 _DEFAULT_RETENTION_GB = 8.0
 
@@ -135,6 +137,9 @@ _state = threading.local()
 _registry: dict[str, Any] = {}
 _store: dict[str, dict] = {}
 _request_hashes: dict[str, list[str]] = {}
+# Request -> how many multimodal items its prompt holds. Identical clips share one hash,
+# so _request_hashes alone cannot tell two of them from one.
+_request_items: dict[str, int] = {}
 # mm_hash -> the requests that still own its capture.
 _hash_owners: dict[str, set[str]] = {}
 # Hashes whose audio vLLM's encoder cache holds. A new request with that audio is
@@ -380,6 +385,15 @@ def _record_request_hashes(pairs) -> None:
             _forget_request(next(iter(_request_hashes)))
 
 
+def _record_new_requests(scheduler_output: Any) -> None:
+    """Map newly scheduled requests to their hashes, and count each one's multimodal items."""
+    pairs = list(_new_request_hashes(scheduler_output))
+    with _lock:
+        # Counted first, so a request the hash map then forgets loses its count too.
+        _request_items.update(Counter(req_id for req_id, _ in pairs))
+    _record_request_hashes(pairs)
+
+
 def _drop_capture(mm_hash: str) -> None:
     """Delete a capture and tell compaction to skip it. Must hold ``_lock``."""
     entry = _store.pop(mm_hash, None)
@@ -389,6 +403,7 @@ def _drop_capture(mm_hash: str) -> None:
 
 def _forget_request(req_id: str) -> None:
     """Drop a request's claims and delete the captures nobody needs anymore. Must hold ``_lock``."""
+    _request_items.pop(req_id, None)
     for mm_hash in _request_hashes.pop(req_id, ()):
         owners = _hash_owners.get(mm_hash)
         if owners is None:
@@ -457,36 +472,60 @@ def _end_step() -> None:
             _drop_capture(mm_hash)
 
 
-def _trim_store() -> int:
-    """Evict the least recently used captures while stored inputs exceed the byte budget.
+def _trim_store(new_hashes: Sequence[str] = ()) -> int:
+    """Bring stored inputs under the byte budget without deleting a capture a request owns.
 
-    Captures normally go when their last owner is aligned or released, so this only
-    catches captures nobody releases: outputs an offline caller drops, and opted-in
-    requests to a server started without the ``ctc_serving`` middleware. Python
+    Captures normally go when their last owner is aligned or released, so the least
+    recently used captures no request owns go first: audio vLLM's encoder cache still
+    holds after its requests were aligned, and the captures of forgotten requests. Python
     dicts preserve insertion order and alignment re-inserts what it keeps, so the first
-    keys are the least recently used. The newest capture is kept even when it alone
-    exceeds the budget.
+    keys are the least recently used. When owned captures alone exceed the budget, the
+    captures of ``new_hashes`` are refused, newest first, so that no request loses a
+    capture it already has; each refused request reports ``capture_unavailable``. The
+    newest capture is kept even when it alone exceeds the budget.
+
+    Args:
+        new_hashes (Sequence[str]): The hashes the current encoder step stored, in encoding order.
+
+    Returns:
+        int: How many captures were deleted.
     """
     byte_limit = _byte_limit()
-    evicted = 0
+    evicted = refused = 0
     with _lock:
         stored = sum(entry["nbytes"] for entry in _store.values())
-        while stored > byte_limit and len(_store) > 1:
-            entry = _store.pop(next(iter(_store)))
-            entry["dropped"] = True
-            stored -= entry["nbytes"]
+        unowned = [mm_hash for mm_hash in _store if mm_hash not in _hash_owners] if stored > byte_limit else []
+        for mm_hash in unowned:
+            if stored <= byte_limit or len(_store) <= 1:
+                break
+            stored -= _store[mm_hash]["nbytes"]
+            _drop_capture(mm_hash)
             evicted += 1
+        for mm_hash in reversed(new_hashes):
+            if stored <= byte_limit or len(_store) <= 1:
+                break
+            if mm_hash in _store:
+                stored -= _store[mm_hash]["nbytes"]
+                _drop_capture(mm_hash)
+                refused += 1
     if evicted:
-        # A long-running server can reach it through requests it never aligns;
-        # alignment reports each capture it then misses.
         logging.warning(
-            "[NeMoSpeechLM] Evicting CTC timestamp captures that were never aligned or released to stay under "
-            "%.1f GB (logged once). Offline, align or ctc_release() outputs sooner, or raise %s.",
+            "[NeMoSpeechLM] Evicting CTC timestamp captures no request owns to stay under %.1f GB (logged "
+            "once); raise %s to keep more.",
             byte_limit / 1e9,
             _RETENTION_GB_ENV,
             mode=LogMode.ONCE,
         )
-    return evicted
+    if refused:
+        logging.warning(
+            "[NeMoSpeechLM] Requests not yet aligned or released hold %.1f GB of CTC timestamp captures, so new "
+            "captures are refused and their requests get no timestamps (logged once). Align or release requests "
+            "sooner (offline, ctc_release()), or raise %s.",
+            byte_limit / 1e9,
+            _RETENTION_GB_ENV,
+            mode=LogMode.ONCE,
+        )
+    return evicted + refused
 
 
 def _compact_ready() -> int:
@@ -524,8 +563,8 @@ def _compact(entry: dict) -> None:
     entry["nbytes"] = _entry_nbytes(entry)
 
 
-def _empty_result() -> dict:
-    return {"words": [], "diarization": [], "speaker_tag_to_diarization_speaker": {}}
+def _empty_result(error: str | None = None) -> dict:
+    return {"words": [], "diarization": [], "speaker_tag_to_diarization_speaker": {}, "error": error}
 
 
 def align_finished_requests(finished: Sequence[tuple[str, str]], *, release: bool) -> list[dict]:
@@ -545,12 +584,15 @@ def align_finished_requests(finished: Sequence[tuple[str, str]], *, release: boo
         list[dict]: Per item, ``words`` (``word``/``start``/``end``/``speaker`` in
         start-time order, speaker being the transcript's ``<spk:N>`` tag),
         ``diarization`` (10 ms Sortformer activity segments, ``speaker`` being the
-        Sortformer speaker index; the output to score diarization with), and
-        ``speaker_tag_to_diarization_speaker`` linking the two. Empty lists when
-        timestamps are not enabled, when no capture is recorded for the request
-        (no audio, or already released), when its capture was evicted, when it has
-        more than one audio item, when the transcript is empty, or when the aligner
-        cannot align it.
+        Sortformer speaker index; the output to score diarization with),
+        ``speaker_tag_to_diarization_speaker`` linking the two, and ``error``: ``None``
+        when the result is complete, as for an empty transcript, which has no words;
+        otherwise why its lists are empty: ``"not_enabled"`` (timestamps are not
+        enabled), ``"no_capture"`` (no capture is recorded for the request: it did not
+        opt in, carried no audio, or was already released), ``"multiple_audio"`` (it has
+        more than one audio item), ``"capture_unavailable"`` (its capture was not kept,
+        to stay under ``NEMO_CTC_TIMESTAMP_RETAIN_GB``), or ``"alignment_failed"`` (the
+        aligner cannot align the transcript).
 
     Raises:
         Exception: Any aligner error other than ``ValueError``, which is how the
@@ -573,19 +615,21 @@ def prepare_finished_requests(finished: Sequence[tuple[str, str]], *, release: b
         release (bool): Afterwards drop each request's claim on its capture.
 
     Returns:
-        dict: ``count``, the number of items, and ``batches``: each ``items``, the indices
-        it covers, and ``prepared``, a batch for :func:`align_prepared_requests`. Items in
-        no batch get empty results.
+        dict: ``count``, the number of items; ``errors``, per item the ``error`` its result
+        reports (see :func:`align_finished_requests`); and ``batches``: each ``items``, the
+        indices it covers, and ``prepared``, a batch for :func:`align_prepared_requests`.
+        Items in no batch get empty results.
 
     Raises:
         Exception: Any error other than ``ValueError`` while preparing.
     """
     from nemo.collections.speechlm2.parts.ctc_timestamp_utils import MultiSpeakerSOTWordTimestampAligner
 
-    reply = {"count": len(finished), "batches": []}
+    errors: list[str | None] = [None] * len(finished)
+    reply = {"count": len(finished), "batches": [], "errors": errors}
     aligner = active_aligner()
     if aligner is None:
-        return reply
+        return {**reply, "errors": ["not_enabled"] * len(finished)}
     special_tokens = _registry.get("special_tokens", ())
     pending, no_audio, multi_audio, evicted = [], [], [], []
     with _lock:
@@ -596,15 +640,19 @@ def prepare_finished_requests(finished: Sequence[tuple[str, str]], *, release: b
             hashes = mm_hashes_for_request(request_id)
             if not hashes:
                 no_audio.append(request_id)
+                errors[index] = "no_capture"
                 continue
-            if len(hashes) > 1:
+            if len(hashes) > 1 or _request_items.get(_resolve_request_id(request_id), 0) > 1:
                 # The transcript spans all of the request's audio, but each item has its
                 # own inputs and timeline, so aligning it to any one item would be wrong.
+                # The same clip twice is two items with one hash.
                 multi_audio.append(request_id)
+                errors[index] = "multiple_audio"
                 continue
             key = next((h for h in hashes if h in _store), None)
             if key is None:
                 evicted.append(request_id)
+                errors[index] = "capture_unavailable"
                 continue
             # Re-insert to mark it recently used; releasing happens after preparing.
             entry = _store.pop(key)
@@ -630,7 +678,7 @@ def prepare_finished_requests(finished: Sequence[tuple[str, str]], *, release: b
         )
     if evicted:
         logging.warning(
-            "[NeMoSpeechLM] The captures of %d of %d requests (first: %s) were evicted to stay under %.1f GB; "
+            "[NeMoSpeechLM] The captures of %d of %d requests (first: %s) were not kept, to stay under %.1f GB; "
             "align or ctc_release() requests sooner, or raise %s.",
             len(evicted),
             len(finished),
@@ -653,6 +701,10 @@ def prepare_finished_requests(finished: Sequence[tuple[str, str]], *, release: b
     for start in range(0, len(pending), _ALIGN_BATCH):
         for items, prepared in _prepare_chunk(aligner, pending[start : start + _ALIGN_BATCH], device):
             reply["batches"].append({"items": items, "prepared": prepared})
+    prepared_items = {index for batch in reply["batches"] for index in batch["items"]}
+    for index, _, _ in pending:
+        if index not in prepared_items:
+            errors[index] = "alignment_failed"
     if release:
         _release_requests([request_id for request_id, _ in finished])
     return reply
@@ -678,17 +730,17 @@ def align_prepared_requests(reply: dict) -> list[dict]:
 
 def _results_from(reply: dict, aligned: Sequence[list[dict | None]]) -> list[dict]:
     """Public results per item of ``reply``, from each of its batches' aligner results."""
-    results: list[dict] = [_empty_result() for _ in range(reply["count"])]
+    results: list[dict] = [_empty_result(error) for error in reply.get("errors") or [None] * reply["count"]]
     for batch, batch_results in zip(reply["batches"], aligned):
         for index, result in zip(batch["items"], batch_results):
-            if result is not None:
-                results[index] = _public_result(result)
+            results[index] = _empty_result("alignment_failed") if result is None else _public_result(result)
     return results
 
 
 def _prepare_chunk(aligner: Any, chunk: list, device: torch.device) -> list[tuple[list[int], dict]]:
     """Run the deferred head for up to ``_ALIGN_BATCH`` requests and prepare their alignment."""
     entries = [entry for _, _, entry in chunk]
+    prepared = None
     try:
         prepared = aligner.prepare_from_inputs(
             _collate(entries, device),
@@ -697,14 +749,16 @@ def _prepare_chunk(aligner: Any, chunk: list, device: torch.device) -> list[tupl
             [float(entry["duration"]) for entry in entries],
         )
     except Exception as error:  # noqa: BLE001
-        if len(chunk) > 1:
-            # Retry one by one, so that a single bad transcript, or a batch too large
-            # for device memory, does not cost the rest their timestamps.
-            return [batch for item in chunk for batch in _prepare_chunk(aligner, [item], device)]
-        if not isinstance(error, ValueError):
-            raise
-        logging.warning("[NeMoSpeechLM] CTC alignment failed: %s", error)
-        return []
+        if len(chunk) == 1:
+            if not isinstance(error, ValueError):
+                raise
+            logging.warning("[NeMoSpeechLM] CTC alignment failed: %s", error)
+            return []
+    if prepared is None:
+        # Retry one by one, so that a single bad transcript, or a batch too large for
+        # device memory, does not cost the rest their timestamps. Not from inside the
+        # handler: its traceback keeps the failed batch's device tensors alive.
+        return [batch for item in chunk for batch in _prepare_chunk(aligner, [item], device)]
     return [([index for index, _, _ in chunk], prepared)]
 
 
@@ -899,7 +953,7 @@ def _public_result(result: dict) -> dict:
         str(tag): None if column is None else int(column)
         for tag, column in (result.get("speaker_tag_to_sortformer_column") or {}).items()
     }
-    return {"words": words, "diarization": diarization, "speaker_tag_to_diarization_speaker": mapping}
+    return {"words": words, "diarization": diarization, "speaker_tag_to_diarization_speaker": mapping, "error": None}
 
 
 def _seconds(value: Any) -> float:
@@ -1089,8 +1143,9 @@ def ctc_timestamps(
 
     Each output's capture is deleted once it has been aligned with ``release=True``.
     Pass ``release=False`` to align the same outputs again, e.g. with ``texts``, and
-    release outputs that will never be aligned with :func:`ctc_release`; captures
-    nobody releases are bounded only by ``NEMO_CTC_TIMESTAMP_RETAIN_GB`` (default 8).
+    release outputs that will never be aligned with :func:`ctc_release`. Until then their
+    captures count against ``NEMO_CTC_TIMESTAMP_RETAIN_GB`` (default 8); once they fill it,
+    new outputs get no timestamps.
 
     Args:
         llm (Any): The ``vllm.LLM`` that produced ``outputs``, with CTC timestamps enabled.
@@ -1160,7 +1215,7 @@ def install_encoder_cache_binding() -> None:
         # New requests resolve to their hashes here, including those whose audio is
         # an encoder-cache hit and therefore never reaches the batch below; without
         # this, repeated audio would find no inputs.
-        _record_request_hashes(_new_request_hashes(scheduler_output))
+        _record_new_requests(scheduler_output)
         # vLLM evicting audio only ends cache hits on its capture; owners that have
         # not been aligned yet keep it.
         _follow_engine_cache(freed=getattr(scheduler_output, "free_encoder_mm_hashes", ()))
@@ -1176,7 +1231,7 @@ def install_encoder_cache_binding() -> None:
 
         _follow_engine_cache(encoded=mm_hashes)
         _record_request_hashes((req_id, mm_hash) for mm_hash, (req_id, _position) in zip(mm_hashes, item_refs))
-        _trim_store()
+        _trim_store(mm_hashes)
         _compact_ready()
         return outputs
 
