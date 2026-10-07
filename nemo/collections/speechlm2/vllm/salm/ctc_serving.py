@@ -25,9 +25,9 @@ through :func:`align_async`, the same worker method offline callers reach, and a
 the result to the response as a top-level ``ctc_timestamps`` field in the offline
 format: ``words``, ``diarization``, ``speaker_tag_to_diarization_speaker`` and
 ``error``, which names why ``words`` is empty. Score diarization (DER) with ``diarization``,
-never with ``words``. vLLM's
-chat route serves the request itself, API-key check included; every other request
-passes through untouched.
+never with ``words``. Under data parallelism, every engine core is asked and the one that
+holds the request's capture answers. vLLM's chat route serves the request itself, API-key
+check included; every other request passes through untouched.
 
 Speaker tags reach the aligner only when the model writes them and the request keeps
 them with ``"skip_special_tokens": false``. The middleware does not read the prompt: a
@@ -50,6 +50,9 @@ from nemo.utils.nemo_logging import LogMode
 
 _CHAT_PATH = "/v1/chat/completions"
 _OPT_IN = "capture_ctc_timestamps"
+
+# The errors a prepare reply reports for a request when its engine core holds no capture of it.
+_NOT_HELD = frozenset({"no_capture", "not_enabled"})
 
 
 async def ctc_timestamp_middleware(request: Any, call_next: Any) -> Any:
@@ -88,13 +91,15 @@ async def ctc_timestamp_middleware(request: Any, call_next: Any) -> Any:
         completion = json.loads(b"".join([chunk async for chunk in response.body_iterator]))
         request_id = _reported_request_id(completion, request_id)
         text = completion["choices"][0]["message"]["content"] or ""
-        (result,) = await align_async(engine.collective_rpc, [(request_id, text)], require_enabled=False)
+        (result,) = await align_async(_capture_owner_rpc(engine), [(request_id, text)], require_enabled=False)
     except BaseException as error:
         # Alignment releases the capture; a request that stops before it releases it here.
         await _release(engine, request_id)
         if not isinstance(error, Exception):
             raise
-        logging.error("[NeMoSpeechLM] CTC timestamps for chat request %s failed: %s", request_id, error)
+        logging.error(
+            "[NeMoSpeechLM] CTC timestamps for chat request %s failed: %s", request_id, error, exc_info=error
+        )
         return _error(error, "InternalServerError", HTTPStatus.INTERNAL_SERVER_ERROR)
 
     completion["ctc_timestamps"] = result
@@ -147,6 +152,51 @@ def _reported_request_id(completion: dict, predicted: str) -> str:
             mode=LogMode.ONCE,
         )
     return reported
+
+
+def _capture_owner_rpc(engine: Any) -> Any:
+    """``engine.collective_rpc`` for preparing one request, answered by the engine core that holds its capture.
+
+    Under data parallelism, vLLM's ``collective_rpc`` runs on every engine core but returns only
+    the first core's replies (``DPLBAsyncMPClient.call_utility_async``), while a request's capture
+    lives on the core that served it, so this collects each core's replies and keeps the owner's.
+    A single engine keeps vLLM's own path. Releasing needs no owner: vLLM's ``collective_rpc``
+    reaches every core.
+    """
+    core = getattr(engine, "engine_core", None)
+    identities = list(getattr(core, "core_engines", None) or ())
+    if len(identities) < 2:
+        return engine.collective_rpc
+
+    async def rpc(method: str, timeout: float | None = None, args: tuple = (), kwargs: dict | None = None) -> list:
+        replies = await asyncio.gather(
+            *(
+                core._call_utility_async("collective_rpc", method, timeout, args, kwargs, engine=identity)
+                for identity in identities
+            )
+        )
+        return [_owner_reply(replies)]
+
+    return rpc
+
+
+def _owner_reply(core_replies: list[list]) -> Any:
+    """The prepare reply of the engine core that holds the request's capture.
+
+    Of a core's per-worker replies, only the worker that holds captures answers with ``errors``.
+    A core without the request's capture reports ``no_capture``, or ``not_enabled`` without
+    timestamps; the owner reports anything else. Ownership decides, not words or batches, so the
+    diarization and error of an empty transcript or a failed alignment come from the owner too.
+    With no owner, the first core's reply stands, as in vLLM.
+
+    Raises:
+        RuntimeError: More than one core holds a capture of the request.
+    """
+    holders = [reply for replies in core_replies for reply in replies if isinstance(reply, dict) and "errors" in reply]
+    owners = [reply for reply in holders if not _NOT_HELD.issuperset(reply["errors"])]
+    if len(owners) > 1:
+        raise RuntimeError(f"{len(owners)} data-parallel engine cores hold a CTC capture of this request.")
+    return (owners or holders or core_replies[0])[0]
 
 
 async def _release(engine: Any, request_id: str) -> None:

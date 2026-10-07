@@ -15,6 +15,7 @@
 """The vLLM plugin's per-request store for deferred CTC timestamp inputs, on CPU."""
 
 import asyncio
+import contextlib
 import sys
 import threading
 import weakref
@@ -973,6 +974,12 @@ def test_startup_profiling_inputs_opt_into_capture(monkeypatch):
     assert inputs.hf_processor_mm_kwargs == {"capture_ctc_timestamps": True}
 
 
+_WORKER_METHODS = {
+    ct.WORKER_PREPARE_METHOD: ct._worker_prepare_requests,
+    ct.WORKER_RELEASE_METHOD: ct._worker_release_requests,
+}
+
+
 @pytest.fixture
 def server(aligner):
     """The chat middleware in front of a stand-in for vLLM's chat route, over a stub engine and the real store."""
@@ -985,16 +992,16 @@ def server(aligner):
 
     from nemo.collections.speechlm2.vllm.salm.ctc_serving import ctc_timestamp_middleware
 
-    workers = {
-        ct.WORKER_PREPARE_METHOD: ct._worker_prepare_requests,
-        ct.WORKER_RELEASE_METHOD: ct._worker_release_requests,
-    }
-    script = {"transcript": "hi there", "status": 200, "id_prefix": "chatcmpl-"}
+    def capture(request_id):
+        _capture(1, 4, [f"hash-{request_id}"])
+        ct._record_request_hashes([(f"{request_id}-0123abcd", f"hash-{request_id}")])
+
+    script = {"transcript": "hi there", "status": 200, "id_prefix": "chatcmpl-", "capture": capture}
     rpcs = []
 
     async def collective_rpc(method, args):
         rpcs.append(method)
-        return [workers[method](None, *args)]
+        return [_WORKER_METHODS[method](None, *args)]
 
     hf_config = SimpleNamespace(ctc_timestamps={"adapter_path": "/adapter.pt"})
     engine = SimpleNamespace(model_config=SimpleNamespace(hf_config=hf_config), collective_rpc=collective_rpc)
@@ -1008,8 +1015,7 @@ def server(aligner):
         request_id = f"{script['id_prefix']}{base}"
         if (body.get("mm_processor_kwargs") or {}).get("capture_ctc_timestamps"):
             # The capture the engine keeps for an opted-in request while it generates.
-            _capture(1, 4, [f"hash-{request_id}"])
-            ct._record_request_hashes([(f"{request_id}-0123abcd", f"hash-{request_id}")])
+            script["capture"](request_id)
         message = {"role": "assistant", "content": script["transcript"]}
         content = {"id": request_id, "object": "chat.completion", "choices": [{"index": 0, "message": message}]}
         return JSONResponse(content, status_code=script["status"])
@@ -1090,13 +1096,15 @@ def test_a_failed_chat_completion_releases_its_capture(server):
     assert server.rpcs == [ct.WORKER_RELEASE_METHOD] and ct._store == {}
 
 
-def test_an_alignment_failure_releases_the_capture_and_answers_500(server):
+def test_an_alignment_failure_releases_the_capture_and_answers_500(server, caplog):
     server.script["transcript"] = "crash"
 
     response = server.post()
 
     assert response.status_code == 500 and response.json()["error"]["message"] == "kernel failure"
     assert server.rpcs == [ct.WORKER_PREPARE_METHOD, ct.WORKER_RELEASE_METHOD] and ct._store == {}
+    # The log keeps the traceback, not only the message.
+    assert any(record.exc_info and str(record.exc_info[1]) == "kernel failure" for record in caplog.records)
 
 
 def test_a_cancelled_chat_completion_releases_its_capture(server):
@@ -1121,6 +1129,169 @@ def test_a_cancelled_chat_completion_releases_its_capture(server):
         asyncio.run(ctc_timestamp_middleware(Request(scope, receive), call_next))
 
     assert server.rpcs == [ct.WORKER_RELEASE_METHOD] and ct._store == {}
+
+
+class _Worker:
+    """One vLLM worker process, with an engine-side store of its own; only rank 0 holds captures."""
+
+    def __init__(self, rank):
+        self.rank = rank
+        self.state = {
+            "_store": {},
+            "_request_hashes": {},
+            "_request_items": {},
+            "_hash_owners": {},
+            "_engine_cached": set(),
+            "_external_ids": {},
+            "_uncompacted": deque(),
+        }
+
+    @contextlib.contextmanager
+    def active(self):
+        """Run the block in this worker: the module's store is this worker's meanwhile."""
+        outer = {name: getattr(ct, name) for name in [*self.state, "_holds_captures"]}
+        for name, value in self.state.items():
+            setattr(ct, name, value)
+        ct._holds_captures = lambda: self.rank == 0
+        try:
+            yield
+        finally:
+            self.state = {name: getattr(ct, name) for name in self.state}
+            for name, value in outer.items():
+                setattr(ct, name, value)
+
+
+class _DataParallelEngine:
+    """vLLM's AsyncLLM over DPLBAsyncMPClient, its internal data-parallel load balancer, as the middleware sees it."""
+
+    def __init__(self, hf_config, cores=3, tensor_parallel=2):
+        self.model_config = SimpleNamespace(hf_config=hf_config)
+        self.workers = [[_Worker(rank) for rank in range(tensor_parallel)] for _ in range(cores)]
+        self.engine_core = SimpleNamespace(
+            core_engines=[core.to_bytes(2, "little") for core in range(cores)], _call_utility_async=self._call_utility
+        )
+        self.rpcs = []
+
+    async def _call_utility(self, method, *args, engine):
+        """One core's utility call: each of its workers runs the collective RPC, replying in rank order."""
+        assert method == "collective_rpc"
+        worker_method, _, worker_args, _ = args
+        core = int.from_bytes(engine, "little")
+        self.rpcs.append((worker_method, core))
+        replies = []
+        for worker in self.workers[core]:
+            with worker.active():
+                replies.append(_WORKER_METHODS[worker_method](None, *worker_args))
+        return replies
+
+    async def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+        # As DPLBAsyncMPClient.call_utility_async: every core runs it; the first core's replies return.
+        replies = await asyncio.gather(
+            *(
+                self._call_utility("collective_rpc", method, timeout, args, kwargs, engine=identity)
+                for identity in self.engine_core.core_engines
+            )
+        )
+        return replies[0]
+
+    def stores(self):
+        return [core[0].state["_store"] for core in self.workers]
+
+
+@pytest.fixture
+def dp_server(server):
+    """``server`` over three data-parallel engine cores; the cores in ``script["owners"]`` capture the audio."""
+
+    def connect(cores=3):
+        server.engine = _DataParallelEngine(server.hf_config, cores=cores)
+        server.app.state.engine_client = server.engine
+
+    def capture(request_id):
+        for core in server.script["owners"]:
+            # Sortformer marks speaker 1 from 10 ms label frame 5 to 15.
+            inputs = _inputs(1, 4)
+            inputs.diarization_labels[:, 1, 5:15] = True
+            with server.engine.workers[core][0].active():
+                _capture(1, 4, [f"hash-{request_id}"], inputs=inputs)
+                ct._record_request_hashes([(f"{request_id}-0123abcd", f"hash-{request_id}")])
+
+    server.script.update(capture=capture, owners=[1])
+    server.connect = connect
+    connect()
+    return server
+
+
+def test_vllm_data_parallel_collective_rpc_returns_only_the_first_cores_replies():
+    """The vLLM behavior _DataParallelEngine copies, which the middleware's capture-owner RPC works around."""
+    core_client = pytest.importorskip("vllm.v1.engine.core_client")
+    client = object.__new__(core_client.DPLBAsyncMPClient)
+    client.core_engines = [core.to_bytes(2, "little") for core in range(3)]
+
+    async def call_utility(method, *args, engine):
+        return [f"core {int.from_bytes(engine, 'little')}"]
+
+    client._call_utility_async = call_utility
+
+    assert asyncio.run(client.collective_rpc_async(ct.WORKER_PREPARE_METHOD)) == ["core 0"]
+
+
+def test_a_request_served_by_a_later_data_parallel_core_gets_its_timestamps(dp_server):
+    response = dp_server.post()
+
+    timestamps = response.json()["ctc_timestamps"]
+    assert response.status_code == 200 and _words(timestamps) == ["hi", "there"] and timestamps["error"] is None
+    assert dp_server.engine.rpcs == [(ct.WORKER_PREPARE_METHOD, core) for core in range(3)]
+    assert dp_server.engine.stores() == [{}, {}, {}]
+
+
+@pytest.mark.parametrize("transcript, error", [("", None), ("untokenizable", "alignment_failed")])
+def test_a_later_core_whose_words_are_not_aligned_still_answers_with_its_diarization(dp_server, transcript, error):
+    dp_server.script.update(transcript=transcript, owners=[2])
+
+    response = dp_server.post()
+
+    segment = [{"speaker": 1, "start": 0.05, "end": 0.15}]
+    assert response.status_code == 200 and response.json()["ctc_timestamps"] == ct._empty_result(error, segment)
+    assert dp_server.engine.stores() == [{}, {}, {}]
+
+
+def test_a_request_no_core_captured_reports_no_capture(dp_server):
+    dp_server.script["owners"] = []
+
+    response = dp_server.post()
+
+    assert response.status_code == 200 and response.json()["ctc_timestamps"] == ct._empty_result("no_capture")
+
+
+def test_a_request_two_cores_captured_is_refused_and_released_on_both(dp_server):
+    dp_server.script["owners"] = [0, 2]
+
+    response = dp_server.post()
+
+    assert response.status_code == 500 and "2 data-parallel engine cores" in response.json()["error"]["message"]
+    assert dp_server.engine.stores() == [{}, {}, {}]
+
+
+def test_a_single_engine_core_keeps_vllms_collective_rpc(dp_server):
+    from nemo.collections.speechlm2.vllm.salm.ctc_serving import _capture_owner_rpc
+
+    dp_server.connect(cores=1)
+    dp_server.script["owners"] = [0]
+
+    response = dp_server.post()
+
+    assert _capture_owner_rpc(dp_server.engine) == dp_server.engine.collective_rpc
+    assert _words(response.json()["ctc_timestamps"]) == ["hi", "there"] and dp_server.engine.stores() == [{}]
+
+
+def test_a_failed_chat_completion_releases_the_capture_on_the_core_that_holds_it(dp_server):
+    dp_server.script.update(status=500, owners=[2])
+
+    response = dp_server.post()
+
+    assert response.status_code == 500
+    assert dp_server.engine.rpcs == [(ct.WORKER_RELEASE_METHOD, core) for core in range(3)]
+    assert dp_server.engine.stores() == [{}, {}, {}]
 
 
 def test_transcripts_without_speaker_tags_are_reported(aligner, caplog):
