@@ -612,6 +612,25 @@ def test_reencoded_audio_replaces_its_entry_as_the_most_recent(aligner):
     assert first["dropped"] and ct._store["hash-a"]["asr_encoded"].shape[-1] == 3
 
 
+def test_deferred_head_batches_stay_within_the_frame_budget(aligner, monkeypatch):
+    monkeypatch.setattr(ct, "_HEAD_FRAME_BUDGET", 12)
+    _capture(1, 5, ["hash-a"])
+    _capture(1, 5, ["hash-b"])
+    _capture(1, 3, ["hash-c"])
+    ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b"), ("req-c", "hash-c")])
+    finished = [("req-a", "a"), ("req-b", "b"), ("req-c", "c")]
+
+    ct.align_finished_requests(finished, release=False)
+    # Two requests padded to five frames take ten; a third would take fifteen.
+    assert [texts for _, texts, _ in aligner.calls] == [["a", "b"], ["c"]]
+
+    aligner.calls.clear()
+    aligner.online_inference_length, aligner.chunk_left_context, aligner.chunk_right_context = 2, 1, 1
+    ct.align_finished_requests(finished, release=True)
+    # Decoded in windows of four frames, all three take twelve.
+    assert [texts for _, texts, _ in aligner.calls] == [["a", "b", "c"]]
+
+
 def test_a_failed_batch_is_freed_before_its_requests_are_retried_one_by_one(aligner, monkeypatch):
     failed_inputs = []
 

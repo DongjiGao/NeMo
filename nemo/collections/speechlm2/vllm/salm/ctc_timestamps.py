@@ -56,8 +56,9 @@ A result without timestamps names the reason in its ``error``.
 
 Alignment is split where its work changes kind. The engine process, where the inputs
 live, runs the CTC head on the device and keeps only the log-prob columns each
-transcript's tokens use (:func:`prepare_finished_requests`), in one worker method that
-both modes reach through ``collective_rpc``. The caller then runs the CPU-bound
+transcript's tokens use, window by window, in batches bounded by ``_HEAD_FRAME_BUDGET``
+(:func:`prepare_finished_requests`). Both modes reach it through one worker method and
+``collective_rpc``. The caller then runs the CPU-bound
 alignment search on that compact batch (:func:`align_prepared_requests`), so the engine
 is busy only for the head. The client functions :func:`align` and
 :func:`release_captures` serve a synchronous ``LLM``, which is what
@@ -102,9 +103,14 @@ _PACKED_TENSOR = "__tensor__"
 # vLLM forms the scheduler's request id as f"{external_id}-{random_uuid():.8}".
 _INTERNAL_ID_SUFFIX_LEN = 8
 
-# Requests decoded together in one deferred-head call, which materializes a
-# (batch, frames, vocabulary) log-prob tensor on the device.
+# Requests decoded together in one deferred-head call, at most.
 _ALIGN_BATCH = 16
+
+# Bounds a deferred-head call by its requests times the frames the head decodes at
+# once: a window, or the longest request when it fits in one. The head's
+# vocabulary-wide output for those frames dominates the device memory preparing
+# takes, about 1.6 GiB at this budget with a 32,769-class BF16 head.
+_HEAD_FRAME_BUDGET = 8192
 
 # Records a server merges into one alignment search (see _AlignmentBatcher). The
 # search's per-frame loop is shared, so more records cost little more, short ones
@@ -698,8 +704,8 @@ def prepare_finished_requests(finished: Sequence[tuple[str, str]], *, release: b
         )
 
     device = next(aligner.ctc_decoder.parameters()).device
-    for start in range(0, len(pending), _ALIGN_BATCH):
-        for items, prepared in _prepare_chunk(aligner, pending[start : start + _ALIGN_BATCH], device):
+    for chunk in _head_batches(aligner, pending):
+        for items, prepared in _prepare_chunk(aligner, chunk, device):
             reply["batches"].append({"items": items, "prepared": prepared})
     prepared_items = {index for batch in reply["batches"] for index in batch["items"]}
     for index, _, _ in pending:
@@ -737,8 +743,40 @@ def _results_from(reply: dict, aligned: Sequence[list[dict | None]]) -> list[dic
     return results
 
 
+def _head_batches(aligner: Any, pending: list) -> list[list]:
+    """Split pending requests, in order, into deferred-head batches.
+
+    A batch holds at most ``_ALIGN_BATCH`` requests, and its requests times the frames the
+    head decodes at once stay within ``_HEAD_FRAME_BUDGET``; a request over the budget on
+    its own forms a batch by itself.
+    """
+    core = int(getattr(aligner, "online_inference_length", 0))
+    window = core + int(getattr(aligner, "chunk_left_context", 0)) + int(getattr(aligner, "chunk_right_context", 0))
+
+    def head_frames(frames: int) -> int:
+        # Collation pads every request to the longest, which the head decodes whole when it
+        # fits in one core window, and otherwise window by window.
+        return frames if core <= 0 or frames <= core else min(frames, window)
+
+    batches: list[list] = []
+    longest = 0
+    for item in pending:
+        frames = item[2]["asr_encoded"].shape[-1]
+        if (
+            batches
+            and len(batches[-1]) < _ALIGN_BATCH
+            and (len(batches[-1]) + 1) * head_frames(max(longest, frames)) <= _HEAD_FRAME_BUDGET
+        ):
+            batches[-1].append(item)
+            longest = max(longest, frames)
+        else:
+            batches.append([item])
+            longest = frames
+    return batches
+
+
 def _prepare_chunk(aligner: Any, chunk: list, device: torch.device) -> list[tuple[list[int], dict]]:
-    """Run the deferred head for up to ``_ALIGN_BATCH`` requests and prepare their alignment."""
+    """Run the deferred head for one batch from :func:`_head_batches` and prepare its alignment."""
     entries = [entry for _, _, entry in chunk]
     prepared = None
     try:

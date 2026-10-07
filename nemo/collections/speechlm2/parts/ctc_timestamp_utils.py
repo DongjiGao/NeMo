@@ -26,7 +26,7 @@ import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 from omegaconf import OmegaConf
@@ -332,6 +332,34 @@ class MultiSpeakerSOTWordTimestampAligner:
 
     @torch.no_grad()
     def ctc_log_probs_from_inputs(self, timestamp_inputs: Any) -> torch.Tensor:
+        """Run the deferred CTC head over stored ASR states and return its whole output.
+
+        The output is vocabulary-wide; :meth:`prepare_from_inputs` keeps only the columns
+        transcripts use. Each window of :meth:`_run_ctc_head` is copied into the output and
+        freed before the next one is decoded.
+
+        Args:
+            timestamp_inputs (Any): ``CTCTimestampInputs`` whose ``asr_encoded`` is shaped ``(B, D, T)``.
+
+        Returns:
+            torch.Tensor: CTC log probabilities shaped ``(B, T, classes)``.
+        """
+        num_frames = timestamp_inputs.asr_encoded.shape[-1]
+        output: List[torch.Tensor] = []
+
+        def keep(start: int, log_probs: torch.Tensor) -> None:
+            if log_probs.shape[1] == num_frames:
+                output.append(log_probs)
+                return
+            if not output:
+                output.append(log_probs.new_empty((log_probs.shape[0], num_frames, log_probs.shape[2])))
+            output[0][:, start : start + log_probs.shape[1]] = log_probs
+
+        self._run_ctc_head(timestamp_inputs, keep)
+        return output[0]
+
+    @torch.no_grad()
+    def _run_ctc_head(self, timestamp_inputs: Any, keep: Callable[[int, torch.Tensor], None]) -> None:
         """Run the deferred CTC head over stored ASR states in bounded windows.
 
         Windows follow the encoder's online inference: ``online_inference_length`` core
@@ -341,9 +369,10 @@ class MultiSpeakerSOTWordTimestampAligner:
 
         Args:
             timestamp_inputs (Any): ``CTCTimestampInputs`` whose ``asr_encoded`` is shaped ``(B, D, T)``.
-
-        Returns:
-            torch.Tensor: CTC log probabilities shaped ``(B, T, classes)``.
+            keep (Callable[[int, torch.Tensor], None]): Called once per window, in order, with the
+                window's first frame and its core frames' log probabilities, shaped
+                ``(B, frames, classes)``. They view the vocabulary-wide window, which is freed
+                before the next window is decoded, so ``keep`` must copy what it keeps.
         """
         states = timestamp_inputs.asr_encoded
         lengths = timestamp_inputs.asr_encoded_lengths
@@ -355,9 +384,9 @@ class MultiSpeakerSOTWordTimestampAligner:
 
         core_length = self.online_inference_length
         if core_length <= 0 or states.shape[-1] <= core_length:
-            return decode(states, lengths)
+            keep(0, decode(states, lengths))
+            return
 
-        chunks = []
         for start in range(0, states.shape[-1], core_length):
             end = min(start + core_length, states.shape[-1])
             context_start = max(start - self.chunk_left_context, 0)
@@ -365,8 +394,8 @@ class MultiSpeakerSOTWordTimestampAligner:
             context_lengths = (lengths - context_start).clamp(min=0, max=context_end - context_start)
             context_logits = decode(states[:, :, context_start:context_end], context_lengths)
             left_drop = start - context_start
-            chunks.append(context_logits[:, left_drop : left_drop + end - start])
-        return torch.cat(chunks, dim=1)
+            keep(start, context_logits[:, left_drop : left_drop + end - start])
+            del context_logits  # before the next window is decoded
 
     @torch.no_grad()
     def prepare_from_inputs(
@@ -379,7 +408,10 @@ class MultiSpeakerSOTWordTimestampAligner:
 
         The half of :meth:`generate_from_inputs` that needs the CTC head and the tokenizer.
         Finish it with :meth:`align_prepared`, or with :func:`align_prepared_batch` in a process
-        that has no model.
+        that has no model. It prepares what :meth:`prepare_alignment` prepares from the head's
+        whole output without ever holding that output: the transcripts are tokenized first,
+        and each window keeps only their columns, gathered after the head's full-vocabulary
+        softmax.
 
         Args:
             timestamp_inputs (Any): ``CTCTimestampInputs`` kept from the generation forward.
@@ -389,10 +421,34 @@ class MultiSpeakerSOTWordTimestampAligner:
         Returns:
             Dict[str, Any]: The prepared batch described in :meth:`prepare_alignment`.
         """
-        ctc_log_probs = self.ctc_log_probs_from_inputs(timestamp_inputs)
-        num_frames = ctc_log_probs.shape[1]
-        return self.prepare_alignment(
-            ctc_log_probs,
+        states = timestamp_inputs.asr_encoded
+        num_frames = states.shape[-1]
+        num_classes = int(self.ctc_decoder.num_classes_with_blank)
+
+        def read_columns(columns: List[List[int]], lengths: List[int]) -> List[torch.Tensor]:
+            index = torch.zeros((len(columns), max(map(len, columns))), dtype=torch.long)
+            for row, record_columns in enumerate(columns):
+                index[row, : len(record_columns)] = torch.tensor(record_columns)
+            index = index.to(states.device)
+            kept = []
+
+            def keep(start: int, log_probs: torch.Tensor) -> None:
+                if log_probs.shape[-1] != num_classes:
+                    raise ValueError(f"The CTC head returned {log_probs.shape[-1]} classes, not {num_classes}.")
+                kept.append(torch.gather(log_probs, 2, index[:, None, :].expand(-1, log_probs.shape[1], -1)))
+
+            self._run_ctc_head(timestamp_inputs, keep)
+            compact = torch.cat(kept, dim=1)
+            if compact.shape[1] != num_frames:
+                raise ValueError(f"The CTC head returned {compact.shape[1]} frames for {num_frames} input frames.")
+            return [
+                compact[row, :length, : len(record_columns)].float().cpu().contiguous()
+                for row, (record_columns, length) in enumerate(zip(columns, lengths))
+            ]
+
+        return self._prepare(
+            (states.shape[0], num_frames, num_classes),
+            read_columns,
             timestamp_inputs.sortformer_sigmoids,
             sot_transcripts,
             ctc_lengths=timestamp_inputs.asr_encoded_lengths.clamp(max=num_frames),
@@ -494,7 +550,68 @@ class MultiSpeakerSOTWordTimestampAligner:
         """
         if ctc_log_probs.ndim != 3:
             raise ValueError("ctc_log_probs must have shape (batch, frames, classes).")
-        batch_size, max_ctc_frames, vocab_size = ctc_log_probs.shape
+
+        def read_columns(columns: List[List[int]], lengths: List[int]) -> List[torch.Tensor]:
+            return [
+                ctc_log_probs[index, :length]
+                .detach()
+                .index_select(1, torch.tensor(record_columns, device=ctc_log_probs.device))
+                .float()
+                .cpu()
+                for index, (record_columns, length) in enumerate(zip(columns, lengths))
+            ]
+
+        return self._prepare(
+            ctc_log_probs.shape,
+            read_columns,
+            sortformer_sigmoids,
+            sot_transcripts,
+            ctc_lengths=ctc_lengths,
+            sortformer_lengths=sortformer_lengths,
+            audio_durations=audio_durations,
+            time_offsets=time_offsets,
+            speaker_logprob_weight=speaker_logprob_weight,
+            diarization_labels=diarization_labels,
+            diarization_lengths=diarization_lengths,
+            diarization_frame_seconds=diarization_frame_seconds,
+        )
+
+    def _prepare(
+        self,
+        ctc_shape: Sequence[int],
+        read_columns: Callable[[List[List[int]], List[int]], List[torch.Tensor]],
+        sortformer_sigmoids: Optional[torch.Tensor],
+        sot_transcripts: Sequence[str],
+        *,
+        ctc_lengths: Optional[torch.Tensor] = None,
+        sortformer_lengths: Optional[torch.Tensor] = None,
+        audio_durations: Optional[Sequence[Optional[float]]] = None,
+        time_offsets: Optional[Sequence[float]] = None,
+        speaker_logprob_weight: Optional[float] = None,
+        diarization_labels: Optional[torch.Tensor] = None,
+        diarization_lengths: Optional[torch.Tensor] = None,
+        diarization_frame_seconds: float = 0.01,
+    ) -> Dict[str, Any]:
+        """:meth:`prepare_alignment` for a CTC output that is read only through ``read_columns``.
+
+        Every transcript becomes CTC targets before any log probability is read, so a
+        transcript the aligner rejects costs no CTC head run.
+
+        Args:
+            ctc_shape (Sequence[int]): ``(batch, frames, classes)`` of the CTC output.
+            read_columns (Callable[[List[List[int]], List[int]], List[torch.Tensor]]): Given each
+                record's columns, blank first, and its valid CTC length, returns its log
+                probabilities shaped ``(ctc_length, columns)``, as float32 on the host.
+            sortformer_sigmoids (Optional[torch.Tensor]): As in :meth:`prepare_alignment`.
+            sot_transcripts (Sequence[str]): As in :meth:`prepare_alignment`.
+            ctc_lengths, sortformer_lengths, audio_durations, time_offsets, speaker_logprob_weight,
+                diarization_labels, diarization_lengths, diarization_frame_seconds: As in
+                :meth:`prepare_alignment`.
+
+        Returns:
+            Dict[str, Any]: The prepared batch described in :meth:`prepare_alignment`.
+        """
+        batch_size, max_ctc_frames, vocab_size = ctc_shape
         if len(sot_transcripts) != batch_size:
             raise ValueError("sot_transcripts must contain one string per batch item.")
         ctc_lengths_list = self._lengths(ctc_lengths, batch_size, max_ctc_frames)
@@ -536,7 +653,7 @@ class MultiSpeakerSOTWordTimestampAligner:
         if speaker_logprob_weight < 0:
             raise ValueError("speaker_logprob_weight must be non-negative.")
 
-        records = []
+        records, columns_per_record = [], []
         for index, transcript in enumerate(sot_transcripts):
             ctc_length = ctc_lengths_list[index]
             speaker_length = speaker_lengths_list[index]
@@ -576,16 +693,12 @@ class MultiSpeakerSOTWordTimestampAligner:
             column_of = {label: column for column, label in enumerate(columns)}
             for stream in streams:
                 stream["labels"] = [column_of[label] for label in stream["labels"]]
-            column_index = torch.tensor(columns, device=ctc_log_probs.device)
+            columns_per_record.append(columns)
             records.append(
                 {
                     "words": words,
                     "streams": streams,
-                    "ctc_log_probs": ctc_log_probs[index, :ctc_length]
-                    .detach()
-                    .index_select(1, column_index)
-                    .float()
-                    .cpu(),
+                    "ctc_log_probs": None,
                     "ctc_length": ctc_length,
                     "ctc_step": ctc_step,
                     "speaker_probs": (
@@ -604,6 +717,8 @@ class MultiSpeakerSOTWordTimestampAligner:
                     "time_offset": float(offsets[index]),
                 }
             )
+        for record, log_probs in zip(records, read_columns(columns_per_record, ctc_lengths_list) if records else ()):
+            record["ctc_log_probs"] = log_probs
 
         return {
             "config": {
