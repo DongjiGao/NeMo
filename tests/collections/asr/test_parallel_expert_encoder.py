@@ -39,6 +39,7 @@ from nemo.collections.speechlm2.parts.ctc_timestamp_utils import (
     _disable_max_seq_length_sync,
     align_prepared_batch,
     get_ctc_timestamp_aligner,
+    merge_prepared_batches,
 )
 
 # ``@experimental`` wraps the class in a wrapt proxy, so ``__new__`` (used to build
@@ -535,6 +536,22 @@ def test_a_prepared_batch_aligns_without_the_aligner_that_prepared_it(monkeypatc
 
 
 @pytest.mark.unit
+def test_merged_prepared_batches_align_like_separate_batches(monkeypatch):
+    torch.manual_seed(0)
+    blank_id = 2
+    extractor = MultiSpeakerSOTWordTimestampAligner(blank_id=blank_id, ctc_frame_seconds=0.01)
+    monkeypatch.setattr(extractor, "_tokenize_words", _tokenize_by_table({"a": 0, "b": 1}))
+    short = extractor.prepare_alignment(torch.log_softmax(torch.randn(1, 5, blank_id + 1), dim=-1), None, ["a b"])
+    long = extractor.prepare_alignment(torch.log_softmax(torch.randn(1, 9, blank_id + 1), dim=-1), None, ["b a b"])
+
+    merged = merge_prepared_batches([short, long])
+
+    assert align_prepared_batch(merged) == align_prepared_batch(short) + align_prepared_batch(long)
+    stricter = {**long, "config": {**long["config"], "maximum_token_len": 0.5}}
+    assert merge_prepared_batches([short, stricter]) is None
+
+
+@pytest.mark.unit
 def test_compact_batched_ctc_alignment_handles_repeated_tokens():
     blank_id = 1
     target = torch.tensor([[blank_id, 0, blank_id, 0, blank_id]])
@@ -679,7 +696,7 @@ def test_timestamp_extractor_batch_honors_record_lengths(monkeypatch):
     assert [result["num_ctc_frames"] for result in results] == [4, 5]
     assert [result["alignment_mode"] for result in results] == ["parallel", "parallel"]
     # Two streams over the batch's 7 padded frames, with only the blank and token columns each transcript uses.
-    assert dp_calls == [(torch.Size([2, 7, 2]), [4, 5])]
+    assert dp_calls == [(torch.Size([2, 5, 2]), [4, 5])]
     assert results[0]["diarization_timestamps"] == [{"speaker": 0, "start": 0.0, "end": 0.02}]
     assert results[1]["diarization_timestamps"] == [{"speaker": 1, "start": 0.01, "end": 0.04}]
     assert [result["diarization_frame_seconds"] for result in results] == [0.01, 0.01]
