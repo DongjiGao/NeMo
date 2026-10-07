@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import math
 import os
 import re
@@ -1533,16 +1534,24 @@ def save_ctc_timestamp_artifact(
     tokenizer: Any,
     decoder_config: Any,
 ) -> Path:
-    """Write the decoder, tokenizer, and construction config as one lightweight artifact."""
+    """Write the decoder, tokenizer, and construction config as one lightweight artifact.
+
+    A ``.safetensors`` destination stores tensor data in safetensors and construction
+    settings in its metadata. Other suffixes retain the original torch serialization.
+    """
     path = Path(destination).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     config = _decoder_init_config(decoder_config)
     state_dict = {key: value.detach().cpu() for key, value in decoder.state_dict().items()}
+    tokenizer_payload = _tokenizer_payload(tokenizer)
+    if path.suffix == ".safetensors":
+        _save_ctc_timestamp_safetensors(path, state_dict, tokenizer_payload, config)
+        return path
     payload = {
         "format": CTC_TIMESTAMP_ARTIFACT_FORMAT,
         "decoder_config": config,
         "decoder_state_dict": state_dict,
-        "tokenizer": _tokenizer_payload(tokenizer),
+        "tokenizer": tokenizer_payload,
     }
     torch.save(payload, path)
     return path
@@ -1602,7 +1611,11 @@ def load_ctc_timestamp_artifact(
     path = Path(source).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"CTC timestamp artifact does not exist: {path}")
-    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload = (
+        _load_ctc_timestamp_safetensors(path)
+        if path.suffix == ".safetensors"
+        else torch.load(path, map_location="cpu", weights_only=True)
+    )
     if not isinstance(payload, Mapping) or payload.get("format") != CTC_TIMESTAMP_ARTIFACT_FORMAT:
         raise ValueError(
             f"Expected a {CTC_TIMESTAMP_ARTIFACT_FORMAT!r} artifact. Convert the original .nemo adapter first."
@@ -1622,6 +1635,68 @@ def load_ctc_timestamp_artifact(
     tokenizer = _load_sentencepiece(payload.get("tokenizer"))
     _validate_vocabulary(tokenizer, config)
     return CTCTimestampArtifact(decoder=decoder, tokenizer=tokenizer, decoder_config=config)
+
+
+def _save_ctc_timestamp_safetensors(
+    path: Path,
+    state_dict: Mapping[str, torch.Tensor],
+    tokenizer_payload: Mapping[str, Any],
+    decoder_config: Mapping[str, Any],
+) -> None:
+    try:
+        from safetensors.torch import save_file
+    except ImportError as error:
+        raise ImportError("Saving a .safetensors CTC timestamp artifact requires safetensors.") from error
+
+    model_proto = tokenizer_payload.get("model_proto")
+    if not isinstance(model_proto, bytes) or not model_proto:
+        raise ValueError("tokenizer.model_proto must contain serialized SentencePiece model bytes.")
+    tokenizer_config = {key: value for key, value in tokenizer_payload.items() if key != "model_proto"}
+    config = OmegaConf.to_container(OmegaConf.create(dict(decoder_config)), resolve=True)
+    tensors = {f"decoder.{key}": value.detach().cpu().contiguous().clone() for key, value in state_dict.items()}
+    tensors["tokenizer.model_proto"] = torch.frombuffer(bytearray(model_proto), dtype=torch.uint8).clone()
+    metadata = {
+        "format": CTC_TIMESTAMP_ARTIFACT_FORMAT,
+        "decoder_config": json.dumps(config, ensure_ascii=False, separators=(",", ":")),
+        "tokenizer_config": json.dumps(tokenizer_config, ensure_ascii=False, separators=(",", ":")),
+    }
+    save_file(tensors, str(path), metadata=metadata)
+
+
+def _load_ctc_timestamp_safetensors(path: Path) -> dict[str, Any]:
+    try:
+        from safetensors import safe_open
+        from safetensors.torch import load_file
+    except ImportError as error:
+        raise ImportError("Loading a .safetensors CTC timestamp artifact requires safetensors.") from error
+
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        metadata = handle.metadata() or {}
+    if metadata.get("format") != CTC_TIMESTAMP_ARTIFACT_FORMAT:
+        raise ValueError(
+            f"Expected a {CTC_TIMESTAMP_ARTIFACT_FORMAT!r} artifact. Convert the original .nemo adapter first."
+        )
+    try:
+        decoder_config = _plain_mapping(json.loads(metadata["decoder_config"]), "decoder_config")
+        tokenizer_payload = _plain_mapping(json.loads(metadata["tokenizer_config"]), "tokenizer_config")
+    except (KeyError, json.JSONDecodeError) as error:
+        raise ValueError("Invalid CTC timestamp safetensors metadata.") from error
+
+    tensors = load_file(str(path), device="cpu")
+    model_proto = tensors.pop("tokenizer.model_proto", None)
+    if not isinstance(model_proto, torch.Tensor) or model_proto.dtype != torch.uint8 or model_proto.numel() == 0:
+        raise ValueError("tokenizer.model_proto must be a non-empty uint8 tensor.")
+    unexpected = sorted(key for key in tensors if not key.startswith("decoder."))
+    if unexpected:
+        raise ValueError(f"Unexpected tensor(s) in CTC timestamp artifact: {unexpected}.")
+    state_dict = {key.removeprefix("decoder."): value for key, value in tensors.items()}
+    tokenizer_payload["model_proto"] = model_proto.contiguous().numpy().tobytes()
+    return {
+        "format": CTC_TIMESTAMP_ARTIFACT_FORMAT,
+        "decoder_config": decoder_config,
+        "decoder_state_dict": state_dict,
+        "tokenizer": tokenizer_payload,
+    }
 
 
 def export_ctc_timestamp_artifact(source_nemo: Union[str, Path], destination: Union[str, Path]) -> Path:

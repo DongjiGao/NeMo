@@ -48,6 +48,34 @@ def test_lightweight_artifact_round_trip_contains_decoder_and_tokenizer(tmp_path
 
 
 @pytest.mark.unit
+def test_safetensors_artifact_round_trip_contains_only_decoder_and_tokenizer(tmp_path):
+    safetensors = pytest.importorskip("safetensors")
+    tokenizer_path = Path(__file__).resolve().parents[2] / ".data/asr/tokenizers/an4_spe_128/tokenizer.model"
+    tokenizer = SentencePieceTokenizer(str(tokenizer_path))
+    config = {
+        "feat_in": 8,
+        "num_classes": tokenizer.vocab_size,
+        "vocabulary": tokenizer.ids_to_tokens(list(range(tokenizer.vocab_size))),
+        "use_transformer": False,
+    }
+    decoder = TransformerCTCDecoder(**config)
+    artifact_path = save_ctc_timestamp_artifact(tmp_path / "timestamp.safetensors", decoder, tokenizer, config)
+
+    with safetensors.safe_open(str(artifact_path), framework="pt", device="cpu") as handle:
+        keys = set(handle.keys())
+        assert handle.metadata()["format"] == CTC_TIMESTAMP_ARTIFACT_FORMAT
+    assert "tokenizer.model_proto" in keys
+    assert all(key == "tokenizer.model_proto" or key.startswith("decoder.") for key in keys)
+    assert not any(key.startswith("encoder.") for key in keys)
+
+    restored = load_ctc_timestamp_artifact(artifact_path)
+    assert restored.tokenizer.text_to_ids("hello world") == tokenizer.text_to_ids("hello world")
+    assert restored.decoder_config == config
+    for name, value in decoder.state_dict().items():
+        assert torch.equal(restored.decoder.state_dict()[name], value)
+
+
+@pytest.mark.unit
 def test_loader_rejects_decoder_only_legacy_payload(tmp_path):
     path = tmp_path / "legacy.pt"
     torch.save({"format": "transformer_ctc_decoder_state_dict_v1"}, path)
