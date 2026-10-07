@@ -72,11 +72,13 @@ vLLM's scheduler knows with a random suffix appended.
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import threading
 import weakref
 from collections import Counter, deque
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -237,6 +239,41 @@ def ctc_adapter_path(ctc_config: Any) -> str | None:
     if isinstance(ctc_config, dict):
         return ctc_config.get("adapter_path")
     return getattr(ctc_config, "adapter_path", None)
+
+
+def ctc_timestamp_config(model_config: Any) -> Any:
+    """Return the ``ctc_timestamps`` block that turns timestamps on for a model, or ``None`` when they are off.
+
+    The checkpoint config's block when it names an adapter. Otherwise a checkpoint whose
+    ``model.safetensors`` bundles the CTC head (``ctc_timestamp_format`` in its metadata, the head
+    under ``ctc_timestamp.``) is its own adapter, with the block's speaker prior weight.
+
+    Args:
+        model_config (Any): vLLM's ``ModelConfig``: its ``hf_config`` and the local ``model`` directory.
+    """
+    ctc_config = getattr(model_config.hf_config, "ctc_timestamps", None)
+    if ctc_adapter_path(ctc_config):
+        return ctc_config
+    bundled = _bundled_ctc_head(str(getattr(model_config, "model", None) or ""))
+    if bundled is None:
+        return None
+    return {"adapter_path": bundled, "speaker_logprob_weight": read_speaker_prior_weight(ctc_config)}
+
+
+@functools.lru_cache(maxsize=None)
+def _bundled_ctc_head(model: str) -> str | None:
+    """The ``model.safetensors`` of a local checkpoint directory that bundles a CTC timestamp head."""
+    from safetensors import safe_open
+
+    from nemo.collections.speechlm2.parts.ctc_timestamp_utils import CTC_TIMESTAMP_ARTIFACT_FORMAT
+    from nemo.collections.speechlm2.parts.hf_hub import SAFETENSORS_SINGLE_FILE
+
+    path = Path(model) / SAFETENSORS_SINGLE_FILE
+    if not model or not path.is_file():
+        return None
+    with safe_open(str(path), framework="pt", device="cpu") as checkpoint:
+        metadata = checkpoint.metadata() or {}
+    return str(path.resolve()) if metadata.get("ctc_timestamp_format") == CTC_TIMESTAMP_ARTIFACT_FORMAT else None
 
 
 def tokenizer_special_tokens(model_config: Any) -> tuple[str, ...]:

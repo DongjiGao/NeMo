@@ -44,7 +44,12 @@ import uuid
 from http import HTTPStatus
 from typing import Any
 
-from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import align_async, ctc_adapter_path, release_captures_async
+from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
+    align_async,
+    ctc_adapter_path,
+    ctc_timestamp_config,
+    release_captures_async,
+)
 from nemo.utils import logging
 from nemo.utils.nemo_logging import LogMode
 
@@ -71,7 +76,7 @@ async def ctc_timestamp_middleware(request: Any, call_next: Any) -> Any:
         request.method != "POST"
         or path != _CHAT_PATH
         or engine is None
-        or not ctc_adapter_path(getattr(engine.model_config.hf_config, "ctc_timestamps", None))
+        or not ctc_adapter_path(ctc_timestamp_config(engine.model_config))
     ):
         return await call_next(request)
     # Reading the body here keeps it replayable for vLLM's route.

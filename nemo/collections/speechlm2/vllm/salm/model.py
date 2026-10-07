@@ -69,6 +69,7 @@ from nemo.collections.speechlm2.vllm.salm.config import _AUDIO_PLACEHOLDER
 from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
     active_aligner,
     ctc_adapter_path,
+    ctc_timestamp_config,
     install_worker_methods,
     read_speaker_prior_weight,
     register_aligner,
@@ -182,15 +183,15 @@ class NeMoSpeechLMForConditionalGeneration(
         # Installed even without an adapter, so ctc_timestamps() gets a clear "not
         # enabled" error instead of an unknown method.
         install_worker_methods()
-        self._maybe_enable_ctc_timestamps(getattr(config, "ctc_timestamps", None), vllm_config)
+        self._maybe_enable_ctc_timestamps(ctc_timestamp_config(vllm_config.model_config), vllm_config)
 
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
 
     def _maybe_enable_ctc_timestamps(self, ctc_config: Any, vllm_config: VllmConfig) -> None:
-        """Arm CTC timestamp capture when the checkpoint ships an adapter path.
+        """Arm CTC timestamp capture when the checkpoint names a CTC adapter or bundles the head.
 
-        Driven by a ``ctc_timestamps`` block in the checkpoint config, mirroring
-        how ``encoder_quantization`` travels, so serving needs no extra flags.
+        Driven by the checkpoint (``ctc_timestamp_config``), mirroring how
+        ``encoder_quantization`` travels, so serving needs no extra flags.
         Off unless configured: capture costs throughput and retains rows, so a
         deployment that does not want timestamps should not pay for them.
         """
@@ -427,6 +428,8 @@ class NeMoSpeechLMForConditionalGeneration(
     def _split_perception_llm(
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> tuple[dict[str, torch.Tensor], list[tuple[str, torch.Tensor]]]:
+        from nemo.collections.speechlm2.parts.ctc_timestamp_utils import CTC_TIMESTAMP_BUNDLE_PREFIX
+
         perception: dict[str, torch.Tensor] = {}
         llm: list[tuple[str, torch.Tensor]] = []
         for name, tensor in weights:
@@ -436,6 +439,8 @@ class NeMoSpeechLMForConditionalGeneration(
                 perception[name[len("perception.") :]] = tensor
             elif name.startswith("llm.mtp."):
                 pass  # MTP draft-head weights; loaded by the speculative draft model, not here
+            elif name.startswith(CTC_TIMESTAMP_BUNDLE_PREFIX):
+                pass  # a bundled CTC timestamp head; the aligner loads it from the checkpoint file
             elif name.startswith("mtp."):
                 raise ValueError(
                     f"Unsupported bare MTP tensor {name!r}; NeMo SpeechLM exports must store draft weights "

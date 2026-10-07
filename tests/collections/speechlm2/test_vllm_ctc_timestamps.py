@@ -1149,6 +1149,49 @@ def test_a_completion_vllm_cancelled_for_a_disconnected_client_passes_through_an
     assert not [record for record in caplog.records if record.levelname == "ERROR"]
 
 
+def _checkpoint(directory, bundles_ctc_head=True):
+    """A ``model.safetensors`` whose metadata marks a bundled CTC timestamp head when asked."""
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    from nemo.collections.speechlm2.parts.ctc_timestamp_utils import CTC_TIMESTAMP_ARTIFACT_FORMAT
+
+    path = directory / "model.safetensors"
+    metadata = {"ctc_timestamp_format": CTC_TIMESTAMP_ARTIFACT_FORMAT} if bundles_ctc_head else {}
+    safetensors_torch.save_file({"llm.weight": torch.zeros(1)}, str(path), metadata=metadata)
+    return str(path.resolve())
+
+
+def test_a_checkpoint_that_bundles_the_ctc_head_is_its_own_adapter(tmp_path):
+    bundled = _checkpoint(tmp_path)
+
+    def model_config(ctc_timestamps):
+        return SimpleNamespace(hf_config=SimpleNamespace(ctc_timestamps=ctc_timestamps), model=str(tmp_path))
+
+    assert ct.ctc_timestamp_config(model_config(None)) == {
+        "adapter_path": bundled,
+        "speaker_logprob_weight": ct.DEFAULT_SPEAKER_PRIOR_WEIGHT,
+    }
+    assert ct.ctc_timestamp_config(model_config({"speaker_logprob_weight": 0.5}))["speaker_logprob_weight"] == 0.5
+    named = {"adapter_path": "/adapter.safetensors"}
+    assert ct.ctc_timestamp_config(model_config(named)) is named
+
+
+def test_a_checkpoint_without_a_bundled_head_keeps_timestamps_off(tmp_path):
+    _checkpoint(tmp_path, bundles_ctc_head=False)
+    model_config = SimpleNamespace(hf_config=SimpleNamespace(ctc_timestamps=None), model=str(tmp_path))
+
+    assert ct.ctc_timestamp_config(model_config) is None
+
+
+def test_a_server_whose_checkpoint_bundles_the_ctc_head_attaches_timestamps(server, tmp_path):
+    _checkpoint(tmp_path)
+    server.hf_config.ctc_timestamps = None
+    server.app.state.engine_client.model_config.model = str(tmp_path)
+
+    response = server.post()
+
+    assert _words(response.json()["ctc_timestamps"]) == ["hi", "there"]
+
+
 class _Worker:
     """One vLLM worker process, with an engine-side store of its own; only rank 0 holds captures."""
 
