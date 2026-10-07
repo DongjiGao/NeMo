@@ -509,8 +509,10 @@ class MultiSpeakerSOTWordTimestampAligner:
             )
 
         blank_id = self._resolve_blank_id(vocab_size)
-        weight = self.speaker_logprob_weight if speaker_logprob_weight is None else float(speaker_logprob_weight)
-        if weight < 0:
+        speaker_logprob_weight = (
+            self.speaker_logprob_weight if speaker_logprob_weight is None else float(speaker_logprob_weight)
+        )
+        if speaker_logprob_weight < 0:
             raise ValueError("speaker_logprob_weight must be non-negative.")
 
         records = []
@@ -585,7 +587,7 @@ class MultiSpeakerSOTWordTimestampAligner:
         return {
             "config": {
                 "speaker_activity_threshold": self.speaker_activity_threshold,
-                "speaker_logprob_weight": weight,
+                "speaker_logprob_weight": speaker_logprob_weight,
                 "maximum_token_len": self.maximum_token_len,
                 "epsilon": self.epsilon,
             },
@@ -611,7 +613,7 @@ class MultiSpeakerSOTWordTimestampAligner:
         records = prepared["records"]
         batch_size = len(records)
         max_ctc_frames = prepared["max_ctc_frames"]
-        weight = prepared["config"]["speaker_logprob_weight"]
+        speaker_logprob_weight = prepared["config"]["speaker_logprob_weight"]
         ctc_lengths_list = [record["ctc_length"] for record in records]
         num_columns = max((record["ctc_log_probs"].shape[1] for record in records), default=1)
         ctc_cpu = torch.zeros((batch_size, max_ctc_frames, num_columns))
@@ -699,7 +701,7 @@ class MultiSpeakerSOTWordTimestampAligner:
 
             use_speaker_dp = bool(
                 aligned_speaker_cpu is not None
-                and weight > 0
+                and speaker_logprob_weight > 0
                 and any(column is not None for context in contexts for column in context["mapping"].values())
             )
             if use_speaker_dp:
@@ -710,7 +712,7 @@ class MultiSpeakerSOTWordTimestampAligner:
                     blank_id,
                     [context["mapping"] for context in contexts],
                     speaker_probs=aligned_speaker_cpu,
-                    speaker_logprob_weight=weight,
+                    speaker_logprob_weight=speaker_logprob_weight,
                 )
             else:
                 final_paths, final_path_scores = preliminary_paths, preliminary_path_scores
