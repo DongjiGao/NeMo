@@ -231,6 +231,11 @@ class MultiSpeakerSOTWordTimestampAligner:
     (:meth:`generate_from_inputs`) or CTC log probabilities (:meth:`extract_from_outputs_batch`).
     To start from audio, run the encoder with ``return_ctc_timestamp_inputs=True`` and pass the
     returned ``CTCTimestampInputs`` to :meth:`generate_from_inputs`.
+
+    Each result keeps word timestamps (``speaker_word_timestamps``) apart from the 10 ms
+    Sortformer activity segments (``diarization_timestamps``). Score diarization (DER) with
+    the segments only: word timestamps mark where each word is, not continuous speech
+    activity, so a DER computed from them is poor.
     """
 
     _SPEAKER_TAG_RE = re.compile(r"<spk:(\d+)>", flags=re.IGNORECASE)
@@ -780,7 +785,7 @@ class MultiSpeakerSOTWordTimestampAligner:
                     "diarization_timestamps": (
                         []
                         if record["diarization_labels"] is None
-                        else self._diarization_segments(
+                        else self.diarization_segments(
                             record["diarization_labels"],
                             frame_seconds=prepared["diarization_frame_seconds"],
                             time_offset=record["time_offset"],
@@ -891,14 +896,24 @@ class MultiSpeakerSOTWordTimestampAligner:
         ]
 
     @staticmethod
-    def _diarization_segments(
+    def diarization_segments(
         labels: torch.Tensor,
         *,
         frame_seconds: float,
         time_offset: float,
         audio_duration: Optional[float],
     ) -> List[Dict[str, Any]]:
-        """Convert boolean ``(speakers, frames)`` activity into DER-ready segments."""
+        """Convert boolean ``(speakers, frames)`` activity into DER-ready segments.
+
+        Args:
+            labels (torch.Tensor): Boolean speaker activity shaped ``(speakers, frames)``.
+            frame_seconds (float): Duration of one label frame, in seconds.
+            time_offset (float): Time of the first frame, in seconds.
+            audio_duration (Optional[float]): Recording duration in seconds; segments end there.
+
+        Returns:
+            List[Dict[str, Any]]: ``speaker`` (the label row), ``start`` and ``end``, in start-time order.
+        """
         segments = []
         for speaker, activity in enumerate(labels):
             padded = torch.cat(

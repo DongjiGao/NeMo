@@ -24,7 +24,8 @@ and :func:`ctc_timestamp_middleware` aligns the finished transcript of such a re
 through :func:`align_async`, the same worker method offline callers reach, and adds
 the result to the response as a top-level ``ctc_timestamps`` field in the offline
 format: ``words``, ``diarization``, ``speaker_tag_to_diarization_speaker`` and
-``error``, which names why a result has no timestamps. vLLM's
+``error``, which names why ``words`` is empty. Score diarization (DER) with ``diarization``,
+never with ``words``. vLLM's
 chat route serves the request itself, API-key check included; every other request
 passes through untouched.
 

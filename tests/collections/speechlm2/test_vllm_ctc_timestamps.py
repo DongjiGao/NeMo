@@ -40,12 +40,24 @@ class _FakeAligner:
         self.calls.append((timestamp_inputs, list(sot_transcripts), list(audio_durations)))
         if any("crash" in text for text in sot_transcripts):
             raise RuntimeError("kernel failure")
+        if any("untokenizable" in text for text in sot_transcripts):
+            raise ValueError("tokenizer disagreement")
+        labels, lengths = timestamp_inputs.diarization_labels, timestamp_inputs.diarization_lengths
         return {
             "config": {},
             "num_speaker_columns": 2,
             "diarization_frame_seconds": 0.01,
             "diarization_max_speaker_count": 4,
-            "records": [{"text": text, "ctc_log_probs": torch.zeros(1, 2)} for text in sot_transcripts],
+            "records": [
+                {
+                    "text": text,
+                    "ctc_log_probs": torch.zeros(1, 2),
+                    "diarization_labels": None if labels is None else labels[row, :, : int(lengths[row])],
+                    "audio_duration": duration,
+                    "time_offset": 0.0,
+                }
+                for row, (text, duration) in enumerate(zip(sot_transcripts, audio_durations))
+            ],
         }
 
 
@@ -600,6 +612,33 @@ def test_an_empty_transcript_has_no_words_and_no_error(aligner):
 
     assert _align_one("req", " ", release=True) == ct._empty_result()
     assert aligner.calls == []
+
+
+def test_requests_whose_words_are_not_aligned_still_get_their_diarization(aligner):
+    labels = torch.zeros(3, 4, 32, dtype=torch.bool)
+    labels[:, 1, 5:15] = True
+    inputs = CTCTimestampInputs(
+        asr_encoded=torch.randn(3, 4, 4),
+        asr_encoded_lengths=torch.full((3,), 4),
+        sortformer_sigmoids=torch.rand(3, 4, 2),
+        sortformer_lengths=torch.full((3,), 4),
+        diarization_labels=labels,
+        diarization_lengths=torch.full((3,), 32),
+    )
+    _capture(3, 4, ["hash-a", "hash-b", "hash-c"], inputs=inputs)
+    ct._record_request_hashes([("empty", "hash-a"), ("untokenizable", "hash-b"), ("unalignable", "hash-c")])
+    finished = [("empty", " "), ("untokenizable", "untokenizable"), ("unalignable", "unalignable")]
+
+    results = ct.align_finished_requests(finished, release=True)
+
+    # Speaker 1 is active from 10 ms label frame 5 to 15, whatever happened to the words:
+    # nothing to align, rejected while preparing, and rejected by the search.
+    segment = [{"speaker": 1, "start": 0.05, "end": 0.15}]
+    assert results == [
+        ct._empty_result(None, segment),
+        ct._empty_result("alignment_failed", segment),
+        ct._empty_result("alignment_failed", segment),
+    ]
 
 
 def test_reencoded_audio_replaces_its_entry_as_the_most_recent(aligner):

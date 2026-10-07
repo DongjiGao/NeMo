@@ -52,7 +52,8 @@ served from the cache and captures nothing, so it needs the old capture. Stored 
 are bounded by ``NEMO_CTC_TIMESTAMP_RETAIN_GB`` of host memory (default 8): captures no
 request owns are evicted first, least recently used first, and when owned captures alone
 fill the budget, new captures are refused, so no request loses a capture it already has.
-A result without timestamps names the reason in its ``error``.
+A result without word timestamps names the reason in its ``error``; its 10 ms
+diarization, which needs only the capture, is still returned.
 
 Alignment is split where its work changes kind. The engine process, where the inputs
 live, runs the CTC head on the device and keeps only the log-prob columns each
@@ -569,8 +570,9 @@ def _compact(entry: dict) -> None:
     entry["nbytes"] = _entry_nbytes(entry)
 
 
-def _empty_result(error: str | None = None) -> dict:
-    return {"words": [], "diarization": [], "speaker_tag_to_diarization_speaker": {}, "error": error}
+def _empty_result(error: str | None = None, diarization: Sequence[dict] = ()) -> dict:
+    """A result without words; ``diarization`` comes from the capture alone, when there is one."""
+    return {"words": [], "diarization": list(diarization), "speaker_tag_to_diarization_speaker": {}, "error": error}
 
 
 def align_finished_requests(finished: Sequence[tuple[str, str]], *, release: bool) -> list[dict]:
@@ -590,15 +592,18 @@ def align_finished_requests(finished: Sequence[tuple[str, str]], *, release: boo
         list[dict]: Per item, ``words`` (``word``/``start``/``end``/``speaker`` in
         start-time order, speaker being the transcript's ``<spk:N>`` tag),
         ``diarization`` (10 ms Sortformer activity segments, ``speaker`` being the
-        Sortformer speaker index; the output to score diarization with),
-        ``speaker_tag_to_diarization_speaker`` linking the two, and ``error``: ``None``
-        when the result is complete, as for an empty transcript, which has no words;
-        otherwise why its lists are empty: ``"not_enabled"`` (timestamps are not
-        enabled), ``"no_capture"`` (no capture is recorded for the request: it did not
-        opt in, carried no audio, or was already released), ``"multiple_audio"`` (it has
-        more than one audio item), ``"capture_unavailable"`` (its capture was not kept,
-        to stay under ``NEMO_CTC_TIMESTAMP_RETAIN_GB``), or ``"alignment_failed"`` (the
-        aligner cannot align the transcript).
+        Sortformer speaker index), ``speaker_tag_to_diarization_speaker`` linking the
+        two, and ``error``. Score diarization (DER) with ``diarization`` only: word
+        timestamps mark where each word is, not continuous speech activity, so a DER
+        computed from them is poor. ``diarization`` needs only the capture, so it is
+        returned even when the words cannot be aligned. ``error`` is ``None`` when the
+        words are complete, as for an empty transcript, which has none; otherwise it says
+        why ``words`` is empty: ``"not_enabled"`` (timestamps are not enabled),
+        ``"no_capture"`` (no capture is recorded for the request: it did not opt in,
+        carried no audio, or was already released), ``"multiple_audio"`` (it has more
+        than one audio item), ``"capture_unavailable"`` (its capture was not kept, to stay
+        under ``NEMO_CTC_TIMESTAMP_RETAIN_GB``), or ``"alignment_failed"`` (the aligner
+        cannot align the transcript; ``diarization`` is still returned).
 
     Raises:
         Exception: Any aligner error other than ``ValueError``, which is how the
@@ -622,9 +627,10 @@ def prepare_finished_requests(finished: Sequence[tuple[str, str]], *, release: b
 
     Returns:
         dict: ``count``, the number of items; ``errors``, per item the ``error`` its result
-        reports (see :func:`align_finished_requests`); and ``batches``: each ``items``, the
-        indices it covers, and ``prepared``, a batch for :func:`align_prepared_requests`.
-        Items in no batch get empty results.
+        reports (see :func:`align_finished_requests`); ``diarization``, per item in no
+        batch its diarization from the capture alone, or ``None``; and ``batches``: each
+        ``items``, the indices it covers, and ``prepared``, a batch for
+        :func:`align_prepared_requests`. Items in no batch get results without words.
 
     Raises:
         Exception: Any error other than ``ValueError`` while preparing.
@@ -632,17 +638,15 @@ def prepare_finished_requests(finished: Sequence[tuple[str, str]], *, release: b
     from nemo.collections.speechlm2.parts.ctc_timestamp_utils import MultiSpeakerSOTWordTimestampAligner
 
     errors: list[str | None] = [None] * len(finished)
-    reply = {"count": len(finished), "batches": [], "errors": errors}
+    diarization: list[list[dict] | None] = [None] * len(finished)
+    reply = {"count": len(finished), "batches": [], "errors": errors, "diarization": diarization}
     aligner = active_aligner()
     if aligner is None:
         return {**reply, "errors": ["not_enabled"] * len(finished)}
     special_tokens = _registry.get("special_tokens", ())
-    pending, no_audio, multi_audio, evicted = [], [], [], []
+    pending, wordless, no_audio, multi_audio, evicted = [], [], [], [], []
     with _lock:
         for index, (request_id, text) in enumerate(finished):
-            text = MultiSpeakerSOTWordTimestampAligner.clean_sot_transcript(text, special_tokens)
-            if not text:
-                continue
             hashes = mm_hashes_for_request(request_id)
             if not hashes:
                 no_audio.append(request_id)
@@ -663,9 +667,12 @@ def prepare_finished_requests(finished: Sequence[tuple[str, str]], *, release: b
             # Re-insert to mark it recently used; releasing happens after preparing.
             entry = _store.pop(key)
             _store[key] = entry
+            text = MultiSpeakerSOTWordTimestampAligner.clean_sot_transcript(text, special_tokens)
             # A snapshot, so compaction on the engine thread cannot swap its tensors
-            # while they are being collated.
-            pending.append((index, text, dict(entry)))
+            # while they are being read. An empty transcript has no words to align.
+            (pending if text else wordless).append((index, text, dict(entry)))
+    for index, _, entry in wordless:
+        diarization[index] = _capture_diarization(entry)
     if multi_audio:
         logging.warning(
             "[NeMoSpeechLM] CTC timestamps need one audio item per request; skipped %d requests with more "
@@ -708,9 +715,10 @@ def prepare_finished_requests(finished: Sequence[tuple[str, str]], *, release: b
         for items, prepared in _prepare_chunk(aligner, chunk, device):
             reply["batches"].append({"items": items, "prepared": prepared})
     prepared_items = {index for batch in reply["batches"] for index in batch["items"]}
-    for index, _, _ in pending:
+    for index, _, entry in pending:
         if index not in prepared_items:
             errors[index] = "alignment_failed"
+            diarization[index] = _capture_diarization(entry)
     if release:
         _release_requests([request_id for request_id, _ in finished])
     return reply
@@ -736,11 +744,53 @@ def align_prepared_requests(reply: dict) -> list[dict]:
 
 def _results_from(reply: dict, aligned: Sequence[list[dict | None]]) -> list[dict]:
     """Public results per item of ``reply``, from each of its batches' aligner results."""
-    results: list[dict] = [_empty_result(error) for error in reply.get("errors") or [None] * reply["count"]]
+    errors = reply.get("errors") or [None] * reply["count"]
+    diarization = reply.get("diarization") or [None] * reply["count"]
+    results: list[dict] = [_empty_result(error, segments or ()) for error, segments in zip(errors, diarization)]
     for batch, batch_results in zip(reply["batches"], aligned):
-        for index, result in zip(batch["items"], batch_results):
-            results[index] = _empty_result("alignment_failed") if result is None else _public_result(result)
+        prepared = batch["prepared"]
+        for index, record, result in zip(batch["items"], prepared["records"], batch_results):
+            if result is None:
+                results[index] = _empty_result("alignment_failed", _record_diarization(prepared, record))
+            else:
+                results[index] = _public_result(result)
     return results
+
+
+def _capture_diarization(entry: dict) -> list[dict]:
+    """Public diarization of a stored capture, from its 10 ms labels alone."""
+    from nemo.collections.speechlm2.parts.ctc_timestamp_utils import MultiSpeakerSOTWordTimestampAligner
+
+    labels = entry["diarization_labels"]
+    if labels is None:
+        return []
+    if entry["ready"] is not None:
+        entry["ready"].synchronize()
+    lengths = entry["diarization_lengths"]
+    return _public_diarization(
+        MultiSpeakerSOTWordTimestampAligner.diarization_segments(
+            labels[0, :, : labels.shape[-1] if lengths is None else int(lengths[0])],
+            frame_seconds=entry["diarization_frame_seconds"],
+            time_offset=0.0,
+            audio_duration=float(entry["duration"]),
+        )
+    )
+
+
+def _record_diarization(prepared: dict, record: dict) -> list[dict]:
+    """Public diarization of a prepared record, from its 10 ms labels alone."""
+    from nemo.collections.speechlm2.parts.ctc_timestamp_utils import MultiSpeakerSOTWordTimestampAligner
+
+    if record.get("diarization_labels") is None:
+        return []
+    return _public_diarization(
+        MultiSpeakerSOTWordTimestampAligner.diarization_segments(
+            record["diarization_labels"],
+            frame_seconds=prepared["diarization_frame_seconds"],
+            time_offset=record["time_offset"],
+            audio_duration=record["audio_duration"],
+        )
+    )
 
 
 def _head_batches(aligner: Any, pending: list) -> list[list]:
@@ -983,15 +1033,24 @@ def _public_result(result: dict) -> dict:
         for word in speaker_words
     ]
     words.sort(key=lambda w: (w["start"], w["end"]))
-    diarization = [
-        {"speaker": int(segment["speaker"]), "start": _seconds(segment["start"]), "end": _seconds(segment["end"])}
-        for segment in result.get("diarization_timestamps") or ()
-    ]
     mapping = {
         str(tag): None if column is None else int(column)
         for tag, column in (result.get("speaker_tag_to_sortformer_column") or {}).items()
     }
-    return {"words": words, "diarization": diarization, "speaker_tag_to_diarization_speaker": mapping, "error": None}
+    return {
+        "words": words,
+        "diarization": _public_diarization(result.get("diarization_timestamps") or ()),
+        "speaker_tag_to_diarization_speaker": mapping,
+        "error": None,
+    }
+
+
+def _public_diarization(segments: Sequence[dict]) -> list[dict]:
+    """Diarization segments with the Sortformer speaker index, and times rounded to milliseconds."""
+    return [
+        {"speaker": int(segment["speaker"]), "start": _seconds(segment["start"]), "end": _seconds(segment["end"])}
+        for segment in segments
+    ]
 
 
 def _seconds(value: Any) -> float:
