@@ -996,7 +996,13 @@ def server(aligner):
         _capture(1, 4, [f"hash-{request_id}"])
         ct._record_request_hashes([(f"{request_id}-0123abcd", f"hash-{request_id}")])
 
-    script = {"transcript": "hi there", "status": 200, "id_prefix": "chatcmpl-", "capture": capture}
+    script = {
+        "transcript": "hi there",
+        "status": 200,
+        "id_prefix": "chatcmpl-",
+        "capture": capture,
+        "cancelled": False,
+    }
     rpcs = []
 
     async def collective_rpc(method, args):
@@ -1016,6 +1022,8 @@ def server(aligner):
         if (body.get("mm_processor_kwargs") or {}).get("capture_ctc_timestamps"):
             # The capture the engine keeps for an opted-in request while it generates.
             script["capture"](request_id)
+        if script["cancelled"]:
+            return None  # what vLLM's route returns once its client disconnects
         message = {"role": "assistant", "content": script["transcript"]}
         content = {"id": request_id, "object": "chat.completion", "choices": [{"index": 0, "message": message}]}
         return JSONResponse(content, status_code=script["status"])
@@ -1129,6 +1137,16 @@ def test_a_cancelled_chat_completion_releases_its_capture(server):
         asyncio.run(ctc_timestamp_middleware(Request(scope, receive), call_next))
 
     assert server.rpcs == [ct.WORKER_RELEASE_METHOD] and ct._store == {}
+
+
+def test_a_completion_vllm_cancelled_for_a_disconnected_client_passes_through_and_releases(server, caplog):
+    server.script["cancelled"] = True
+
+    response = server.post()
+
+    assert response.status_code == 200 and response.json() is None
+    assert server.rpcs == [ct.WORKER_RELEASE_METHOD] and ct._store == {}
+    assert not [record for record in caplog.records if record.levelname == "ERROR"]
 
 
 class _Worker:

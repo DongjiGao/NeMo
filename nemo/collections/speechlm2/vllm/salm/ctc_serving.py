@@ -89,6 +89,11 @@ async def ctc_timestamp_middleware(request: Any, call_next: Any) -> Any:
             await _release(engine, request_id)
             return response
         completion = json.loads(b"".join([chunk async for chunk in response.body_iterator]))
+        headers = {name: value for name, value in response.headers.items() if name.lower() != "content-length"}
+        if not isinstance(completion, dict):
+            # vLLM's chat route answers null for a request whose client disconnected; there is nothing to align.
+            await _release(engine, request_id)
+            return _json(completion, response.status_code, headers)
         request_id = _reported_request_id(completion, request_id)
         text = completion["choices"][0]["message"]["content"] or ""
         (result,) = await align_async(_capture_owner_rpc(engine), [(request_id, text)], require_enabled=False)
@@ -103,7 +108,6 @@ async def ctc_timestamp_middleware(request: Any, call_next: Any) -> Any:
         return _error(error, "InternalServerError", HTTPStatus.INTERNAL_SERVER_ERROR)
 
     completion["ctc_timestamps"] = result
-    headers = {name: value for name, value in response.headers.items() if name.lower() != "content-length"}
     return _json(completion, response.status_code, headers)
 
 
