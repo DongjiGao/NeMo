@@ -34,7 +34,7 @@ import os
 import tarfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
 import torch.distributed as dist
@@ -963,12 +963,18 @@ class ParallelExpertEncoder(nn.Module):
             use_online = audio_signal.shape[-1] > self.chunk_feat_len
         else:
             use_online = False
-        runner = self._forward_online if use_online else self._forward
+        if return_ctc_timestamp_inputs:
+            runner = (
+                self._forward_online_with_ctc_timestamp_inputs
+                if use_online
+                else self._forward_with_ctc_timestamp_inputs
+            )
+        else:
+            runner = self._forward_online if use_online else self._forward
         return runner(
             audio_signal=audio_signal,
             length=length,
             spk_targets=spk_targets,
-            return_ctc_timestamp_inputs=return_ctc_timestamp_inputs,
         )
 
     def _align_diarization_output_resolution(
@@ -1142,8 +1148,40 @@ class ParallelExpertEncoder(nn.Module):
         audio_signal,
         length,
         spk_targets=None,
-        return_ctc_timestamp_inputs: bool = False,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the single-pass encoder without retaining timestamp inputs."""
+        output, encoded_len, _ = self._forward_impl(
+            audio_signal=audio_signal,
+            length=length,
+            spk_targets=spk_targets,
+            return_ctc_timestamp_inputs=False,
+        )
+        return output, encoded_len
+
+    def _forward_with_ctc_timestamp_inputs(
+        self,
+        audio_signal,
+        length,
+        spk_targets=None,
+    ) -> tuple[torch.Tensor, torch.Tensor, CTCTimestampInputs]:
+        """Run the single-pass encoder and retain request-owned timestamp inputs."""
+        output, encoded_len, timestamp_inputs = self._forward_impl(
+            audio_signal=audio_signal,
+            length=length,
+            spk_targets=spk_targets,
+            return_ctc_timestamp_inputs=True,
+        )
+        if timestamp_inputs is None:
+            raise RuntimeError("CTC timestamp input capture completed without returning timestamp inputs.")
+        return output, encoded_len, timestamp_inputs
+
+    def _forward_impl(
+        self,
+        audio_signal,
+        length,
+        spk_targets,
+        return_ctc_timestamp_inputs: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[CTCTimestampInputs]]:
         """Single-pass forward used by training and validation."""
         self._check_spk_targets(spk_targets, audio_signal.shape[0])
         use_diarization = None if spk_targets is None else self._missing_target_rows(spk_targets)
@@ -1185,17 +1223,47 @@ class ParallelExpertEncoder(nn.Module):
             diarization_preds=diarization_preds,
             use_diarization=use_diarization,
         )
-        if return_ctc_timestamp_inputs:
-            return output, asr_encoded_len, timestamp_inputs
-        return output, asr_encoded_len
+        return output, asr_encoded_len, timestamp_inputs
 
     def _forward_online(
         self,
         audio_signal,
         length,
         spk_targets=None,
-        return_ctc_timestamp_inputs: bool = False,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the windowed encoder without retaining timestamp inputs."""
+        output, encoded_len, _ = self._forward_online_impl(
+            audio_signal=audio_signal,
+            length=length,
+            spk_targets=spk_targets,
+            return_ctc_timestamp_inputs=False,
+        )
+        return output, encoded_len
+
+    def _forward_online_with_ctc_timestamp_inputs(
+        self,
+        audio_signal,
+        length,
+        spk_targets=None,
+    ) -> tuple[torch.Tensor, torch.Tensor, CTCTimestampInputs]:
+        """Run the windowed encoder and retain request-owned timestamp inputs."""
+        output, encoded_len, timestamp_inputs = self._forward_online_impl(
+            audio_signal=audio_signal,
+            length=length,
+            spk_targets=spk_targets,
+            return_ctc_timestamp_inputs=True,
+        )
+        if timestamp_inputs is None:
+            raise RuntimeError("CTC timestamp input capture completed without returning timestamp inputs.")
+        return output, encoded_len, timestamp_inputs
+
+    def _forward_online_impl(
+        self,
+        audio_signal,
+        length,
+        spk_targets,
+        return_ctc_timestamp_inputs: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[CTCTimestampInputs]]:
         """Run both branches over context-extended long-form windows."""
         self._check_spk_targets(spk_targets, audio_signal.shape[0])
         total_feat_len = min(audio_signal.shape[-1], int(length.max().item()))
@@ -1332,9 +1400,7 @@ class ParallelExpertEncoder(nn.Module):
             diarization_preds=diarization_preds,
             use_diarization=use_diarization,
         )
-        if return_ctc_timestamp_inputs:
-            return output, encoded_len, timestamp_inputs
-        return output, encoded_len
+        return output, encoded_len, timestamp_inputs
 
     def _init_streaming_diar(self, audio_signal: torch.Tensor, length: torch.Tensor, batch_size: int):
         """Initialize Sortformer state for windowed inference.

@@ -781,11 +781,10 @@ def test_forward_online_returns_detached_encoder_states_without_running_ctc_head
     extractor = type("Extractor", (), {"ctc_decoder": decoder})()
     enc.__dict__["_ctc_timestamp_extractor_cache"] = ("/tmp/timestamp.pt", extractor)
 
-    _, encoded_len, timestamp_inputs = enc._forward_online(
+    _, encoded_len, timestamp_inputs = enc._forward_online_with_ctc_timestamp_inputs(
         audio_signal=torch.randn(2, 80, 200),
         length=torch.tensor([200, 160]),
         spk_targets=torch.rand(2, 25, 4),
-        return_ctc_timestamp_inputs=True,
     )
 
     assert decoder.calls == []
@@ -813,11 +812,10 @@ def test_forward_offline_returns_detached_encoder_states_without_second_asr_pass
         return original_asr_forward(*args, **kwargs)
 
     enc.asr_encoder.forward = count_asr_calls
-    _, encoded_len, timestamp_inputs = enc._forward(
+    _, encoded_len, timestamp_inputs = enc._forward_with_ctc_timestamp_inputs(
         audio_signal=torch.randn(1, 80, 64),
         length=torch.tensor([64]),
         spk_targets=torch.rand(1, 8, 4),
-        return_ctc_timestamp_inputs=True,
     )
 
     assert asr_calls == 1
@@ -1130,10 +1128,9 @@ def test_pe_encoder_retains_native_10ms_diarization_labels_during_online_timesta
     mels = torch.randn(2, _MEL_FEATURES, 160)
     lengths = torch.tensor([160, 120])
 
-    _, encoded_lengths, timestamp_inputs = enc._forward_online(
+    _, encoded_lengths, timestamp_inputs = enc._forward_online_with_ctc_timestamp_inputs(
         audio_signal=mels,
         length=lengths,
-        return_ctc_timestamp_inputs=True,
     )
 
     assert encoded_lengths.tolist() == [20, 15]
