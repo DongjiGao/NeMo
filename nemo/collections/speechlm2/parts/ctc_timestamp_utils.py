@@ -464,14 +464,14 @@ class MultiSpeakerSOTWordTimestampAligner:
 
         Returns:
             Dict[str, Any]: ``config``, the hyperparameters alignment uses, from which
-            :func:`align_prepared_batch` rebuilds an aligner; ``max_ctc_frames``;
-            ``num_speaker_columns``; ``diarization_frame_seconds``;
-            ``diarization_max_speaker_count``; and ``records``, per record: ``words``, speaker
-            ``streams`` with renumbered ``labels``, ``ctc_log_probs`` shaped
-            ``(ctc_length, columns)``, ``ctc_length``, ``ctc_step``, ``speaker_probs`` shaped
-            ``(speaker_length, speakers)``, ``speaker_length``, ``sortformer_step``,
-            ``diarization_labels`` shaped ``(speakers, diarization_length)``,
-            ``audio_duration`` and ``time_offset``.
+            :func:`align_prepared_batch` rebuilds an aligner; ``num_speaker_columns``;
+            ``diarization_frame_seconds``; ``diarization_max_speaker_count``; and ``records``,
+            per record: ``words``, speaker ``streams`` with renumbered ``labels``,
+            ``ctc_log_probs`` shaped ``(ctc_length, columns)``, ``ctc_length``, ``ctc_step``,
+            ``speaker_probs`` shaped ``(speaker_length, speakers)``, ``speaker_length``,
+            ``sortformer_step``, ``diarization_labels`` shaped ``(speakers, diarization_length)``,
+            ``audio_duration`` and ``time_offset``. :func:`merge_prepared_batches` merges
+            batches whose batch-level values match.
         """
         if ctc_log_probs.ndim != 3:
             raise ValueError("ctc_log_probs must have shape (batch, frames, classes).")
@@ -593,7 +593,6 @@ class MultiSpeakerSOTWordTimestampAligner:
                 "maximum_token_len": self.maximum_token_len,
                 "epsilon": self.epsilon,
             },
-            "max_ctc_frames": max_ctc_frames,
             "num_speaker_columns": None if sortformer_sigmoids is None else sortformer_sigmoids.shape[-1],
             "diarization_frame_seconds": None if diarization_labels is None else float(diarization_frame_seconds),
             "diarization_max_speaker_count": None if diarization_labels is None else diarization_labels.shape[1],
@@ -614,9 +613,9 @@ class MultiSpeakerSOTWordTimestampAligner:
         """
         records = prepared["records"]
         batch_size = len(records)
-        max_ctc_frames = prepared["max_ctc_frames"]
         speaker_logprob_weight = prepared["config"]["speaker_logprob_weight"]
         ctc_lengths_list = [record["ctc_length"] for record in records]
+        max_ctc_frames = max(ctc_lengths_list, default=0)
         num_columns = max((record["ctc_log_probs"].shape[1] for record in records), default=1)
         ctc_cpu = torch.zeros((batch_size, max_ctc_frames, num_columns))
         for index, record in enumerate(records):
@@ -1369,6 +1368,26 @@ def align_prepared_batch(prepared: Dict[str, Any]) -> List[Dict[str, Any]]:
         List[Dict[str, Any]]: One alignment result per record.
     """
     return MultiSpeakerSOTWordTimestampAligner(**prepared["config"]).align_prepared(prepared)
+
+
+def merge_prepared_batches(batches: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Merge batches from :meth:`MultiSpeakerSOTWordTimestampAligner.prepare_alignment` into one.
+
+    The alignment search runs one per-frame loop over all records at once, so a merged search
+    costs little more than its longest record. Batches merge only when every batch-level value,
+    everything but ``records``, matches.
+
+    Args:
+        batches (Sequence[Dict[str, Any]]): One or more prepared batches.
+
+    Returns:
+        Optional[Dict[str, Any]]: One batch with every record, in order, or ``None`` when a
+        batch-level value differs and the batches must be aligned separately.
+    """
+    batch_values = [{key: value for key, value in batch.items() if key != "records"} for batch in batches]
+    if any(values != batch_values[0] for values in batch_values[1:]):
+        return None
+    return {**batch_values[0], "records": [record for batch in batches for record in batch["records"]]}
 
 
 @dataclass(frozen=True)
