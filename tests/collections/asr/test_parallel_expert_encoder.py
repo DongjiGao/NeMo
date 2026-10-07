@@ -485,6 +485,17 @@ def test_prepared_alignment_needs_an_audio_duration_or_ctc_frame_seconds():
 
 
 @pytest.mark.unit
+def test_clean_sot_transcript_drops_special_tokens_but_keeps_speaker_tags():
+    special_tokens = ["<s>", "</s>", "<|im_end|>", "<spk:0>", "<SPK:1>"]
+
+    cleaned = MultiSpeakerSOTWordTimestampAligner.clean_sot_transcript(
+        "<s><spk:0> hello  <|im_end|>world <SPK:1> yes</s>", special_tokens
+    )
+
+    assert cleaned == "<spk:0> hello world <SPK:1> yes"
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("speaker_weight", [0.0, 0.5])
 def test_dp_over_the_gathered_columns_matches_the_dp_over_the_full_output(speaker_weight):
     torch.manual_seed(0)

@@ -290,6 +290,25 @@ class MultiSpeakerSOTWordTimestampAligner:
         self.chunk_right_context = int(chunk_right_context)
 
     @classmethod
+    def clean_sot_transcript(cls, transcript: str, special_tokens: Sequence[str]) -> str:
+        """Remove the special tokens a decoder kept, except ``<spk:N>`` speaker tags.
+
+        Decode with special tokens kept, so the speaker tags survive, then clean the text here:
+        :meth:`parse_sot_words` would align any other special token as a word.
+
+        Args:
+            transcript (str): Decoded t-SOT transcript.
+            special_tokens (Sequence[str]): The decoding tokenizer's special tokens.
+
+        Returns:
+            str: The transcript without those tokens, its words separated by single spaces.
+        """
+        for token in special_tokens:
+            if cls._SPEAKER_TAG_RE.fullmatch(token) is None:
+                transcript = transcript.replace(token, " ")
+        return " ".join(transcript.split())
+
+    @classmethod
     def parse_sot_words(cls, transcript: str) -> List[Dict[str, Any]]:
         """Split a t-SOT transcript into words while retaining speaker turns."""
         words: List[Dict[str, Any]] = []
