@@ -50,6 +50,7 @@ __all__ = [
 
 
 CTC_TIMESTAMP_ARTIFACT_FORMAT = "nemo_ctc_timestamp_artifact_v1"
+CTC_TIMESTAMP_BUNDLE_PREFIX = "ctc_timestamp."
 
 
 class TransformerCTCDecoder(ConvASRDecoder):
@@ -1666,30 +1667,42 @@ def _save_ctc_timestamp_safetensors(
 def _load_ctc_timestamp_safetensors(path: Path) -> dict[str, Any]:
     try:
         from safetensors import safe_open
-        from safetensors.torch import load_file
     except ImportError as error:
         raise ImportError("Loading a .safetensors CTC timestamp artifact requires safetensors.") from error
 
     with safe_open(str(path), framework="pt", device="cpu") as handle:
         metadata = handle.metadata() or {}
-    if metadata.get("format") != CTC_TIMESTAMP_ARTIFACT_FORMAT:
-        raise ValueError(
-            f"Expected a {CTC_TIMESTAMP_ARTIFACT_FORMAT!r} artifact. Convert the original .nemo adapter first."
-        )
-    try:
-        decoder_config = _plain_mapping(json.loads(metadata["decoder_config"]), "decoder_config")
-        tokenizer_payload = _plain_mapping(json.loads(metadata["tokenizer_config"]), "tokenizer_config")
-    except (KeyError, json.JSONDecodeError) as error:
-        raise ValueError("Invalid CTC timestamp safetensors metadata.") from error
+        if metadata.get("format") == CTC_TIMESTAMP_ARTIFACT_FORMAT:
+            prefix = ""
+            decoder_config_key = "decoder_config"
+            tokenizer_config_key = "tokenizer_config"
+        elif metadata.get("ctc_timestamp_format") == CTC_TIMESTAMP_ARTIFACT_FORMAT:
+            prefix = CTC_TIMESTAMP_BUNDLE_PREFIX
+            decoder_config_key = "ctc_timestamp_decoder_config"
+            tokenizer_config_key = "ctc_timestamp_tokenizer_config"
+        else:
+            raise ValueError(
+                f"Expected a {CTC_TIMESTAMP_ARTIFACT_FORMAT!r} artifact. Convert the original .nemo adapter first."
+            )
+        try:
+            decoder_config = _plain_mapping(json.loads(metadata[decoder_config_key]), "decoder_config")
+            tokenizer_payload = _plain_mapping(json.loads(metadata[tokenizer_config_key]), "tokenizer_config")
+        except (KeyError, json.JSONDecodeError) as error:
+            raise ValueError("Invalid CTC timestamp safetensors metadata.") from error
+        decoder_prefix = f"{prefix}decoder."
+        tensor_keys = list(handle.keys())
+        if not prefix:
+            unexpected = sorted(
+                key for key in tensor_keys if key != "tokenizer.model_proto" and not key.startswith(decoder_prefix)
+            )
+            if unexpected:
+                raise ValueError(f"Unexpected tensor(s) in CTC timestamp artifact: {unexpected}.")
+        decoder_keys = [key for key in tensor_keys if key.startswith(decoder_prefix)]
+        state_dict = {key.removeprefix(decoder_prefix): handle.get_tensor(key) for key in decoder_keys}
+        model_proto = handle.get_tensor(f"{prefix}tokenizer.model_proto")
 
-    tensors = load_file(str(path), device="cpu")
-    model_proto = tensors.pop("tokenizer.model_proto", None)
     if not isinstance(model_proto, torch.Tensor) or model_proto.dtype != torch.uint8 or model_proto.numel() == 0:
         raise ValueError("tokenizer.model_proto must be a non-empty uint8 tensor.")
-    unexpected = sorted(key for key in tensors if not key.startswith("decoder."))
-    if unexpected:
-        raise ValueError(f"Unexpected tensor(s) in CTC timestamp artifact: {unexpected}.")
-    state_dict = {key.removeprefix("decoder."): value for key, value in tensors.items()}
     tokenizer_payload["model_proto"] = model_proto.contiguous().numpy().tobytes()
     return {
         "format": CTC_TIMESTAMP_ARTIFACT_FORMAT,

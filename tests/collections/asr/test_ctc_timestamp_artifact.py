@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,62 @@ def test_safetensors_artifact_round_trip_contains_only_decoder_and_tokenizer(tmp
     assert not any(key.startswith("encoder.") for key in keys)
 
     restored = load_ctc_timestamp_artifact(artifact_path)
+    assert restored.tokenizer.text_to_ids("hello world") == tokenizer.text_to_ids("hello world")
+    assert restored.decoder_config == config
+    for name, value in decoder.state_dict().items():
+        assert torch.equal(restored.decoder.state_dict()[name], value)
+
+
+@pytest.mark.unit
+def test_load_combined_checkpoint_ignores_salm_tensors_and_restores_ctc_head(tmp_path):
+    safetensors = pytest.importorskip("safetensors")
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    base_weight = torch.arange(8, dtype=torch.float32)
+    tokenizer_path = Path(__file__).resolve().parents[2] / ".data/asr/tokenizers/an4_spe_128/tokenizer.model"
+    tokenizer = SentencePieceTokenizer(str(tokenizer_path))
+    config = {
+        "feat_in": 8,
+        "num_classes": tokenizer.vocab_size,
+        "vocabulary": tokenizer.ids_to_tokens(list(range(tokenizer.vocab_size))),
+        "use_transformer": False,
+    }
+    decoder = TransformerCTCDecoder(**config)
+    tensors = {
+        "llm.weight": base_weight,
+        "ctc_timestamp.tokenizer.model_proto": torch.frombuffer(
+            bytearray(tokenizer.tokenizer.serialized_model_proto()), dtype=torch.uint8
+        ).clone(),
+    }
+    tensors.update({f"ctc_timestamp.decoder.{key}": value for key, value in decoder.state_dict().items()})
+    combined_path = tmp_path / "model_ctc.safetensors"
+    safetensors_torch.save_file(
+        tensors,
+        combined_path,
+        metadata={
+            "ctc_timestamp_format": CTC_TIMESTAMP_ARTIFACT_FORMAT,
+            "ctc_timestamp_decoder_config": json.dumps(config),
+            "ctc_timestamp_tokenizer_config": json.dumps(
+                {
+                    "legacy": bool(getattr(tokenizer, "legacy", False)),
+                    "ignore_extra_whitespaces": bool(getattr(tokenizer, "ignore_extra_whitespaces", True)),
+                    "trim_spm_separator_after_special_token": bool(
+                        getattr(tokenizer, "trim_spm_separator_after_special_token", True)
+                    ),
+                    "spm_separator": str(getattr(tokenizer, "spm_separator", "▁")),
+                }
+            ),
+        },
+    )
+
+    with safetensors.safe_open(str(combined_path), framework="pt", device="cpu") as handle:
+        keys = set(handle.keys())
+        assert torch.equal(handle.get_tensor("llm.weight"), base_weight)
+        assert handle.metadata()["ctc_timestamp_format"] == CTC_TIMESTAMP_ARTIFACT_FORMAT
+    assert "ctc_timestamp.tokenizer.model_proto" in keys
+    assert any(key.startswith("ctc_timestamp.decoder.") for key in keys)
+    assert not any(key.startswith("ctc_timestamp.encoder.") for key in keys)
+
+    restored = load_ctc_timestamp_artifact(combined_path)
     assert restored.tokenizer.text_to_ids("hello world") == tokenizer.text_to_ids("hello world")
     assert restored.decoder_config == config
     for name, value in decoder.state_dict().items():
