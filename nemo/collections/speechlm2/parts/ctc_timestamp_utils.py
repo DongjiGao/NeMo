@@ -240,7 +240,6 @@ class MultiSpeakerSOTWordTimestampAligner:
         ctc_decoder: Optional[TransformerCTCDecoder] = None,
         tokenizer: Optional[Any] = None,
         blank_id: Optional[int] = None,
-        input_frame_seconds: float = 0.01,
         ctc_frame_seconds: Optional[float] = None,
         sortformer_frame_seconds: Optional[float] = None,
         speaker_activity_threshold: float = 0.5,
@@ -250,7 +249,6 @@ class MultiSpeakerSOTWordTimestampAligner:
         online_inference_length: int = 0,
         chunk_left_context: int = 0,
         chunk_right_context: int = 0,
-        subsampling_factor: int = 1,
     ) -> None:
         """Initialize multi-speaker SOT word timestamp alignment.
 
@@ -258,8 +256,8 @@ class MultiSpeakerSOTWordTimestampAligner:
             ctc_decoder (Optional[TransformerCTCDecoder]): CTC timestamp decoder.
             tokenizer (Optional[Any]): Tokenizer matching the CTC decoder vocabulary.
             blank_id (Optional[int]): Explicit CTC blank class index.
-            input_frame_seconds (float): Duration represented by one input feature frame.
-            ctc_frame_seconds (Optional[float]): Explicit duration of one CTC frame.
+            ctc_frame_seconds (Optional[float]): Duration of one CTC frame, for records without an
+                audio duration.
             sortformer_frame_seconds (Optional[float]): Explicit duration of one Sortformer frame.
             speaker_activity_threshold (float): Threshold for speaker activity metadata.
             speaker_logprob_weight (float): Weight of the Sortformer prior in CTC alignment.
@@ -269,8 +267,6 @@ class MultiSpeakerSOTWordTimestampAligner:
                 head over stored states; 0 runs it over the whole sequence at once.
             chunk_left_context (int): Encoder frames of left context per deferred head window.
             chunk_right_context (int): Encoder frames of right context per deferred head window.
-            subsampling_factor (int): Input frames per CTC frame, for the CTC frame duration when
-                no audio duration is given.
         """
         if speaker_logprob_weight < 0:
             raise ValueError("speaker_logprob_weight must be non-negative.")
@@ -281,7 +277,6 @@ class MultiSpeakerSOTWordTimestampAligner:
         self.ctc_decoder = ctc_decoder
         self.tokenizer = tokenizer
         self.blank_id = blank_id
-        self.input_frame_seconds = float(input_frame_seconds)
         self.ctc_frame_seconds = ctc_frame_seconds
         self.sortformer_frame_seconds = sortformer_frame_seconds
         self.speaker_activity_threshold = float(speaker_activity_threshold)
@@ -291,7 +286,6 @@ class MultiSpeakerSOTWordTimestampAligner:
         self.online_inference_length = int(online_inference_length)
         self.chunk_left_context = int(chunk_left_context)
         self.chunk_right_context = int(chunk_right_context)
-        self.subsampling_factor = int(subsampling_factor)
 
     @classmethod
     def parse_sot_words(cls, transcript: str) -> List[Dict[str, Any]]:
@@ -519,12 +513,16 @@ class MultiSpeakerSOTWordTimestampAligner:
         if weight < 0:
             raise ValueError("speaker_logprob_weight must be non-negative.")
 
-        default_ctc_step = self.input_frame_seconds * float(self.subsampling_factor)
         records = []
         for index, transcript in enumerate(sot_transcripts):
             ctc_length = ctc_lengths_list[index]
             speaker_length = speaker_lengths_list[index]
-            ctc_step = self._frame_seconds(ctc_length, durations[index], self.ctc_frame_seconds, default_ctc_step)
+            if durations[index] is not None:
+                ctc_step = float(durations[index]) / ctc_length
+            elif self.ctc_frame_seconds is not None:
+                ctc_step = float(self.ctc_frame_seconds)
+            else:
+                raise ValueError(f"Record {index} has no audio duration, and ctc_frame_seconds is not set.")
             sortformer_step = (
                 None
                 if speaker_length is None
@@ -1547,8 +1545,8 @@ def get_ctc_timestamp_aligner(
 ) -> MultiSpeakerSOTWordTimestampAligner:
     """Load and cache an inference-only aligner without registering it in ``owner``'s module tree.
 
-    Every call copies the encoder's deferred-head windows and subsampling factor onto the cached
-    aligner, so a change to them reaches it. The aligner keeps no reference to the encoder.
+    Every call copies the encoder's deferred-head windows onto the cached aligner, so a change to
+    them reaches it. The aligner keeps no reference to the encoder.
     """
     if not isinstance(artifact_path, str) or not artifact_path:
         raise ValueError("ctc_timestamp_model_path must be a non-empty lightweight artifact path.")
@@ -1562,11 +1560,9 @@ def get_ctc_timestamp_aligner(
         owner.__dict__["_ctc_timestamp_extractor_cache"] = (resolved_path, aligner)
         cached = (resolved_path, aligner)
     aligner = cached[1]
-    pee = getattr(owner, "encoder", owner)
     aligner.online_inference_length = int(getattr(owner, "online_inference_length", 0))
     aligner.chunk_left_context = int(getattr(owner, "chunk_left_context", 0))
     aligner.chunk_right_context = int(getattr(owner, "chunk_right_context", 0))
-    aligner.subsampling_factor = int(getattr(pee, "subsampling_factor", 1))
     parameter = next(owner.parameters(), None)
     dtype = parameter.dtype if parameter is not None and device.type != "cpu" else torch.float32
     aligner.ctc_decoder.to(device=device, dtype=dtype).eval()
