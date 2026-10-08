@@ -780,7 +780,7 @@ def test_timestamp_extractor_batch_honors_record_lengths(monkeypatch):
 
     assert [result["num_ctc_frames"] for result in results] == [4, 5]
     assert [result["alignment_mode"] for result in results] == ["parallel", "parallel"]
-    # Two streams over the batch's 7 padded frames, with only the blank and token columns each transcript uses.
+    # Two streams over the longest record's 5 valid frames, keeping each transcript's blank and token columns.
     assert dp_calls == [(torch.Size([2, 5, 2]), [4, 5])]
     assert results[0]["diarization_timestamps"] == [{"speaker": 0, "start": 0.0, "end": 0.02}]
     assert results[1]["diarization_timestamps"] == [{"speaker": 1, "start": 0.01, "end": 0.04}]

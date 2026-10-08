@@ -691,12 +691,22 @@ def test_a_failed_batch_is_freed_before_its_requests_are_retried_one_by_one(alig
     assert [_words(result) for result in results] == [["x"], ["y"]] and len(failed_inputs) == 1
 
 
-def test_unexpected_alignment_errors_are_raised_not_hidden(aligner):
+@pytest.mark.parametrize("release", [True, False])
+def test_unexpected_alignment_errors_are_raised_not_hidden(aligner, release):
     _capture(2, 4, ["hash-a", "hash-b"])
-    ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b")])
+    ct._record_request_hashes([("req-a", "hash-a"), ("req-b", "hash-b"), ("req-other", "hash-a")])
 
     with pytest.raises(RuntimeError, match="kernel failure"):
-        ct.align_finished_requests([("req-a", "fine"), ("req-b", "crash")], release=True)
+        ct.align_finished_requests([("req-a", "fine"), ("req-b", "crash")], release=release)
+
+    if release:
+        # The failed call still drops its claims; req-other keeps the capture it shares.
+        assert set(ct._request_hashes) == {"req-other"} and ct._hash_owners == {"hash-a": {"req-other"}}
+        assert set(ct._store) == {"hash-a"}
+    else:
+        # Without release the claims stay, so the caller can retry.
+        assert set(ct._request_hashes) == {"req-a", "req-b", "req-other"}
+        assert set(ct._store) == {"hash-a", "hash-b"}
 
 
 def test_tensor_durations_survive_compaction(aligner):
@@ -753,7 +763,9 @@ def test_collate_assembles_padded_rows_on_the_gpu(aligner):
     assert torch.count_nonzero(batch.asr_encoded[1, :, 3:]) == 0
 
 
-def test_runner_hook_keys_captures_by_hash_maps_cache_hits_and_ignores_outside_forwards(aligner, monkeypatch):
+def _hooked_runner(monkeypatch):
+    """A stand-in for vLLM's GPU model runner with the capture hook installed, and a builder for its steps."""
+
     class StubRunner:
         def _batch_mm_inputs_from_scheduler(self, step):
             return step.hashes, None, [(req_id, None) for req_id in step.req_ids]
@@ -778,7 +790,11 @@ def test_runner_hook_keys_captures_by_hash_maps_cache_hits_and_ignores_outside_f
 
     monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_model_runner", SimpleNamespace(GPUModelRunner=StubRunner))
     ct.install_encoder_cache_binding()
-    runner = StubRunner()
+    return StubRunner(), step
+
+
+def test_runner_hook_keys_captures_by_hash_maps_cache_hits_and_ignores_outside_forwards(aligner, monkeypatch):
+    runner, step = _hooked_runner(monkeypatch)
 
     first = step([("req-a-0123abcd", "hash-a")], [("req-a-0123abcd", "hash-a")])
     assert runner._execute_mm_encoder(first) == "encoded"
@@ -797,6 +813,22 @@ def test_runner_hook_keys_captures_by_hash_maps_cache_hits_and_ignores_outside_f
     assert set(ct._store) == {"hash-a", "hash-c"}
     runner._execute_mm_encoder(step([], [], freed=["hash-a"]))
     assert list(ct._store) == ["hash-c"]
+
+
+def test_audio_encoded_again_keeps_the_capture_an_earlier_request_owns(aligner, monkeypatch):
+    runner, step = _hooked_runner(monkeypatch)
+    both = [("req-a-0123abcd", "hash-a"), ("req-b-0123abcd", "hash-b")]
+    runner._execute_mm_encoder(step(both, both))
+    monkeypatch.setenv("NEMO_CTC_TIMESTAMP_RETAIN_GB", str(2.5 * ct._store["hash-a"]["nbytes"] / 1e9))
+
+    # vLLM evicts hash-a's audio while req-a waits for alignment, then encodes it again for
+    # req-a2 in the same step as req-c's new audio.
+    again = [("req-c-0123abcd", "hash-c"), ("req-a2-0123abcd", "hash-a")]
+    runner._execute_mm_encoder(step(again, again, freed=["hash-a"]))
+
+    assert set(ct._store) == {"hash-a", "hash-b"}
+    results = ct.align_finished_requests([("req-a", "a"), ("req-b", "b"), ("req-c", "c")], release=True)
+    assert [result["error"] for result in results] == [None, None, "capture_unavailable"]
 
 
 def test_offline_alignment_refuses_a_model_without_timestamps(monkeypatch):

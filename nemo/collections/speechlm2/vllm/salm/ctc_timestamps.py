@@ -529,7 +529,9 @@ def _trim_store(new_hashes: Sequence[str] = ()) -> int:
     newest capture is kept even when it alone exceeds the budget.
 
     Args:
-        new_hashes (Sequence[str]): The hashes the current encoder step stored, in encoding order.
+        new_hashes (Sequence[str]): The hashes the current encoder step stored for the first time,
+            in encoding order. Audio encoded again replaces a capture already counted, so it is
+            not among them.
 
     Returns:
         int: How many captures were deleted.
@@ -660,7 +662,8 @@ def prepare_finished_requests(finished: Sequence[tuple[str, str]], *, release: b
 
     Args:
         finished (Sequence[tuple[str, str]]): As in :func:`align_finished_requests`.
-        release (bool): Afterwards drop each request's claim on its capture.
+        release (bool): Afterwards drop each request's claim on its capture, also when
+            preparing fails.
 
     Returns:
         dict: ``count``, the number of items; ``errors``, per item the ``error`` its result
@@ -672,6 +675,15 @@ def prepare_finished_requests(finished: Sequence[tuple[str, str]], *, release: b
     Raises:
         Exception: Any error other than ``ValueError`` while preparing.
     """
+    try:
+        return _prepare_finished_requests(finished)
+    finally:
+        if release:
+            _release_requests([request_id for request_id, _ in finished])
+
+
+def _prepare_finished_requests(finished: Sequence[tuple[str, str]]) -> dict:
+    """:func:`prepare_finished_requests` without releasing, which that function does on every exit."""
     from nemo.collections.speechlm2.parts.ctc_timestamp_utils import MultiSpeakerSOTWordTimestampAligner
 
     errors: list[str | None] = [None] * len(finished)
@@ -756,8 +768,6 @@ def prepare_finished_requests(finished: Sequence[tuple[str, str]], *, release: b
         if index not in prepared_items:
             errors[index] = "alignment_failed"
             diarization[index] = _capture_diarization(entry)
-    if release:
-        _release_requests([request_id for request_id, _ in finished])
     return reply
 
 
@@ -1353,6 +1363,10 @@ def install_encoder_cache_binding() -> None:
         # vLLM evicting audio only ends cache hits on its capture; owners that have
         # not been aligned yet keep it.
         _follow_engine_cache(freed=getattr(scheduler_output, "free_encoder_mm_hashes", ()))
+        # Audio encoded again replaces a capture an earlier request may still own, so only
+        # captures new to the store can be refused.
+        with _lock:
+            retained = set(_store)
 
         # The forward receives only tensors, so it takes its items' hashes from here, in
         # the order vLLM encodes them.
@@ -1365,7 +1379,7 @@ def install_encoder_cache_binding() -> None:
 
         _follow_engine_cache(encoded=mm_hashes)
         _record_request_hashes((req_id, mm_hash) for mm_hash, (req_id, _position) in zip(mm_hashes, item_refs))
-        _trim_store(mm_hashes)
+        _trim_store([mm_hash for mm_hash in mm_hashes if mm_hash not in retained])
         _compact_ready()
         return outputs
 
