@@ -31,20 +31,29 @@ check included; every other request passes through untouched.
 
 Speaker tags reach the aligner only when the model writes them and the request keeps
 them with ``"skip_special_tokens": false``. The middleware does not read the prompt: a
-transcript without tags is aligned as one speaker, with a warning. Streaming and ``n``
-above 1 are refused for opted-in requests. A request that fails, is cancelled or cannot
-be aligned releases its capture.
+transcript without tags is aligned as one speaker, with a warning. With ``"stream": true``,
+text deltas stream immediately and ``ctc_timestamps`` accompanies the final choice's
+``finish_reason``, before any final usage chunk and ``[DONE]``. Only stream completion
+waits for alignment. Requests with ``n`` above 1 are refused. A request that fails,
+is cancelled or cannot be aligned releases its capture.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import aclosing
 from http import HTTPStatus
 from typing import Any
 
+import anyio
+from starlette.responses import StreamingResponse
+
 from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import (
+    _empty_result,
     align_async,
     ctc_adapter_path,
     ctc_timestamp_config,
@@ -55,6 +64,7 @@ from nemo.utils.nemo_logging import LogMode
 
 _CHAT_PATH = "/v1/chat/completions"
 _OPT_IN = "capture_ctc_timestamps"
+_SSE_BOUNDARY = re.compile(rb"\r?\n\r?\n")
 
 # The errors a prepare reply reports for a request when its engine core holds no capture of it.
 _NOT_HELD = frozenset({"no_capture", "not_enabled"})
@@ -84,8 +94,8 @@ async def ctc_timestamp_middleware(request: Any, call_next: Any) -> Any:
     if payload is None:
         return await call_next(request)
     num_completion_choices = payload.get("n")
-    if payload.get("stream") or (isinstance(num_completion_choices, int) and num_completion_choices > 1):
-        return _error("CTC timestamps support neither streaming nor n > 1.")
+    if isinstance(num_completion_choices, int) and num_completion_choices > 1:
+        return _error("CTC timestamps do not support n > 1.")
 
     request_id = _engine_request_id(request, payload)
     try:
@@ -93,6 +103,8 @@ async def ctc_timestamp_middleware(request: Any, call_next: Any) -> Any:
         if response.status_code != HTTPStatus.OK:
             await _release(engine, request_id)
             return response
+        if payload.get("stream") and response.headers.get("content-type", "").startswith("text/event-stream"):
+            return _TimestampStreamingResponse(response, engine, request_id)
         completion = json.loads(b"".join([chunk async for chunk in response.body_iterator]))
         headers = {name: value for name, value in response.headers.items() if name.lower() != "content-length"}
         if not isinstance(completion, dict):
@@ -114,6 +126,145 @@ async def ctc_timestamp_middleware(request: Any, call_next: Any) -> Any:
 
     completion["ctc_timestamps"] = result
     return _json(completion, response.status_code, headers)
+
+
+class _TimestampStreamingResponse(StreamingResponse):
+    """Close the alignment iterator even if ASGI send fails, or the client disconnects before the body starts."""
+
+    def __init__(self, response: Any, engine: Any, request_id: str):
+        self._started = False
+        self._upstream = response.body_iterator
+        self._engine = engine
+        self._request_id = request_id
+        headers = {name: value for name, value in response.headers.items() if name.lower() != "content-length"}
+        super().__init__(
+            self._body(), status_code=response.status_code, headers=headers, background=response.background
+        )
+
+    async def _body(self) -> AsyncIterator[bytes]:
+        self._started = True
+        async with aclosing(_stream_with_timestamps(self._upstream, self._engine, self._request_id)) as stream:
+            async for chunk in stream:
+                yield chunk
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self.body_iterator.aclose()
+                if not self._started:
+                    await _release(self._engine, self._request_id)
+                    await self._upstream.aclose()
+
+
+async def _stream_with_timestamps(body: AsyncIterator[bytes], engine: Any, request_id: str) -> AsyncIterator[bytes]:
+    """Forward text immediately; defer the finish marker, trailing usage and DONE until alignment completes.
+
+    Keep only transcript text and terminal metadata, not the stream. A final text/logprobs
+    delta can share an event with ``finish_reason``; split it so that alignment delays no text.
+    Alignment failures use the normal timestamp error field because HTTP headers are already sent.
+    Upstream errors retain vLLM's error event instead of fabricating a successful completion.
+    """
+    text: list[str] = []
+    terminal = None
+    trailing: list[bytes] = []
+    failed = False
+    aligned = False
+    try:
+        async with aclosing(_sse_events(body)) as events:
+            async for event in events:
+                data = _sse_data(event)
+                if data == "[DONE]":
+                    if terminal is not None and not failed:
+                        try:
+                            (result,) = await align_async(
+                                _capture_owner_rpc(engine), [(request_id, "".join(text))], require_enabled=False
+                            )
+                            aligned = True  # The worker already released the capture.
+                        except Exception as error:
+                            logging.error(
+                                "[NeMoSpeechLM] CTC timestamps for streaming chat request %s failed: %s",
+                                request_id,
+                                error,
+                                exc_info=error,
+                            )
+                            result = _empty_result("alignment_failed")
+                        terminal["ctc_timestamps"] = result
+                        yield _sse_json(terminal)
+                    for tail in trailing:
+                        yield tail
+                    yield event
+                    return
+                if data is None:
+                    # SSE comments/keepalives carry no completion data.
+                    yield event
+                    continue
+                chunk = json.loads(data)
+                if "error" in chunk:
+                    failed = True
+                    terminal = None
+                    yield event
+                    continue
+                request_id = _reported_request_id(chunk, request_id)
+                if terminal is not None:
+                    trailing.append(event)
+                    continue
+                choices = chunk.get("choices") or []
+                if failed or not choices:
+                    yield event
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+                text.append(delta.get("content") or "")
+                if choice.get("finish_reason") is None:
+                    yield event
+                    continue
+                terminal = chunk
+                if delta or choice.get("logprobs") is not None:
+                    partial = {**choice, "finish_reason": None}
+                    if "stop_reason" in partial:
+                        partial["stop_reason"] = None
+                    yield _sse_json({**chunk, "choices": [partial]})
+                    terminal["choices"] = [{**choice, "delta": {}, "logprobs": None}]
+                    if "token_ids" in choice:
+                        terminal["choices"][0]["token_ids"] = []
+            raise ValueError("vLLM's chat stream ended before [DONE].")
+    except Exception as error:
+        logging.error("[NeMoSpeechLM] Streaming chat request %s failed: %s", request_id, error, exc_info=error)
+        yield b"data: " + _error(error, "InternalServerError", HTTPStatus.INTERNAL_SERVER_ERROR).body + b"\n\n"
+        yield b"data: [DONE]\n\n"
+    finally:
+        # Starlette cancels the stream's AnyIO scope on disconnect. Shield cleanup so
+        # cancellation cannot strand an owned capture while other requests keep decoding.
+        with anyio.CancelScope(shield=True):
+            if not aligned:
+                await _release(engine, request_id)
+            await body.aclose()
+
+
+async def _sse_events(body: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    """Frame SSE events across arbitrary HTTP fragments, including split UTF-8 and CRLF delimiters."""
+    pending = b""
+    async for chunk in body:
+        start = max(0, len(pending) - 3)
+        pending += chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+        while match := _SSE_BOUNDARY.search(pending, start):
+            yield pending[: match.end()]
+            pending = pending[match.end() :]
+            start = 0
+    if pending:
+        raise ValueError("vLLM's chat stream ended with an incomplete SSE event.")
+
+
+def _sse_data(event: bytes) -> str | None:
+    """Read SSE data fields after framing, keeping comments and other fields out of the JSON payload."""
+    fields = [line[5:].removeprefix(b" ") for line in event.splitlines() if line.startswith(b"data:")]
+    return b"\n".join(fields).decode("utf-8") if fields else None
+
+
+def _sse_json(chunk: dict) -> bytes:
+    return ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8")
 
 
 def _opted_in(body: bytes) -> dict | None:

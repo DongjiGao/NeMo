@@ -16,6 +16,7 @@
 
 import asyncio
 import contextlib
+import json
 import sys
 import threading
 import weakref
@@ -987,7 +988,7 @@ def server(aligner):
     import uuid
 
     from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, StreamingResponse
     from fastapi.testclient import TestClient
 
     from nemo.collections.speechlm2.vllm.salm.ctc_serving import ctc_timestamp_middleware
@@ -1002,6 +1003,9 @@ def server(aligner):
         "id_prefix": "chatcmpl-",
         "capture": capture,
         "cancelled": False,
+        "stream_fragment_bytes": None,
+        "finish_reason": "stop",
+        "stream_error": None,
     }
     rpcs = []
 
@@ -1024,6 +1028,34 @@ def server(aligner):
             script["capture"](request_id)
         if script["cancelled"]:
             return None  # what vLLM's route returns once its client disconnects
+        if body.get("stream") and script["status"] == 200:
+
+            async def stream():
+                base_chunk = {"id": request_id, "object": "chat.completion.chunk", "created": 1, "model": "hr9a"}
+                chunks = [
+                    {"delta": {"role": "assistant", "content": ""}, "finish_reason": None},
+                    {"delta": {"content": script["transcript"]}, "finish_reason": script["finish_reason"]},
+                ]
+                data = b""
+                for choice in chunks:
+                    chunk = {**base_chunk, "choices": [{"index": 0, "logprobs": None, **choice}]}
+                    data += _sse(chunk)
+                if script["stream_error"]:
+                    data += _sse({"error": script["stream_error"]})
+                if (body.get("stream_options") or {}).get("include_usage"):
+                    data += _sse(
+                        {
+                            **base_chunk,
+                            "choices": [],
+                            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+                        }
+                    )
+                data += b"data: [DONE]\n\n"
+                step = script["stream_fragment_bytes"] or len(data)
+                for start in range(0, len(data), step):
+                    yield data[start : start + step]
+
+            return StreamingResponse(stream(), media_type="text/event-stream", headers={"x-upstream": "preserved"})
         message = {"role": "assistant", "content": script["transcript"]}
         content = {"id": request_id, "object": "chat.completion", "choices": [{"index": 0, "message": message}]}
         return JSONResponse(content, status_code=script["status"])
@@ -1086,13 +1118,317 @@ def test_alignment_uses_the_request_id_vllm_reports(server, caplog):
     assert server.rpcs == [ct.WORKER_PREPARE_METHOD] and ct._store == {}
 
 
-def test_opted_in_requests_refuse_streaming_and_n_above_1(server):
-    for fields in ({"stream": True}, {"n": 2}):
+def test_opted_in_requests_refuse_n_above_1(server):
+    for fields in ({"n": 2}, {"stream": True, "n": 2}):
         response = server.post(**fields)
 
         assert response.status_code == 400
-        assert "neither streaming nor n > 1" in response.json()["error"]["message"]
+        assert "n > 1" in response.json()["error"]["message"]
     assert server.rpcs == []
+
+
+def _sse(chunk):
+    return ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode()
+
+
+def _stream_chunks(response):
+    events = response.content.decode().split("\n\n")
+    assert events[-2:] == ["data: [DONE]", ""]
+    return [json.loads(event.removeprefix("data: ")) for event in events[:-2]]
+
+
+@pytest.mark.parametrize("fragment_bytes", [1, 7, 65536])
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+def test_streaming_timestamps_follow_the_full_transcript_and_preserve_usage(server, fragment_bytes, finish_reason):
+    server.script.update(
+        transcript="<spk:0> héllo 世界", stream_fragment_bytes=fragment_bytes, finish_reason=finish_reason
+    )
+    expected = server.post().json()["ctc_timestamps"]
+
+    response = server.post(stream=True, stream_options={"include_usage": True})
+
+    assert response.status_code == 200 and response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["x-upstream"] == "preserved"
+    chunks = _stream_chunks(response)
+    assert (
+        "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks if chunk["choices"])
+        == server.script["transcript"]
+    )
+    terminal = [chunk for chunk in chunks if chunk["choices"] and chunk["choices"][0]["finish_reason"]]
+    assert len(terminal) == 1 and terminal[0]["choices"][0]["finish_reason"] == finish_reason
+    assert terminal[0]["choices"][0]["delta"] == {} and terminal[0]["ctc_timestamps"] == expected
+    assert all("ctc_timestamps" not in chunk for chunk in chunks if chunk is not terminal[0])
+    assert chunks[-1]["choices"] == [] and chunks[-1]["usage"]["total_tokens"] == 5
+    assert server.rpcs == [ct.WORKER_PREPARE_METHOD] and ct._store == {}
+
+
+@pytest.mark.parametrize(
+    "transcript, error", [("", None), ("untokenizable", "alignment_failed"), ("crash", "alignment_failed")]
+)
+def test_stream_alignment_failure_keeps_the_transcript_and_finishes(server, transcript, error):
+    server.script["transcript"] = transcript
+
+    chunks = _stream_chunks(server.post(stream=True))
+
+    terminal = next(chunk for chunk in chunks if "ctc_timestamps" in chunk)
+    assert terminal["ctc_timestamps"]["words"] == [] and terminal["ctc_timestamps"]["error"] == error
+    assert "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks) == transcript
+    assert ct._store == {} and ct._request_hashes == {}
+
+
+def test_an_upstream_stream_error_passes_through_without_aligning(server):
+    server.script["stream_error"] = {"message": "engine failed", "code": 500}
+
+    chunks = _stream_chunks(server.post(stream=True))
+
+    assert chunks[-1] == {"error": server.script["stream_error"]}
+    assert not any("ctc_timestamps" in chunk for chunk in chunks)
+    assert server.rpcs == [ct.WORKER_RELEASE_METHOD] and ct._store == {}
+
+
+def test_a_stream_without_the_opt_in_is_unchanged(server):
+    chunks = _stream_chunks(server.post(opt_in=False, stream=True))
+
+    assert len(chunks) == 2 and chunks[-1]["choices"][0]["delta"]["content"] == "hi there"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop" and server.rpcs == []
+
+
+def test_streaming_uses_the_capture_on_a_later_data_parallel_core(dp_server):
+    dp_server.script["owners"] = [2]
+    expected = dp_server.post().json()["ctc_timestamps"]
+    dp_server.engine.rpcs.clear()
+
+    chunks = _stream_chunks(dp_server.post(stream=True))
+
+    terminal = next(chunk for chunk in chunks if "ctc_timestamps" in chunk)
+    assert terminal["ctc_timestamps"] == expected and dp_server.engine.stores() == [{}, {}, {}]
+    assert dp_server.engine.rpcs == [(ct.WORKER_PREPARE_METHOD, core) for core in range(3)]
+
+
+def _stream_for(server, body, request_id="chatcmpl-stream"):
+    from nemo.collections.speechlm2.vllm.salm.ctc_serving import _stream_with_timestamps
+
+    server.script["capture"](request_id)
+    return _stream_with_timestamps(body, server.app.state.engine_client, request_id)
+
+
+def _stream_choice(content, finish_reason=None, **fields):
+    return {
+        "id": "chatcmpl-stream",
+        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": finish_reason, **fields}],
+    }
+
+
+def test_streaming_does_not_delay_text_or_duplicate_final_logprobs_and_token_ids(server, monkeypatch):
+    from nemo.collections.speechlm2.vllm.salm import ctc_serving as serving
+
+    original = serving.align_async
+    logprobs = {"content": [{"token": "there", "logprob": -0.1, "bytes": [116], "top_logprobs": []}]}
+
+    async def run():
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def delayed(*args, **kwargs):
+            started.set()
+            await finish.wait()
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(serving, "align_async", delayed)
+
+        async def body():
+            yield _sse(_stream_choice("hi "))
+            yield _sse(_stream_choice("there", "stop", logprobs=logprobs, token_ids=[42], stop_reason=99))
+            yield b"data: [DONE]\n\n"
+
+        async with contextlib.aclosing(_stream_for(server, body())) as stream:
+            first, last_text = await anext(stream), await anext(stream)
+            assert not started.is_set() and server.rpcs == []
+            assert json.loads(first[6:])["choices"][0]["delta"]["content"] == "hi "
+            partial = json.loads(last_text[6:])["choices"][0]
+            assert partial["delta"]["content"] == "there" and partial["finish_reason"] is None
+            assert partial["logprobs"] == logprobs and partial["token_ids"] == [42] and partial["stop_reason"] is None
+            waiting = asyncio.create_task(anext(stream))
+            await asyncio.wait_for(started.wait(), 2)
+            assert not waiting.done()
+            finish.set()
+            terminal = json.loads((await asyncio.wait_for(waiting, 2))[6:])
+            choice = terminal["choices"][0]
+            assert choice["delta"] == {} and choice["logprobs"] is None and choice["token_ids"] == []
+            assert choice["finish_reason"] == "stop" and choice["stop_reason"] == 99
+            assert _words(terminal["ctc_timestamps"]) == ["hi", "there"]
+            assert await anext(stream) == b"data: [DONE]\n\n"
+        assert ct._store == {}
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("phase", ["generation", "alignment"])
+@pytest.mark.parametrize("cancel_scope", [False, True])
+def test_a_disconnected_stream_releases_captures_and_closes_upstream(server, monkeypatch, phase, cancel_scope):
+    import anyio
+
+    from nemo.collections.speechlm2.vllm.salm import ctc_serving as serving
+
+    async def run():
+        started, closed = asyncio.Event(), asyncio.Event()
+
+        async def blocking_align(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(serving, "align_async", blocking_align)
+
+        async def body():
+            try:
+                yield _sse(_stream_choice("hi"))
+                if phase == "generation":
+                    started.set()
+                    await asyncio.Event().wait()
+                yield _sse(_stream_choice("", "stop"))
+                yield b"data: [DONE]\n\n"
+            finally:
+                closed.set()
+
+        async def consume():
+            async for _ in _stream_for(server, body()):
+                pass
+
+        if cancel_scope:
+            async with anyio.create_task_group() as group:
+                group.start_soon(consume)
+                await asyncio.wait_for(started.wait(), 2)
+                group.cancel_scope.cancel()
+        else:
+            task = asyncio.create_task(consume())
+            await asyncio.wait_for(started.wait(), 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert closed.is_set() and ct._store == {} and ct._request_hashes == {}
+        assert server.rpcs == [ct.WORKER_RELEASE_METHOD]
+
+    asyncio.run(run())
+
+
+def test_closing_a_stream_between_deltas_releases_its_capture(server):
+    async def body():
+        yield _sse(_stream_choice("hi"))
+        yield _sse(_stream_choice(" there", "stop"))
+        yield b"data: [DONE]\n\n"
+
+    async def run():
+        stream = _stream_for(server, body())
+        await anext(stream)
+        await stream.aclose()
+        assert ct._store == {} and server.rpcs == [ct.WORKER_RELEASE_METHOD]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("phase", ["headers", "text", "alignment"])
+def test_an_asgi_send_failure_releases_the_capture_immediately(server, monkeypatch, phase):
+    from starlette.requests import ClientDisconnect
+    from starlette.responses import StreamingResponse
+
+    from nemo.collections.speechlm2.vllm.salm import ctc_serving as serving
+
+    async def run():
+        scope = {"type": "http", "asgi": {"spec_version": "2.4"}}
+        server.script["capture"]("chatcmpl-stream")
+        upstream_closed = False
+
+        async def body():
+            nonlocal upstream_closed
+            try:
+                yield _sse(_stream_choice("hi"))
+                yield _sse(_stream_choice("", "stop"))
+                yield b"data: [DONE]\n\n"
+            finally:
+                upstream_closed = True
+
+        async def receive():
+            await asyncio.Event().wait()
+
+        async def send(message):
+            if phase == "headers" or (phase == "text" and message["type"] == "http.response.body"):
+                raise OSError("client socket closed")
+
+        async def cancelled_align(*args, **kwargs):
+            raise asyncio.CancelledError
+
+        if phase == "alignment":
+            monkeypatch.setattr(serving, "align_async", cancelled_align)
+        response = serving._TimestampStreamingResponse(
+            StreamingResponse(body(), media_type="text/event-stream"),
+            server.app.state.engine_client,
+            "chatcmpl-stream",
+        )
+        with pytest.raises(asyncio.CancelledError if phase == "alignment" else ClientDisconnect):
+            await response(scope, receive, send)
+        assert ct._store == {} and ct._request_hashes == {} and server.rpcs == [ct.WORKER_RELEASE_METHOD]
+        # An unstarted async generator has no body to finalize.
+        assert upstream_closed or phase == "headers"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("tail", [b"data: {broken}\n\n", b"data: {", b"", RuntimeError("upstream failed")])
+def test_a_malformed_or_interrupted_stream_reports_an_error_and_releases(server, tail):
+    async def body():
+        yield _sse(_stream_choice("hi"))
+        if isinstance(tail, Exception):
+            raise tail
+        yield tail
+
+    async def run():
+        events = [event async for event in _stream_for(server, body())]
+        assert events[-1] == b"data: [DONE]\n\n" and "error" in json.loads(events[-2][6:])
+        assert not any(b'"ctc_timestamps"' in event for event in events)
+        assert ct._store == {} and server.rpcs == [ct.WORKER_RELEASE_METHOD]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_sse_comments_multiline_data_and_utf8_survive_byte_fragmentation(server, newline):
+    comment = b": keepalive" + newline * 2
+    event = _sse(_stream_choice("世界", "stop")).replace(b'"choices":', b'\n data: "choices":')
+    event = event.replace(b"\n data:", b"\ndata:").replace(b"\n", newline)
+    done = b"data: [DONE]" + newline * 2
+
+    async def body():
+        for value in comment + event + done:
+            yield bytes([value])
+
+    async def run():
+        events = [event async for event in _stream_for(server, body())]
+        assert events[0] == comment and events[-1] == done
+        assert _words(json.loads(events[-2][6:])["ctc_timestamps"]) == ["世界"]
+        assert ct._store == {}
+
+    asyncio.run(run())
+
+
+def test_concurrent_streams_align_their_own_transcripts_and_release_all_captures(server):
+    async def one(index):
+        request_id = f"chatcmpl-{index}"
+
+        async def body():
+            chunk = _stream_choice(f"word{index}", "stop")
+            chunk["id"] = request_id
+            yield _sse(chunk)
+            await asyncio.sleep(0)
+            yield b"data: [DONE]\n\n"
+
+        events = [event async for event in _stream_for(server, body(), request_id)]
+        result = json.loads(events[-2][6:])
+        assert result["id"] == request_id and _words(result["ctc_timestamps"]) == [f"word{index}"]
+
+    async def run():
+        await asyncio.wait_for(asyncio.gather(*(one(index) for index in range(16))), 5)
+        assert ct._store == {} and ct._request_hashes == {} and ct._hash_owners == {}
+
+    asyncio.run(run())
 
 
 def test_a_failed_chat_completion_releases_its_capture(server):
