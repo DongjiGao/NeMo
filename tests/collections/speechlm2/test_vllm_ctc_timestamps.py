@@ -1558,6 +1558,36 @@ def test_a_checkpoint_without_a_bundled_head_keeps_timestamps_off(tmp_path):
         ct.ctc_timestamp_config(model_config)
 
 
+def _sharded_checkpoint(directory, ctc_shards):
+    """A sharded checkpoint whose index maps the language model to one shard and the CTC head to ``ctc_shards``."""
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    from nemo.collections.speechlm2.parts.ctc_timestamp_utils import CTC_TIMESTAMP_ARTIFACT_FORMAT
+
+    weight_map = {"llm.weight": "model-00001-of-00001.safetensors"}
+    safetensors_torch.save_file({"llm.weight": torch.zeros(1)}, str(directory / "model-00001-of-00001.safetensors"))
+    for index, shard in enumerate(ctc_shards):
+        name = f"ctc_timestamp.decoder.weight{index}"
+        metadata = {"ctc_timestamp_format": CTC_TIMESTAMP_ARTIFACT_FORMAT}
+        safetensors_torch.save_file({name: torch.zeros(1)}, str(directory / shard), metadata=metadata)
+        weight_map[name] = shard
+    (directory / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
+
+
+def test_a_sharded_checkpoint_bundles_its_head_in_one_shard(tmp_path, caplog):
+    # As the FP8 and NVFP4 exports of GA-RC1 write it: the whole head in model-ctc-bf16.safetensors.
+    _sharded_checkpoint(tmp_path, ["model-ctc-bf16.safetensors"])
+    model_config = SimpleNamespace(hf_config=SimpleNamespace(ctc_timestamps=None), model=str(tmp_path))
+
+    adapter = ct.ctc_timestamp_config(model_config)["adapter_path"]
+    assert adapter == str((tmp_path / "model-ctc-bf16.safetensors").resolve())
+
+    split = tmp_path / "split"
+    split.mkdir()
+    _sharded_checkpoint(split, ["model-ctc-a.safetensors", "model-ctc-b.safetensors"])
+    model_config.model = str(split)
+    assert ct.ctc_timestamp_config(model_config) is None and "spans 2 shards" in caplog.text
+
+
 def test_a_bundled_head_this_engine_cannot_use_is_skipped_but_requested_timestamps_fail(monkeypatch, caplog):
     pytest.importorskip("vllm")
     from nemo.collections.speechlm2.vllm.salm.model import NeMoSpeechLMForConditionalGeneration

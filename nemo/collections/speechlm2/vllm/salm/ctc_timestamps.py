@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import os
 import threading
 import weakref
@@ -245,9 +246,9 @@ def ctc_timestamp_config(model_config: Any) -> Any:
     """Return the ``ctc_timestamps`` block that turns timestamps on for a model, or ``None`` when they are off.
 
     ``"enabled": false`` turns them off. Otherwise the checkpoint config's block when it names an
-    adapter. Otherwise a checkpoint whose ``model.safetensors`` bundles the CTC head
-    (``ctc_timestamp_format`` in its metadata, the head under ``ctc_timestamp.``) is its own
-    adapter, with the block's speaker prior weight. Such a block is ``"optional"`` unless the
+    adapter. Otherwise a checkpoint that bundles the CTC head, in ``model.safetensors`` or in one
+    shard of a sharded checkpoint (``ctc_timestamp_format`` in its metadata, the head under
+    ``ctc_timestamp.``), is its own adapter, with the block's speaker prior weight. Such a block is ``"optional"`` unless the
     config sets ``"enabled": true``: where the engine cannot produce timestamps, the model then
     serves without them instead of failing to start.
 
@@ -281,14 +282,38 @@ def ctc_timestamp_config(model_config: Any) -> Any:
 
 @functools.lru_cache(maxsize=None)
 def _bundled_ctc_head(model: str) -> str | None:
-    """The ``model.safetensors`` of a local checkpoint directory that bundles a CTC timestamp head."""
+    """The safetensors file of a local checkpoint directory that holds its bundled CTC timestamp head.
+
+    That is ``model.safetensors``, or in a sharded checkpoint the one shard its index maps every
+    ``ctc_timestamp.`` tensor to, as quantized exports write it. The file's metadata must name the
+    head's format.
+    """
     from safetensors import safe_open
 
-    from nemo.collections.speechlm2.parts.ctc_timestamp_utils import CTC_TIMESTAMP_ARTIFACT_FORMAT
+    from nemo.collections.speechlm2.parts.ctc_timestamp_utils import (
+        CTC_TIMESTAMP_ARTIFACT_FORMAT,
+        CTC_TIMESTAMP_BUNDLE_PREFIX,
+    )
     from nemo.collections.speechlm2.parts.hf_hub import SAFETENSORS_SINGLE_FILE
 
+    if not model:
+        return None
     path = Path(model) / SAFETENSORS_SINGLE_FILE
-    if not model or not path.is_file():
+    index = Path(model) / f"{SAFETENSORS_SINGLE_FILE}.index.json"
+    if not path.is_file() and index.is_file():
+        weight_map = json.loads(index.read_text()).get("weight_map", {})
+        shards = sorted({shard for name, shard in weight_map.items() if name.startswith(CTC_TIMESTAMP_BUNDLE_PREFIX)})
+        if len(shards) > 1:
+            logging.warning(
+                "[NeMoSpeechLM] The checkpoint's CTC timestamp head spans %d shards (%s), so it is not loaded; "
+                "point ctc_timestamps.adapter_path at one file that holds the whole head.",
+                len(shards),
+                ", ".join(shards),
+            )
+        if len(shards) != 1:
+            return None
+        path = Path(model) / shards[0]
+    if not path.is_file():
         return None
     with safe_open(str(path), framework="pt", device="cpu") as checkpoint:
         metadata = checkpoint.metadata() or {}
