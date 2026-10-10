@@ -210,16 +210,19 @@ class TestBuildFP8Encoder:
             ),
             "ConformerEncoder": (ConformerEncoder, {}),
         }[encoder_name]
-        encoder = encoder_cls(
-            feat_in=32, d_model=64, n_heads=4, n_layers=1, subsampling=None, subsampling_factor=1, **kwargs
-        ).eval()
-        perception = nn.Module()
-        perception.encoder = encoder
-        build_fp8_encoder(perception, _QuantConfig(DECODER_IGNORE + ["perception.proj"]))
-        monkeypatch.setattr(FP8Linear, "forward", lambda self, x: x.new_zeros(*x.shape[:-1], self.out_features))
+        # Other test modules set CUDA as the default device at import, but ConformerEncoder
+        # always creates its relative-position biases on the CPU.
+        with torch.device("cpu"):
+            encoder = encoder_cls(
+                feat_in=32, d_model=64, n_heads=4, n_layers=1, subsampling=None, subsampling_factor=1, **kwargs
+            ).eval()
+            perception = nn.Module()
+            perception.encoder = encoder
+            build_fp8_encoder(perception, _QuantConfig(DECODER_IGNORE + ["perception.proj"]))
+            monkeypatch.setattr(FP8Linear, "forward", lambda self, x: x.new_zeros(*x.shape[:-1], self.out_features))
 
-        with torch.no_grad():
-            encoded, length = encoder(audio_signal=torch.randn(1, 32, 3), length=torch.tensor([3]))[:2]
+            with torch.no_grad():
+                encoded, length = encoder(audio_signal=torch.randn(1, 32, 3), length=torch.tensor([3]))[:2]
 
         assert isinstance(encoder.pre_encode, FP8Linear)
         assert encoded.shape == (1, 64, 3) and length.tolist() == [3]
