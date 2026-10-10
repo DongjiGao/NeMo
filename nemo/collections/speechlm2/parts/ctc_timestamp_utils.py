@@ -1667,7 +1667,7 @@ def load_ctc_timestamp_artifact(
         raise FileNotFoundError(f"CTC timestamp artifact does not exist: {path}")
     payload = (
         _load_ctc_timestamp_safetensors(path)
-        if path.suffix == ".safetensors"
+        if _is_safetensors_file(path)
         else torch.load(path, map_location="cpu", weights_only=True)
     )
     if not isinstance(payload, Mapping) or payload.get("format") != CTC_TIMESTAMP_ARTIFACT_FORMAT:
@@ -1715,6 +1715,19 @@ def _save_ctc_timestamp_safetensors(
         "tokenizer_config": json.dumps(tokenizer_config, ensure_ascii=False, separators=(",", ":")),
     }
     save_file(tensors, str(path), metadata=metadata)
+
+
+def _is_safetensors_file(path: Path) -> bool:
+    """Whether a file holds safetensors: an 8-byte little-endian header length, then the JSON header.
+
+    Decided by content as well as suffix: a Hugging Face cache keeps ``model.safetensors`` as a
+    symlink to a blob named by its hash, and callers pass the resolved blob.
+    """
+    if path.suffix == ".safetensors":
+        return True
+    with path.open("rb") as handle:
+        prefix = handle.read(9)
+    return len(prefix) == 9 and prefix[8:9] == b"{" and int.from_bytes(prefix[:8], "little") < path.stat().st_size
 
 
 def _load_ctc_timestamp_safetensors(path: Path) -> dict[str, Any]:
