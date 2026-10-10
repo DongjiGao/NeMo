@@ -1534,13 +1534,18 @@ def test_a_checkpoint_that_bundles_the_ctc_head_is_its_own_adapter(tmp_path):
     def model_config(ctc_timestamps):
         return SimpleNamespace(hf_config=SimpleNamespace(ctc_timestamps=ctc_timestamps), model=str(tmp_path))
 
+    # Found on its own, the head is optional: an engine that cannot use it serves without it.
     assert ct.ctc_timestamp_config(model_config(None)) == {
         "adapter_path": bundled,
         "speaker_logprob_weight": ct.DEFAULT_SPEAKER_PRIOR_WEIGHT,
+        "optional": True,
     }
     assert ct.ctc_timestamp_config(model_config({"speaker_logprob_weight": 0.5}))["speaker_logprob_weight"] == 0.5
+    assert ct.ctc_timestamp_config(model_config({"enabled": True}))["optional"] is False
     named = {"adapter_path": "/adapter.safetensors"}
     assert ct.ctc_timestamp_config(model_config(named)) is named
+    assert ct.ctc_timestamp_config(model_config({"enabled": False})) is None
+    assert ct.ctc_timestamp_config(model_config({**named, "enabled": False})) is None
 
 
 def test_a_checkpoint_without_a_bundled_head_keeps_timestamps_off(tmp_path):
@@ -1548,6 +1553,54 @@ def test_a_checkpoint_without_a_bundled_head_keeps_timestamps_off(tmp_path):
     model_config = SimpleNamespace(hf_config=SimpleNamespace(ctc_timestamps=None), model=str(tmp_path))
 
     assert ct.ctc_timestamp_config(model_config) is None
+    model_config.hf_config.ctc_timestamps = {"enabled": True}
+    with pytest.raises(ValueError, match="bundles no CTC timestamp head"):
+        ct.ctc_timestamp_config(model_config)
+
+
+def test_a_bundled_head_this_engine_cannot_use_is_skipped_but_requested_timestamps_fail(monkeypatch, caplog):
+    pytest.importorskip("vllm")
+    from nemo.collections.speechlm2.vllm.salm.model import NeMoSpeechLMForConditionalGeneration
+
+    monkeypatch.setattr(ct, "_registry", {})
+    model = object.__new__(NeMoSpeechLMForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.perception = SimpleNamespace(encoder=SimpleNamespace(supports_ctc_timestamp_inputs=True))
+    model._uses_pe_encoder = False
+    model.encoder_chunk_size_seconds = None
+    model_runner_v2 = SimpleNamespace(use_v2_model_runner=True)
+
+    model._maybe_enable_ctc_timestamps({"adapter_path": "/model.safetensors", "optional": True}, model_runner_v2)
+    assert ct.active_aligner() is None and "Serving without CTC timestamps" in caplog.text
+
+    # A named adapter, or a bundled head with enabled: true, asked for timestamps, so startup fails.
+    for requested in ({"adapter_path": "/adapter.pt"}, {"adapter_path": "/model.safetensors", "optional": False}):
+        with pytest.raises(ValueError, match="Model Runner V2"):
+            model._maybe_enable_ctc_timestamps(requested, model_runner_v2)
+
+
+def test_a_server_told_to_skip_the_bundled_head_passes_requests_through(server, tmp_path):
+    _checkpoint(tmp_path)
+    server.hf_config.ctc_timestamps = {"enabled": False}
+    server.app.state.engine_client.model_config.model = str(tmp_path)
+    server.script["capture"] = lambda request_id: None  # an engine without timestamps keeps nothing
+
+    response = server.post()
+
+    assert "ctc_timestamps" not in response.json() and server.rpcs == []
+
+
+def test_requests_to_an_engine_that_skipped_the_bundled_head_report_not_enabled(server, tmp_path, monkeypatch):
+    _checkpoint(tmp_path)
+    server.hf_config.ctc_timestamps = None
+    server.app.state.engine_client.model_config.model = str(tmp_path)
+    # The engine skipped the head, for example on Model Runner V2: it registered no aligner and kept nothing.
+    monkeypatch.setattr(ct, "_registry", {})
+    server.script["capture"] = lambda request_id: None
+
+    response = server.post()
+
+    assert response.status_code == 200 and response.json()["ctc_timestamps"] == ct._empty_result("not_enabled")
 
 
 def test_a_server_whose_checkpoint_bundles_the_ctc_head_attaches_timestamps(server, tmp_path):

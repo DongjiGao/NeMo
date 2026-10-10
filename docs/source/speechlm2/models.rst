@@ -163,6 +163,14 @@ completions. Enable the middleware when starting the server:
     vllm serve /path/to/checkpoint \
         --middleware nemo.collections.speechlm2.vllm.salm.ctc_serving.ctc_timestamp_middleware
 
+Timestamps need vLLM's V1 GPU model runner. When the engine uses Model Runner
+V2 (for example with a DFlash2 draft, and by default from vLLM 0.30), a bundled
+head is skipped with a warning and opted-in requests report
+``error="not_enabled"``; a configured ``adapter_path`` or
+``ctc_timestamps.enabled=true`` fails at startup instead. Set
+``ctc_timestamps.enabled=false``, in ``config.json`` or with
+``--hf-overrides``, to serve a bundled checkpoint without timestamps.
+
 Opt in per request with ``mm_processor_kwargs.capture_ctc_timestamps=true``.
 Timestamp requests support one audio item and one completion (``n=1``).
 Set ``skip_special_tokens=false`` to preserve the generated ``<spk:N>`` tags

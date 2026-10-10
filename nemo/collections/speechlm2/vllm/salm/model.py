@@ -191,9 +191,10 @@ class NeMoSpeechLMForConditionalGeneration(
         """Arm CTC timestamp capture when the checkpoint names a CTC adapter or bundles the head.
 
         Driven by the checkpoint (``ctc_timestamp_config``), mirroring how
-        ``encoder_quantization`` travels, so serving needs no extra flags.
-        Off unless configured: capture costs throughput and retains rows, so a
-        deployment that does not want timestamps should not pay for them.
+        ``encoder_quantization`` travels, so serving needs no extra flags;
+        ``ctc_timestamps.enabled=false`` turns a bundled head off. When this engine
+        cannot produce timestamps, a bundled head (``"optional"``) is skipped with a
+        warning, while a named adapter or ``enabled: true`` fails at startup.
         """
         adapter_path = ctc_adapter_path(ctc_config)
         if not adapter_path:
@@ -202,17 +203,17 @@ class NeMoSpeechLMForConditionalGeneration(
         from nemo.collections.speechlm2.parts.ctc_timestamp_utils import get_ctc_timestamp_aligner
         from nemo.collections.speechlm2.vllm.salm.ctc_timestamps import install_encoder_cache_binding
 
-        encoder = self.perception.encoder
-        if not getattr(encoder, "supports_ctc_timestamp_inputs", False):
-            raise ValueError(f"{type(encoder).__name__} cannot produce CTC timestamp inputs.")
-        if not self._uses_pe_encoder and self.encoder_chunk_size_seconds:
-            # Captured inputs cover one forward over the whole audio; nothing would
-            # reassemble the inputs of the chunks this setting splits it into.
-            raise ValueError(
-                "CTC timestamps need one unchunked encoder forward, but encoder_chunk_size_seconds="
-                f"{self.encoder_chunk_size_seconds} is set."
+        unavailable = self._ctc_timestamps_unavailable(vllm_config)
+        if unavailable is not None:
+            if not (isinstance(ctc_config, dict) and ctc_config.get("optional")):
+                raise ValueError(unavailable)
+            logging.warning(
+                "[NeMoSpeechLM] Serving without CTC timestamps, although the checkpoint bundles a CTC head: %s "
+                "Set ctc_timestamps.enabled=false to skip the head without this warning.",
+                unavailable,
             )
-        require_v1_model_runner(vllm_config)
+            return
+        encoder = self.perception.encoder
         speaker_prior_weight = read_speaker_prior_weight(ctc_config)
         encoder.ctc_timestamp_model_path = adapter_path
         device = next(encoder.parameters()).device
@@ -224,6 +225,24 @@ class NeMoSpeechLMForConditionalGeneration(
         register_aligner(aligner, tokenizer_special_tokens(vllm_config.model_config))
         install_encoder_cache_binding()
         logging.info("[NeMoSpeechLM] CTC timestamps enabled from checkpoint config: %s", adapter_path)
+
+    def _ctc_timestamps_unavailable(self, vllm_config: VllmConfig) -> str | None:
+        """Why this engine cannot produce CTC timestamps, or ``None`` when it can."""
+        encoder = self.perception.encoder
+        if not getattr(encoder, "supports_ctc_timestamp_inputs", False):
+            return f"{type(encoder).__name__} cannot produce CTC timestamp inputs."
+        if not self._uses_pe_encoder and self.encoder_chunk_size_seconds:
+            # Captured inputs cover one forward over the whole audio; nothing would
+            # reassemble the inputs of the chunks this setting splits it into.
+            return (
+                "CTC timestamps need one unchunked encoder forward, but encoder_chunk_size_seconds="
+                f"{self.encoder_chunk_size_seconds} is set."
+            )
+        try:
+            require_v1_model_runner(vllm_config)
+        except ValueError as error:
+            return str(error)
+        return None
 
     # ── language-model integration ──
 

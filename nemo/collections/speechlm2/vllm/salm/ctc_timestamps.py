@@ -244,20 +244,39 @@ def ctc_adapter_path(ctc_config: Any) -> str | None:
 def ctc_timestamp_config(model_config: Any) -> Any:
     """Return the ``ctc_timestamps`` block that turns timestamps on for a model, or ``None`` when they are off.
 
-    The checkpoint config's block when it names an adapter. Otherwise a checkpoint whose
-    ``model.safetensors`` bundles the CTC head (``ctc_timestamp_format`` in its metadata, the head
-    under ``ctc_timestamp.``) is its own adapter, with the block's speaker prior weight.
+    ``"enabled": false`` turns them off. Otherwise the checkpoint config's block when it names an
+    adapter. Otherwise a checkpoint whose ``model.safetensors`` bundles the CTC head
+    (``ctc_timestamp_format`` in its metadata, the head under ``ctc_timestamp.``) is its own
+    adapter, with the block's speaker prior weight. Such a block is ``"optional"`` unless the
+    config sets ``"enabled": true``: where the engine cannot produce timestamps, the model then
+    serves without them instead of failing to start.
 
     Args:
         model_config (Any): vLLM's ``ModelConfig``: its ``hf_config`` and the local ``model`` directory.
+
+    Raises:
+        ValueError: ``"enabled": true``, but the config names no adapter and the checkpoint
+            bundles no head.
     """
     ctc_config = getattr(model_config.hf_config, "ctc_timestamps", None)
+    enabled = ctc_config.get("enabled") if isinstance(ctc_config, dict) else getattr(ctc_config, "enabled", None)
+    if enabled is False:
+        return None
     if ctc_adapter_path(ctc_config):
         return ctc_config
     bundled = _bundled_ctc_head(str(getattr(model_config, "model", None) or ""))
     if bundled is None:
+        if enabled:
+            raise ValueError(
+                "ctc_timestamps.enabled is true, but the config names no adapter_path and the checkpoint "
+                "bundles no CTC timestamp head."
+            )
         return None
-    return {"adapter_path": bundled, "speaker_logprob_weight": read_speaker_prior_weight(ctc_config)}
+    return {
+        "adapter_path": bundled,
+        "speaker_logprob_weight": read_speaker_prior_weight(ctc_config),
+        "optional": not enabled,
+    }
 
 
 @functools.lru_cache(maxsize=None)
