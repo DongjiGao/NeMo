@@ -59,6 +59,28 @@ class _QuantConfig:
         return any(prefix == entry or fnmatch(prefix, entry) for entry in self.exclude_modules)
 
 
+DECODER_LAYERS = {
+    "language_model.model.layers.0.mixer.in_proj": {"quant_algo": "FP8"},
+    "language_model.model.layers.1.mixer.experts": {"quant_algo": "NVFP4"},
+}
+
+
+class _MixedQuantConfig(_QuantConfig):
+    """The parts of vLLM's ModelOpt MIXED_PRECISION config that the FP8 encoder reads."""
+
+    def __init__(self, quantized_layers, ignore=DECODER_IGNORE):
+        super().__init__(ignore, name="modelopt_mixed", quant_method=None)
+        self.quantized_layers = dict(quantized_layers)
+
+
+def _asr_layer_rows(quant_algo: str = "FP8") -> dict[str, dict[str, str]]:
+    return {
+        f"perception.encoder.asr_encoder.layers.{i}.{leaf}": {"quant_algo": quant_algo}
+        for i in range(N_LAYERS)
+        for leaf in ("attn.w_qkv", "attn.out_proj", "ffn.net.0", "ffn.net.3")
+    }
+
+
 class _Block(nn.Module):
     """Mirrors the Linear names of a SpeechLM transformer encoder block."""
 
@@ -208,6 +230,57 @@ class TestBuildFP8Encoder:
 
         quant_config = ModelOptFp8Config.from_config(
             {"quant_method": "modelopt", "quant_algo": "FP8", "ignore": DECODER_IGNORE + PERCEPTION_IGNORE}
+        )
+        perception = _speaker_aware_perception()
+
+        assert build_fp8_encoder(perception, quant_config) == N_QUANTIZED
+        assert all(isinstance(linear, FP8Linear) for linear in _asr_linears(perception))
+        assert sum(isinstance(m, FP8Linear) for m in perception.modules()) == N_QUANTIZED
+
+    def test_mixed_precision_config_builds_the_encoder_layers_it_lists_as_fp8(self):
+        perception = _speaker_aware_perception()
+
+        replaced = build_fp8_encoder(perception, _MixedQuantConfig({**DECODER_LAYERS, **_asr_layer_rows()}))
+
+        assert replaced == N_QUANTIZED
+        assert all(isinstance(linear, FP8Linear) for linear in _asr_linears(perception))
+        assert sum(isinstance(m, FP8Linear) for m in perception.modules()) == N_QUANTIZED
+
+    def test_mixed_precision_config_without_encoder_rows_leaves_the_encoder_unquantized(self):
+        perception = _speaker_aware_perception()
+
+        assert build_fp8_encoder(perception, _MixedQuantConfig(DECODER_LAYERS)) == 0
+        assert not any(isinstance(m, FP8Linear) for m in perception.modules())
+
+    def test_mixed_precision_config_rejects_other_encoder_formats_before_changing_the_encoder(self):
+        perception = _speaker_aware_perception()
+        rows = {**_asr_layer_rows(), "perception.encoder.asr_encoder.layers.0.ffn.net.0": {"quant_algo": "NVFP4"}}
+
+        with pytest.raises(NotImplementedError, match="NVFP4"):
+            build_fp8_encoder(perception, _MixedQuantConfig({**DECODER_LAYERS, **rows}))
+        assert not any(isinstance(m, FP8Linear) for m in perception.modules())
+
+    def test_mixed_precision_config_leaves_excluded_rows_unquantized(self):
+        perception = _speaker_aware_perception()
+        diarizer_row = {"perception.encoder.diarization_model.encoder.layers.0.attn.w_qkv": {"quant_algo": "FP8"}}
+        quant_config = _MixedQuantConfig(
+            {**DECODER_LAYERS, **_asr_layer_rows(), **diarizer_row}, ignore=DECODER_IGNORE + PERCEPTION_IGNORE
+        )
+
+        assert build_fp8_encoder(perception, quant_config) == N_QUANTIZED
+        assert type(perception.encoder.diarization_model.encoder.layers[0].attn.w_qkv) is nn.Linear
+
+    def test_vllm_mixed_precision_config_selects_the_listed_layers(self):
+        pytest.importorskip("vllm")
+        from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig
+
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "ignore": DECODER_IGNORE,
+                "quantized_layers": {**DECODER_LAYERS, **_asr_layer_rows()},
+            }
         )
         perception = _speaker_aware_perception()
 

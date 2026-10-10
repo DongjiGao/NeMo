@@ -33,6 +33,13 @@ when the model is constructed; the checkpoint then loads into them directly.
 
 A ``quantization_config`` without any ``perception`` entry predates encoder
 quantization (its decoder was quantized on its own), so its encoder stays unquantized.
+
+A ModelOpt ``MIXED_PRECISION`` checkpoint (for example an NVFP4 decoder with FP8 layers)
+has no such rule: it names every quantized layer in ``quantized_layers``. There an
+encoder Linear is FP8 when listed with ``quant_algo: FP8`` and unquantized when not
+listed::
+
+    "quantized_layers": {..., "perception.encoder.asr_encoder.layers.0.attn.w_qkv": {"quant_algo": "FP8"}}
 """
 
 from collections.abc import Callable, Mapping
@@ -140,27 +147,12 @@ def build_fp8_encoder(perception: nn.Module, quant_config: Optional[Any]) -> int
         NotImplementedError: If the encoder is quantized with anything but ModelOpt FP8.
         ValueError: If a quantized Linear's input width does not suit the CUTLASS FP8 GEMM.
     """
-    exclude_modules = getattr(quant_config, "exclude_modules", None) or ()
-    if not hasattr(quant_config, "is_layer_excluded") or not any(
-        str(entry).startswith("perception") for entry in exclude_modules
-    ):
-        return 0
-    targets = [
-        (name, module)
-        for name, module in perception.named_modules()
-        if isinstance(module, nn.Linear)
-        and not isinstance(module, FP8Linear)
-        and not quant_config.is_layer_excluded(_PERCEPTION_PREFIX + name)
-    ]
+    if hasattr(quant_config, "get_name") and quant_config.get_name() == "modelopt_mixed":
+        targets = _listed_fp8_targets(perception, quant_config)
+    else:
+        targets = _unexcluded_fp8_targets(perception, quant_config)
     if not targets:
         return 0
-    scheme = (quant_config.get_name(), getattr(quant_config, "quant_method", None))
-    if scheme != ("modelopt", "FP8"):
-        raise NotImplementedError(
-            f"quantization_config quantizes {len(targets)} audio encoder Linear(s), e.g. "
-            f"{_PERCEPTION_PREFIX + targets[0][0]!r}, as {scheme[0]} {scheme[1]}; the audio encoder supports only "
-            "ModelOpt FP8 with static per-tensor scales"
-        )
 
     replacements = [
         (
@@ -182,6 +174,57 @@ def build_fp8_encoder(perception: nn.Module, quant_config: Optional[Any]) -> int
 
     logging.info(f"FP8 audio encoder: {len(replacements)} Linears built from quantization_config")
     return len(replacements)
+
+
+def _unexcluded_fp8_targets(perception: nn.Module, quant_config: Optional[Any]) -> list[tuple[str, nn.Linear]]:
+    """Perception Linears that a ModelOpt FP8 config quantizes: those no exclusion entry matches."""
+    exclude_modules = getattr(quant_config, "exclude_modules", None) or ()
+    if not hasattr(quant_config, "is_layer_excluded") or not any(
+        str(entry).startswith("perception") for entry in exclude_modules
+    ):
+        return []
+    targets = [
+        (name, module)
+        for name, module in perception.named_modules()
+        if isinstance(module, nn.Linear)
+        and not isinstance(module, FP8Linear)
+        and not quant_config.is_layer_excluded(_PERCEPTION_PREFIX + name)
+    ]
+    if not targets:
+        return []
+    scheme = (quant_config.get_name(), getattr(quant_config, "quant_method", None))
+    if scheme != ("modelopt", "FP8"):
+        raise NotImplementedError(
+            f"quantization_config quantizes {len(targets)} audio encoder Linear(s), e.g. "
+            f"{_PERCEPTION_PREFIX + targets[0][0]!r}, as {scheme[0]} {scheme[1]}; the audio encoder supports only "
+            "ModelOpt FP8 with static per-tensor scales"
+        )
+    return targets
+
+
+def _listed_fp8_targets(perception: nn.Module, quant_config: Any) -> list[tuple[str, nn.Linear]]:
+    """Perception Linears that a ModelOpt MIXED_PRECISION config lists in ``quantized_layers``."""
+    quantized_layers = quant_config.quantized_layers
+    targets = []
+    others = {}
+    for name, module in perception.named_modules():
+        prefix = _PERCEPTION_PREFIX + name
+        if not isinstance(module, nn.Linear) or isinstance(module, FP8Linear) or prefix not in quantized_layers:
+            continue
+        # vLLM's mixed-precision config checks exclusions before the per-layer table.
+        if quant_config.is_layer_excluded(prefix):
+            continue
+        algo = str(quantized_layers[prefix].get("quant_algo", "")).upper()
+        if algo == "FP8":
+            targets.append((name, module))
+        else:
+            others[prefix] = algo
+    if others:
+        raise NotImplementedError(
+            f"quantized_layers lists {len(others)} audio encoder Linear(s) as {sorted(set(others.values()))}, "
+            f"e.g. {next(iter(others))!r}; the audio encoder supports only FP8 with static per-tensor scales"
+        )
+    return targets
 
 
 def check_fp8_encoder_weights(perception: nn.Module, weights: Mapping[str, torch.Tensor]) -> None:
